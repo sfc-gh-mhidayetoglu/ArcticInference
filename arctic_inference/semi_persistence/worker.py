@@ -121,6 +121,12 @@ def _get_cu():
             lib.cuCheckpointProcessUnlock.argtypes = [ctypes.c_int, ctypes.c_void_p]
             lib.cuCheckpointProcessUnlock.restype = ctypes.c_int
 
+            lib.cuDeviceGetUuid.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            lib.cuDeviceGetUuid.restype = ctypes.c_int
+
+            lib.cuDeviceGetCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            lib.cuDeviceGetCount.restype = ctypes.c_int
+
             _check_cu("cuInit", lib.cuInit(0))
             _cu_bindings = lib
             _cu_bindings_pid = os.getpid()
@@ -140,6 +146,69 @@ def _get_descendant_pids(pid):
     return [c.pid for c in children]
 
 
+class CUuuid(ctypes.Structure):
+    _fields_ = [("bytes", ctypes.c_char * 16)]
+
+
+class CUcheckpointGpuPair(ctypes.Structure):
+    _fields_ = [
+        ("oldUuid", CUuuid),
+        ("newUuid", CUuuid),
+    ]
+
+
+_PTR_SIZE = ctypes.sizeof(ctypes.c_void_p)
+
+
+class CUcheckpointRestoreArgs(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("gpuPairs", ctypes.POINTER(CUcheckpointGpuPair)),
+        ("gpuPairsCount", ctypes.c_uint),
+        ("reserved", ctypes.c_char * (52 - _PTR_SIZE)),
+        ("reserved1", ctypes.c_uint64),
+    ]
+
+
+def _get_device_uuid(cu, ordinal):
+    """Get the CUuuid for a GPU by device ordinal."""
+    uuid = CUuuid()
+    _check_cu(f"cuDeviceGetUuid({ordinal})",
+              cu.cuDeviceGetUuid(ctypes.byref(uuid), ordinal))
+    return uuid
+
+
+def _get_device_count(cu):
+    count = ctypes.c_int(0)
+    _check_cu("cuDeviceGetCount", cu.cuDeviceGetCount(ctypes.byref(count)))
+    return count.value
+
+
+def _make_restore_args(cu, old_gpu, new_gpu):
+    """Build CUcheckpointRestoreArgs with GPU pair for cross-GPU restore.
+
+    Every GPU visible to CUDA must be listed. The mapping must be a
+    valid permutation (bijective): old_gpu swaps with new_gpu, all
+    others map to themselves.
+    """
+    dev_count = _get_device_count(cu)
+    pairs = (CUcheckpointGpuPair * dev_count)()
+    for i in range(dev_count):
+        pairs[i].oldUuid = _get_device_uuid(cu, i)
+        if i == old_gpu:
+            pairs[i].newUuid = _get_device_uuid(cu, new_gpu)
+        elif i == new_gpu:
+            pairs[i].newUuid = _get_device_uuid(cu, old_gpu)
+        else:
+            pairs[i].newUuid = _get_device_uuid(cu, i)
+
+    args = CUcheckpointRestoreArgs()
+    ctypes.memset(ctypes.byref(args), 0, ctypes.sizeof(args))
+    args.gpuPairsCount = dev_count
+    args.gpuPairs = pairs
+    return args, pairs
+
+
 def _worker_checkpoint(child_pid):
     """Checkpoint the vLLM child and all its GPU-holding descendants."""
     cu = _get_cu()
@@ -153,11 +222,26 @@ def _worker_checkpoint(child_pid):
     return all_pids
 
 
-def _worker_restore(pids):
-    """Restore processes in top-down order (reverse of checkpoint order)."""
+def _worker_restore(pids, old_gpu=None, new_gpu=None):
+    """Restore processes in top-down order (reverse of checkpoint order).
+
+    If old_gpu and new_gpu are set, remaps the checkpoint from old_gpu
+    to new_gpu using CUcheckpointGpuPair UUID mapping.
+    """
     cu = _get_cu()
+    restore_arg = None
+    _pairs_ref = None
+    if old_gpu is not None and new_gpu is not None and old_gpu != new_gpu:
+        restore_arg, _pairs_ref = _make_restore_args(cu, old_gpu, new_gpu)
     for pid in reversed(pids):
-        _check_cu(f"Restore({pid})", cu.cuCheckpointProcessRestore(pid, None))
+        if restore_arg is not None:
+            cu.cuCheckpointProcessRestore.argtypes = [ctypes.c_int, ctypes.POINTER(CUcheckpointRestoreArgs)]
+            _check_cu(f"Restore({pid})",
+                      cu.cuCheckpointProcessRestore(pid, ctypes.byref(restore_arg)))
+            cu.cuCheckpointProcessRestore.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        else:
+            _check_cu(f"Restore({pid})",
+                      cu.cuCheckpointProcessRestore(pid, None))
         _check_cu(f"Unlock({pid})", cu.cuCheckpointProcessUnlock(pid, None))
 
 
@@ -217,12 +301,17 @@ def _child_thread(rank, child_pid, pipe, arch,
         if cmd == "restore":
             t0 = time.perf_counter()
             error = None
+            target_gpu = kwargs["gpu"]
             info = {"arch": arch}
             try:
                 if checkpointed_pids is None:
                     raise RuntimeError("restore called but no checkpointed PIDs stored")
-                _worker_restore(checkpointed_pids)
+                _worker_restore(checkpointed_pids,
+                                old_gpu=rank,
+                                new_gpu=target_gpu)
                 _tlog(f"  restored pids: {checkpointed_pids}")
+                info["gpu"] = target_gpu
+                rank = target_gpu
                 checkpointed_pids = None
                 state = "alive"
             except Exception as e:
@@ -232,7 +321,7 @@ def _child_thread(rank, child_pid, pipe, arch,
             _emit_result(cmd, elapsed, error, info)
             continue
 
-        if cmd == "remove":
+        if cmd == "teardown":
             t0 = time.perf_counter()
             error = None
             info = {"arch": arch}
@@ -247,7 +336,7 @@ def _child_thread(rank, child_pid, pipe, arch,
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
             elapsed = time.perf_counter() - t0
-            _tlog(f"<<< remove {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
+            _tlog(f"<<< teardown {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
             _emit_result(cmd, elapsed, error, info)
             break
 
@@ -324,6 +413,15 @@ def worker_loop(rank, cmd_queue, result_queue, completed_counter,
 
             child_queue.put((cmd, kwargs))
             continue
+
+        if cmd == "teardown":
+            if child_queue is not None:
+                child_queue.put(("teardown", {}))
+            if child_thread_obj is not None:
+                child_thread_obj.join(timeout=30)
+            if child_proc is not None:
+                child_proc.join(timeout=30)
+            break
 
         if cmd == "exit":
             if child_queue is not None:

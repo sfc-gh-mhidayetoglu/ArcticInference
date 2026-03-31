@@ -1,12 +1,13 @@
-"""Standalone Instance for a vLLM engine on a specific GPU.
+"""Standalone Instance for a vLLM engine.
 
-Each Instance owns its own worker process.  All primitives are
-non-blocking and return self for chaining.  Cross-instance dependencies
-are expressed via after().
+Each Instance is a GPU-agnostic handle.  The GPU is specified at
+init(gpu) time, which also spawns the worker process.  All primitives
+are non-blocking and return self for chaining.  Cross-instance
+dependencies are expressed via after().
 
 Usage:
-    instance = Instance({"model": "/data-fast/Qwen/Qwen3-32B"}, gpu=0)
-    instance.init().attach().sleep().checkpoint().wait()
+    instance = Instance({"model": "/data-fast/Qwen/Qwen3-32B"})
+    instance.init(gpu=0).attach().sleep().checkpoint().wait()
 """
 from __future__ import annotations
 
@@ -32,6 +33,16 @@ def _gpu_mem_info(gpu_id: int) -> tuple[int, int]:
     free_mib, total_mib = (int(x.strip()) for x in out.split(","))
     return free_mib * 1024 * 1024, total_mib * 1024 * 1024
 
+
+def _gpu_count() -> int:
+    """Return number of GPUs without initializing CUDA."""
+    import subprocess
+    out = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+        text=True,
+    )
+    return len(out.strip().splitlines())
+
 _next_instance_id = 0
 _counter_registry: dict[int, mp.Value] = {}
 
@@ -46,9 +57,8 @@ class Instance:
 
     _all: weakref.WeakValueDictionary[int, "Instance"] = weakref.WeakValueDictionary()
 
-    def __init__(self, vllm_config: dict, gpu: int, *,
-                 use_odirect: bool = True):
-        self.gpu = gpu
+    def __init__(self, vllm_config: dict, *, use_odirect: bool = True):
+        self.gpu = None
         self.vllm_config = vllm_config
         self.instance_id = _alloc_instance_id()
         Instance._all[self.instance_id] = self
@@ -63,18 +73,13 @@ class Instance:
         self._pending_count = 0
         self._pending_cmds = []
         self._total_sent = 0
+        self._use_odirect = use_odirect
 
         self._cmd_queue = _fork_ctx.Queue()
         self._result_queue = _fork_ctx.Queue()
         self._completed_counter = _fork_ctx.Value('i', 0)
         _counter_registry[self.instance_id] = self._completed_counter
-
-        self._worker = _fork_ctx.Process(
-            target=worker_loop,
-            args=(gpu, self._cmd_queue, self._result_queue,
-                  self._completed_counter, use_odirect),
-        )
-        self._worker.start()
+        self._worker = None
 
     def __repr__(self):
         return (f"Instance(id={self.instance_id}, gpu={self.gpu}, "
@@ -82,7 +87,17 @@ class Instance:
                 f"pid={self.pid}, state={self.state}, "
                 f"pinned={self.pinned_bytes / 2**30:.2f} GiB)")
 
-    # -- Internal dispatch -----------------------------------------------------
+    # -- Internal helpers -------------------------------------------------------
+
+    def _reset(self):
+        """Reset instance to created state after remove completes."""
+        if self._worker is not None:
+            self._worker.join(timeout=30)
+            self._worker = None
+        self.state = "created"
+        self.gpu = None
+        self.pid = None
+        self.pinned_bytes = 0
 
     def _send(self, cmd, **kwargs):
         self._cmd_queue.put((cmd, kwargs))
@@ -93,8 +108,15 @@ class Instance:
 
     # -- Primitives (non-blocking, return self) --------------------------------
 
-    def init(self):
+    def init(self, gpu: int):
+        self.gpu = gpu
         self._log("init")
+        self._worker = _fork_ctx.Process(
+            target=worker_loop,
+            args=(gpu, self._cmd_queue, self._result_queue,
+                  self._completed_counter, self._use_odirect),
+        )
+        self._worker.start()
         return self._send("init", vllm_config=self.vllm_config)
 
     def attach(self):
@@ -113,9 +135,9 @@ class Instance:
         self._log("checkpoint")
         return self._send("checkpoint")
 
-    def restore(self):
-        self._log("restore")
-        return self._send("restore")
+    def restore(self, gpu: int):
+        self._log(f"restore(gpu={gpu})")
+        return self._send("restore", gpu=gpu)
 
     def stage(self, data_path=None):
         if data_path is not None:
@@ -144,9 +166,14 @@ class Instance:
         self._log("scatter")
         return self._send("scatter")
 
+    def teardown(self):
+        self._log("teardown")
+        return self._send("teardown")
+
     def remove(self):
+        """Remove from the instance registry."""
         self._log("remove")
-        return self._send("remove")
+        Instance._all.pop(self.instance_id, None)
 
     # -- Cross-instance dependency ---------------------------------------------
 
@@ -198,24 +225,18 @@ class Instance:
                 elif cmd == "detach":
                     self.pinned_bytes = 0
                 elif cmd == "checkpoint":
+                    self.gpu = None
                     self.state = "checkpointed"
                 elif cmd == "restore":
+                    self.gpu = info.get("gpu", self.gpu)
                     self.state = "alive"
-                elif cmd == "remove":
-                    self.state = "removed"
+                elif cmd == "teardown":
+                    self._reset()
 
             if error is not None:
                 raise RuntimeError(f"GPU {self.gpu} command '{cmd}' failed: {error}")
 
         return self
-
-    # -- Lifecycle -------------------------------------------------------------
-
-    def shutdown(self):
-        """Shut down the worker process."""
-        self._cmd_queue.put(("exit", {}))
-        self._result_queue.get()
-        self._worker.join(timeout=30)
 
     # -- Status ----------------------------------------------------------------
 
@@ -245,29 +266,35 @@ class Instance:
                 elif cmd == "detach":
                     self.pinned_bytes = 0
                 elif cmd == "checkpoint":
+                    self.gpu = None
                     self.state = "checkpointed"
                 elif cmd == "restore":
+                    self.gpu = info.get("gpu", self.gpu)
                     self.state = "alive"
-                elif cmd == "remove":
-                    self.state = "removed"
+                elif cmd == "teardown":
+                    self._reset()
 
     @classmethod
     def print_status(cls):
         from collections import defaultdict
         by_gpu = defaultdict(list)
+        unassigned = []
         for inst in cls._all.values():
             inst._sync_state()
-            by_gpu[inst.gpu].append(inst)
+            if inst.gpu is None:
+                unassigned.append(inst)
+            else:
+                by_gpu[inst.gpu].append(inst)
 
-        all_gpus = set(by_gpu.keys())
+        num_gpus = _gpu_count()
         gpu_mem = {}
-        for g in all_gpus:
+        for g in range(num_gpus):
             gpu_mem[g] = _gpu_mem_info(g)
 
         print(f"\n{'=' * 80}", flush=True)
         print(f"  Instance Status  [{time.strftime('%H:%M:%S')}]", flush=True)
         print(f"{'=' * 80}", flush=True)
-        for gpu in sorted(by_gpu):
+        for gpu in range(num_gpus):
             free, total = gpu_mem[gpu]
             used = total - free
             print(f"  GPU {gpu}:  {used / 2**30:.2f} GiB / {total / 2**30:.2f} GiB used  "
@@ -275,11 +302,21 @@ class Instance:
             for inst in by_gpu[gpu]:
                 marker = "*" if inst.state == "alive" else " "
                 model = inst.vllm_config["model"].split("/")[-1]
+                model_w = f"{model} ({inst.weight_bytes / 2**30:.2f} GiB)"
                 pinned = f"pinned={inst.pinned_bytes / 2**30:.2f} GiB"
-                weights = f"weights={inst.weight_bytes / 2**30:.2f} GiB"
                 pending = inst._pending_cmds or []
                 print(f"    [{marker}] inst{inst.instance_id:<3} {inst.state:<15} "
-                      f"{model:<30} {weights:<18} {pinned:<18} "
+                      f"{model_w:<45} {pinned:<18} "
+                      f"pending={pending}", flush=True)
+        if unassigned:
+            print(f"  Unassigned:", flush=True)
+            for inst in unassigned:
+                model = inst.vllm_config["model"].split("/")[-1]
+                model_w = f"{model} ({inst.weight_bytes / 2**30:.2f} GiB)"
+                pinned = f"pinned={inst.pinned_bytes / 2**30:.2f} GiB"
+                pending = inst._pending_cmds or []
+                print(f"    [ ] inst{inst.instance_id:<3} {inst.state:<15} "
+                      f"{model_w:<45} {pinned:<18} "
                       f"pending={pending}", flush=True)
         print(f"{'=' * 80}\n", flush=True)
 

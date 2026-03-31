@@ -174,6 +174,12 @@ def vllm_child_loop(pipe_conn, rank, use_odirect, arch):
     to the fork-context result_queue.
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+    # Run EngineCore in-process to avoid IPC serialization of GPU tensors
+    # during scatter (apply_model). With multiprocessing=1, the closure
+    # capturing buf_gpu gets pickled over ZMQ, which fails for models
+    # >4 GiB (msgspec Ext limit) and is slow even for small models (~16s
+    # vs 0.2s). With =0, apply_model calls the function directly.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     torch.cuda.set_device(0)
 
     llm = None
@@ -257,9 +263,13 @@ def vllm_child_loop(pipe_conn, rank, use_odirect, arch):
                 buf_np = pinned_buf.numpy()
 
                 if use_odirect:
-                    import kvikio.defaults
-                    kvikio.defaults.set("num_threads", max(len(fragment_info), 1))
-                    kvikio.defaults.set("task_size", 1 * 1024 * 1024)
+                    try:
+                        import kvikio.defaults
+                        kvikio.defaults.set("num_threads", max(len(fragment_info), 1))
+                        kvikio.defaults.set("task_size", 1 * 1024 * 1024)
+                    except ImportError:
+                        _clog("  kvikio not available, falling back to regular I/O")
+                        use_odirect = False
 
                 shard_files = sorted(
                     f for f in os.listdir(stage_path)

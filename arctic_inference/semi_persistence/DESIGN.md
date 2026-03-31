@@ -51,23 +51,24 @@ architecture and weight headers from the model file, therefore the
 configs can be a generic HF model.
 
 ```python
-instance_1 = Instance(vllm_config_1, gpu=0)
-instance_2 = Instance(vllm_config_2, gpu=1)
+instance_1 = Instance(vllm_config_1)
+instance_2 = Instance(vllm_config_2)
 ```
 
-Instances 1 and 2 initialize in parallel with random weights.
+Instances 1 and 2 initialize in parallel with random weights.  The GPU
+is specified at `init()` time:
 
 ```python
-instance_1.init()
-instance_2.init()
+instance_1.init(gpu=0)
+instance_2.init(gpu=1)
 ```
 
 ## Process Hierarchy
 
-Each Instance owns one **worker process**.  The worker is **forked**
-from the main process (cheap, inherits file descriptors and queues).
-The worker then spawns the vLLM child via `mp.get_context("spawn")`
-when it receives the `init` command.
+Each Instance owns one **worker process**, created when `init(gpu)` is
+called.  The worker is **forked** from the main process (cheap, inherits
+file descriptors and queues).  The worker then spawns the vLLM child via
+`mp.get_context("spawn")` when it receives the `init` command.
 
 The two-level fork-then-spawn design:
 
@@ -78,10 +79,11 @@ work correctly after fork.
 - **vLLM child (spawned)**: starts with a clean address space -- no
 inherited CUDA contexts.  vLLM can freely use its own multiprocessing
 internally.  Tensor parallelism works.
-- **EngineCore (spawned by vLLM)**: vLLM v1 internally spawns a
-`VLLM::EngineCore` subprocess that performs the actual GPU work (model
-loading, KV cache, inference).  This process holds its own CUDA context
-(~1-3 GiB) and must also be checkpointed/restored.
+- **EngineCore (in-process)**: `VLLM_ENABLE_V1_MULTIPROCESSING=0` runs
+the EngineCore inside the vLLM child process (no separate subprocess).
+This avoids IPC serialization overhead during `scatter` (which would
+otherwise pickle GPU tensors across processes, failing for models >4 GiB
+and adding ~16s latency even for small models).
 
 ```
 Main process  [mp.set_start_method("fork")]
@@ -93,15 +95,15 @@ Main process  [mp.set_start_method("fork")]
   |           |
   |           `-- vLLM child process  (spawned via mp.get_context("spawn"))
   |                 |-- owns pinned CPU memory (allocated on attach)
-  |                 |-- resource_tracker  (no GPU, skipped during checkpoint)
-  |                 `-- VLLM::EngineCore  (holds GPU memory, checkpointed)
+  |                 |-- EngineCore (in-process, holds GPU memory)
+  |                 `-- resource_tracker  (no GPU, skipped during checkpoint)
   |
   |-- Instance 2  (handle, main-process side)
   |     |
   |     `-- Worker process 2  (forked from main)
   |           `-- vLLM child process  (spawned)
-  |                 |-- resource_tracker
-  |                 `-- VLLM::EngineCore
+  |                 |-- EngineCore (in-process)
+  |                 `-- resource_tracker
   |
   `-- ...
 ```
@@ -126,12 +128,12 @@ primitives must be:
 
 | Primitive               | What it does                                                 | Executed in                                |
 | ----------------------- | ------------------------------------------------------------ | ------------------------------------------ |
-| `init()`                | Cold start a model with random weights.                      | Child (spawns vLLM engine)                 |
+| `init(gpu)`             | Cold start a model with random weights on the given GPU.  Spawns the worker process and vLLM child. | Worker + Child                 |
 | `wait()`                | Block the main process until all pending commands complete.  | Main process                               |
 | `after(instance)`       | Sync with another instance (non-blocking from main process). | Worker (blocks until dependency satisfied) |
 | `sleep()`               | `llm.sleep(level=2)` -- frees GPU memory.                    | Child                                      |
-| `checkpoint()`          | Save CUDA state to CPU via `cuCheckpointProcess`* for the vLLM child and all its GPU-holding descendants (e.g. EngineCore). | Worker (ctypes) |
-| `restore()`             | Restore CUDA state via `cuCheckpointProcess`* for all previously checkpointed PIDs. | Worker (ctypes) |
+| `checkpoint()`          | Save CUDA state to CPU via `cuCheckpointProcess`*.  Instance becomes stateless (`gpu=None`). | Worker (ctypes) |
+| `restore(gpu)`          | Restore checkpointed CUDA state onto the specified GPU.  `gpu` is required. | Worker (ctypes) |
 | `attach()`              | Allocate pinned CPU memory and register for DMA.             | Child                                      |
 | `detach()`              | Free pinned CPU memory.                                      | Child                                      |
 | `stage(model_path)`     | Load safetensors into pinned CPU buffer.                     | Child                                      |
@@ -139,7 +141,8 @@ primitives must be:
 | `scatter()`             | Place weights from GPU staging buffer into model params.     | Child                                      |
 | `wake_up(["weights"])`  | Re-allocate weight tensors on GPU.                           | Child                                      |
 | `wake_up(["kv_cache"])` | Re-allocate KV cache on GPU.                                 | Child                                      |
-| `remove()`              | Release everything about the instance.                       | Worker + Child                             |
+| `teardown()`            | Tear down the instance, worker, and child.  Resets to created state, ready for `init(gpu)` again. | Worker + Child |
+| `remove()`              | Remove from the instance registry.  Call after `teardown().wait()`. | Main process |
 
 
 ## `after(instance)` -- Cross-Instance Dependencies
@@ -223,11 +226,11 @@ After scatter, the staging buffer is freed via
 ### Cold start and checkpoint
 
 ```python
-instance_1 = Instance(vllm_config_1, gpu=0)
-instance_2 = Instance(vllm_config_2, gpu=1)
+instance_1 = Instance(vllm_config_1)
+instance_2 = Instance(vllm_config_2)
 
-instance_1.init().attach().sleep().checkpoint()
-instance_2.init().attach().sleep().checkpoint()
+instance_1.init(gpu=0).attach().sleep().checkpoint()
+instance_2.init(gpu=1).attach().sleep().checkpoint()
 ```
 
 ### Initialize a new instance after another finishes
@@ -236,8 +239,8 @@ We need to wait for instance 1's checkpoint on GPU 0 before
 initializing instance 3 on the same GPU.
 
 ```python
-instance_3 = Instance(vllm_config_3, gpu=0)
-instance_3.after(instance_1).init().attach().sleep().checkpoint()
+instance_3 = Instance(vllm_config_3)
+instance_3.after(instance_1).init(gpu=0).attach().sleep().checkpoint()
 
 instance_3.wait()
 instance_2.wait()
@@ -246,20 +249,20 @@ instance_2.wait()
 We do not have to wait on instance 1.  The same sequence with chaining:
 
 ```python
-instance_3 = Instance(vllm_config_3, gpu=0).after(instance_1).init().attach().sleep().checkpoint()
+instance_3 = Instance(vllm_config_3).after(instance_1).init(gpu=0).attach().sleep().checkpoint()
 ```
 
 ### Restore (hot path)
 
 ```python
-instance_1.restore()
+instance_1.restore(gpu=0)
 instance_1.wake_up(["weights"])
 instance_1.stage("/data-fast/Qwen/Qwen3-1.7B")
 instance_1.h2d()
 instance_1.scatter()
 instance_1.wake_up(["kv_cache"])
 
-instance_2.restore()
+instance_2.restore(gpu=1)
 instance_2.wake_up(["weights"])
 instance_2.stage("/data-fast/nvidia/Llama-3.1-70B-Instruct-FP8")
 instance_2.h2d()
@@ -279,7 +282,7 @@ as long as it matches the architecture.
 instance_1.sleep().checkpoint()
 
 instance_3.after(instance_1)
-instance_3.restore()
+instance_3.restore(gpu=0)
 instance_3.wake_up(["weights"])
 instance_3.stage("/data-fast/Qwen/Qwen3-32B")
 instance_3.h2d()
@@ -294,13 +297,13 @@ instance_3.wait()
 vllm_config_4 = {"model": "Qwen/Qwen2.5-1.5B", "gpu_memory_utilization": 0.4}
 vllm_config_5 = {"model": "Qwen/Qwen3-1.7B", "gpu_memory_utilization": 0.4}
 
-instance_4 = Instance(vllm_config_4, gpu=1)
-instance_5 = Instance(vllm_config_5, gpu=1)
+instance_4 = Instance(vllm_config_4)
+instance_5 = Instance(vllm_config_5)
 
 instance_2.sleep().detach().checkpoint()
 
-instance_4.after(instance_2).init()
-instance_5.after(instance_4).init()
+instance_4.after(instance_2).init(gpu=1)
+instance_5.after(instance_4).init(gpu=1)
 instance_4.attach()
 instance_5.attach()
 instance_4.sleep().checkpoint()
@@ -312,8 +315,8 @@ instance_5.wait()
 Reload both on the same GPU at the same time:
 
 ```python
-instance_4.restore().wake_up(["weights"]).stage("/data-fast/Qwen/Qwen2.5-1.5B").h2d().scatter().wake_up(["kv_cache"])
-instance_5.restore().wake_up(["weights"]).stage("/data-fast/Qwen/Qwen3-1.7B").h2d().scatter().wake_up(["kv_cache"])
+instance_4.restore(gpu=1).wake_up(["weights"]).stage("/data-fast/Qwen/Qwen2.5-1.5B").h2d().scatter().wake_up(["kv_cache"])
+instance_5.restore(gpu=1).wake_up(["weights"]).stage("/data-fast/Qwen/Qwen3-1.7B").h2d().scatter().wake_up(["kv_cache"])
 
 instance_4.wait()
 instance_5.wait()
@@ -321,6 +324,24 @@ instance_5.wait()
 
 If on the same GPU, `init()` does not overlap.  It is the user's
 responsibility to serialize using `after`.
+
+### Cross-GPU migration
+
+Once checkpointed, an instance is stateless (`gpu=None`).  `restore(gpu)`
+specifies which GPU to restore onto -- it can be the same or a different
+GPU.
+
+```python
+instance = Instance(vllm_config)
+instance.init(gpu=0).attach().sleep().checkpoint().wait()
+# instance.gpu is now None
+
+# Restore on GPU 1
+instance.restore(gpu=1)
+instance.wake_up(["weights"]).stage(path).h2d().scatter().wake_up(["kv_cache"])
+instance.wait()
+# instance.gpu is now 1
+```
 
 ## Concurrency Model
 
@@ -365,14 +386,19 @@ instance.sleep().checkpoint().wait()
 Checkpoint and restore walk the full process tree of the vLLM child
 using `psutil`.  The `resource_tracker` process is skipped (no GPU).
 
-- **Checkpoint (bottom-up)**: freeze leaves first (EngineCore), then
-  the vLLM child.  This prevents the parent from hanging on IPC to a
-  frozen child.
-- **Restore (top-down)**: thaw the vLLM child first, then EngineCore.
-  This lets the parent be ready to receive when children resume.
+With `VLLM_ENABLE_V1_MULTIPROCESSING=0`, the EngineCore runs in-process
+so there is typically only the vLLM child process to checkpoint.  The
+process tree walk still handles any descendants that may hold GPU state.
 
 The list of checkpointed PIDs is stored so that restore uses the exact
 same set.
+
+### Cross-GPU Restore
+
+`restore(gpu)` supports restoring onto a different GPU using the CUDA
+driver's `CUcheckpointRestoreArgs` with `CUcheckpointGpuPair` UUID
+mapping (requires driver 580+).  The GPU pair mapping must be a valid
+permutation: old_gpu swaps with new_gpu, all others map to themselves.
 
 ## Instance Status
 
@@ -402,36 +428,17 @@ by reading `config.json` from the model path and extracting:
 ## File Structure
 
 ```
-staging/
-  instance.py       -- Instance class (standalone, owns worker process)
-  worker.py         -- Worker loop, child thread, checkpoint/restore ctypes
+semi_persistence/
+  instance.py       -- Instance class (GPU-agnostic handle, owns worker process)
+  worker.py         -- Worker loop, child thread, checkpoint/restore/migrate ctypes
   vllm_child.py     -- vLLM child process (owns GPU, pinned memory, staging)
-  __init__.py       -- Public API exports (`Instance`)
+  abstract.py       -- Abstract InstanceBase interface (reference only)
   main_test.py      -- Integration test
+  main_migrate.py   -- Cross-GPU migration test
   DESIGN.md         -- This file
 ```
 
 ## Known Issues
-
-### vLLM v0.16.0 sleep mode bug (vllm-project/vllm#32947)
-
-vLLM v0.16.0 has a bug in `gpu_worker.py:load_model()` where context
-managers are chained with `and` instead of `,`:
-
-```python
-with pool_ctx and config_ctx:  # BUG: only config_ctx is entered
-```
-
-This means `pool_ctx.__enter__()` is never called, so model weights are
-never tracked by `CuMemAllocator` and cannot be freed during sleep.
-The fix (applied as a local patch) uses comma-separated context
-managers:
-
-```python
-with (pool_ctx, config_ctx):   # FIXED: both are entered
-```
-
-Fixed upstream in v0.17.0+.
 
 ### cumem staging buffer free (PyTorch #145168)
 
@@ -444,10 +451,3 @@ buffer is freed via:
 torch.cuda.caching_allocator_delete(staging_ptr)
 torch.cuda.empty_cache()
 ```
-
-### `mlock` limits
-
-The OS may impose per-process `mlock` limits (check `ulimit -l`).  Since
-each child allocates its own pinned memory, the limit applies per child
-process.  For large models, the limit may need to be raised
-(`ulimit -l unlimited`).
