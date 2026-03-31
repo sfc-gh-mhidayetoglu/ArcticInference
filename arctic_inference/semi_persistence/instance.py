@@ -80,19 +80,27 @@ class Instance:
         self._completed_counter = _fork_ctx.Value('i', 0)
         _counter_registry[self.instance_id] = self._completed_counter
         self._worker = None
+        self.last_generate_result = None
 
     def __repr__(self):
         return (f"Instance(id={self.instance_id}, gpu={self.gpu}, "
-                f"arch={self.arch[0] if self.arch else None}, "
                 f"pid={self.pid}, state={self.state}, "
                 f"pinned={self.pinned_bytes / 2**30:.2f} GiB)")
 
     # -- Internal helpers -------------------------------------------------------
 
     def _reset(self):
-        """Reset instance to created state after remove completes."""
+        """Reset instance to created state after teardown completes."""
         if self._worker is not None:
-            self._worker.join(timeout=30)
+            self._worker.join(timeout=10)
+            if self._worker.is_alive():
+                self._print(f"[inst{self.instance_id}] worker still alive after join, force-killing")
+                try:
+                    import signal
+                    os.kill(self._worker.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self._worker.join(timeout=5)
             self._worker = None
         self.state = "created"
         self.gpu = None
@@ -166,6 +174,11 @@ class Instance:
         self._log("scatter")
         return self._send("scatter")
 
+    def generate(self, prompts, sampling_params):
+        self._log(f"generate({len(prompts)} prompts)")
+        return self._send("generate", prompts=prompts,
+                           sampling_params=sampling_params)
+
     def teardown(self):
         self._log("teardown")
         return self._send("teardown")
@@ -230,6 +243,8 @@ class Instance:
                 elif cmd == "restore":
                     self.gpu = info.get("gpu", self.gpu)
                     self.state = "alive"
+                elif cmd == "generate":
+                    self.last_generate_result = info.get("outputs")
                 elif cmd == "teardown":
                     self._reset()
 

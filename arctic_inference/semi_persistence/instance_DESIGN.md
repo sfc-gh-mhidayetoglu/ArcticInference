@@ -141,6 +141,7 @@ primitives must be:
 | `scatter()`             | Place weights from GPU staging buffer into model params.     | Child                                      |
 | `wake_up(["weights"])`  | Re-allocate weight tensors on GPU.                           | Child                                      |
 | `wake_up(["kv_cache"])` | Re-allocate KV cache on GPU.                                 | Child                                      |
+| `generate(prompts, sp)` | Run inference via `llm.generate()`.  Result stored in `last_generate_result`. | Child                     |
 | `teardown()`            | Tear down the instance, worker, and child.  Resets to created state, ready for `init(gpu)` again. | Worker + Child |
 | `remove()`              | Remove from the instance registry.  Call after `teardown().wait()`. | Main process |
 
@@ -207,19 +208,29 @@ Each shard's pinned region is copied to a GPU staging buffer via
 `dst.copy_(src, non_blocking=True)`.  All shards are launched async,
 then a single `torch.cuda.synchronize()` waits for completion.
 
+### Index separation (CPU vs GPU offsets)
+
+`stage` builds an `index` dict mapping weight names to
+`(byte_offset, length, dtype, shape)` tuples.  These offsets point into
+the pinned CPU buffer and are **never mutated** after `stage`.
+
+`h2d` builds a separate `gpu_index` dict by remapping CPU offsets to
+GPU staging buffer offsets.  `gpu_index` is rebuilt fresh on every
+`h2d` call, so the CPU `index` remains valid across generate cycles
+without any save/restore bookkeeping.
+
 ### scatter (GPU staging -> model params)
 
-`_scatter_into_model` reads from the GPU staging buffer and copies into
-vLLM model parameter tensors.  Handles:
-
-- q/k/v -> qkv_proj stacking
-- gate/up -> gate_up_proj stacking
-- FP8 weight transposition
-- Per-tensor scale merging
+`_scatter_into_model` iterates over `gpu_index` and yields
+`(name, tensor)` pairs to `model.load_weights()` -- vLLM's own weight
+loader.  This delegates all name mapping, fused parameter handling
+(q/k/v -> qkv_proj, gate/up -> gate_up_proj), and per-tensor scale
+merging to vLLM internals.
 
 After scatter, the staging buffer is freed via
-`torch.cuda.caching_allocator_delete(ptr)` followed by
-`torch.cuda.empty_cache()`.
+`buf_gpu.storage().resize_(0)` followed by `torch.cuda.empty_cache()`.
+This releases memory through PyTorch's normal caching allocator path,
+keeping allocator metadata consistent for CRIU checkpoint/restore.
 
 ## Command Sequences
 
@@ -229,9 +240,14 @@ After scatter, the staging buffer is freed via
 instance_1 = Instance(vllm_config_1)
 instance_2 = Instance(vllm_config_2)
 
-instance_1.init(gpu=0).attach().sleep().checkpoint()
-instance_2.init(gpu=1).attach().sleep().checkpoint()
+instance_1.init(gpu=0).attach().stage().sleep().checkpoint()
+instance_2.init(gpu=1).attach().stage().sleep().checkpoint()
 ```
+
+`attach()` allocates pinned CPU memory sized to the model's weight
+footprint.  `stage()` loads safetensors from disk into the pinned
+buffer.  The pinned buffer survives `sleep()` and `checkpoint()` since
+it is CPU memory, not GPU.
 
 ### Initialize a new instance after another finishes
 
@@ -240,7 +256,7 @@ initializing instance 3 on the same GPU.
 
 ```python
 instance_3 = Instance(vllm_config_3)
-instance_3.after(instance_1).init(gpu=0).attach().sleep().checkpoint()
+instance_3.after(instance_1).init(gpu=0).attach().stage().sleep().checkpoint()
 
 instance_3.wait()
 instance_2.wait()
@@ -249,32 +265,46 @@ instance_2.wait()
 We do not have to wait on instance 1.  The same sequence with chaining:
 
 ```python
-instance_3 = Instance(vllm_config_3).after(instance_1).init(gpu=0).attach().sleep().checkpoint()
+instance_3 = Instance(vllm_config_3).after(instance_1).init(gpu=0).attach().stage().sleep().checkpoint()
 ```
 
-### Restore (hot path)
+### Restore and generate (hot path)
+
+After cold-start, weights are already staged in pinned CPU memory.
+Restore only needs to move them CPU→GPU:
 
 ```python
 instance_1.restore(gpu=0)
 instance_1.wake_up(["weights"])
-instance_1.stage("/data-fast/Qwen/Qwen3-1.7B")
 instance_1.h2d()
 instance_1.scatter()
 instance_1.wake_up(["kv_cache"])
-
-instance_2.restore(gpu=1)
-instance_2.wake_up(["weights"])
-instance_2.stage("/data-fast/nvidia/Llama-3.1-70B-Instruct-FP8")
-instance_2.h2d()
-instance_2.scatter()
-instance_2.wake_up(["kv_cache"])
-
+instance_1.generate(prompts, sampling_params)
 instance_1.wait()
-instance_2.wait()
+result = instance_1.last_generate_result
 ```
 
-Here we load the user's desired weights.  We can load any set of weights
-as long as it matches the architecture.
+To re-checkpoint after generate:
+
+```python
+instance_1.sleep().checkpoint().wait()
+```
+
+### Restore with different weights
+
+`stage(data_path)` can load a different set of weights as long as the
+architecture matches.  This replaces the pinned buffer contents:
+
+```python
+instance_1.restore(gpu=0)
+instance_1.wake_up(["weights"])
+instance_1.stage("/data-fast/Qwen/Qwen3-1.7B-finetuned")
+instance_1.h2d()
+instance_1.scatter()
+instance_1.wake_up(["kv_cache"])
+instance_1.generate(prompts, sampling_params)
+instance_1.wait()
+```
 
 ### Swap active model on a GPU
 
@@ -429,25 +459,72 @@ by reading `config.json` from the model path and extracting:
 
 ```
 semi_persistence/
-  instance.py       -- Instance class (GPU-agnostic handle, owns worker process)
-  worker.py         -- Worker loop, child thread, checkpoint/restore/migrate ctypes
-  vllm_child.py     -- vLLM child process (owns GPU, pinned memory, staging)
-  abstract.py       -- Abstract InstanceBase interface (reference only)
-  main_test.py      -- Integration test
-  main_migrate.py   -- Cross-GPU migration test
-  DESIGN.md         -- This file
+  instance.py        -- Instance class (GPU-agnostic handle, owns worker process)
+  worker.py          -- Worker loop, child thread, checkpoint/restore/migrate ctypes
+  vllm_child.py      -- vLLM child process (owns GPU, pinned memory, staging)
+  orchestrator.py    -- Orchestrator class (see orchestrator_DESIGN.md)
+  abstract.py        -- Abstract InstanceBase interface (reference only)
+  demo.py            -- CLI demo script (stdout/stderr redirected to log file)
+  demo.ipynb         -- Jupyter notebook demo
+  main_test.py       -- Integration test
+  test_migrate.py    -- Cross-GPU migration test
+  instance_DESIGN.md -- This file
 ```
 
 ## Known Issues
 
-### cumem staging buffer free (PyTorch #145168)
+### Staging buffer must be freed via `storage().resize_(0)`
 
 When vLLM's sleep mode is enabled, the cumem pluggable allocator
 intercepts all `torch.empty(..., device="cuda")` calls -- including the
-GPU staging buffer allocated during `h2d`.  After scatter, the staging
-buffer is freed via:
+GPU staging buffer allocated during `h2d`.  The buffer **must** be freed
+via `buf_gpu.storage().resize_(0)`, not `caching_allocator_delete(ptr)`.
 
-```python
-torch.cuda.caching_allocator_delete(staging_ptr)
-torch.cuda.empty_cache()
-```
+`caching_allocator_delete` tells PyTorch the memory was freed
+externally, which corrupts the caching allocator's internal block
+tracking.  When CRIU restores the process, the allocator uses stale
+metadata and subsequent GPU allocations crash with
+`c10::Error: invalid device pointer`.
+
+`storage().resize_(0)` releases memory through the normal allocator
+`free` path, keeping block metadata consistent across
+checkpoint/restore cycles.
+
+### Quantized models not supported (GPTQ, FP8)
+
+Quantized models (GPTQ-Int4, FP8) are **not supported** by the
+semi-persistence scatter path.  The issue has three layers:
+
+1. **`model.load_weights()` fails** — with `load_format=dummy`, vLLM
+   creates some quantized parameters as plain `nn.Parameter` without
+   the custom `weight_loader` / `output_dim` attributes that
+   `model.load_weights()` expects.  This causes `AttributeError` on
+   the first scatter call.
+
+2. **Direct copy is insufficient** — even if weights are copied into
+   model parameters by name, quantized kernels (Marlin for GPTQ,
+   cutlass for FP8) require `process_weights_after_loading()` to
+   repack weights from HF format into kernel-specific layout (e.g.
+   Marlin packing, scale reordering).
+
+3. **Repacking after sleep/wake fails** — `sleep(level=2)` discards
+   all GPU memory.  `wake_up(["weights"])` re-allocates empty tensors.
+   `process_weights_after_loading()` expects the original weight
+   format, but after wake-up the memory is zeroed.  The repacking
+   produces garbage because it operates on empty data.
+
+Non-quantized models (BF16, FP32) work correctly because their weights
+are plain tensors that can be directly copied without post-processing.
+
+To support quantized models, one of these approaches would be needed:
+
+- **Store repacked weights**: after the initial `load_format=auto`
+  load, save the Marlin-repacked tensors to the pinned CPU buffer
+  instead of the raw HF safetensor data.  Scatter would then copy
+  pre-repacked data directly, skipping `process_weights_after_loading`.
+- **Use `load_format=auto` during init**: load real weights at init
+  time (slower cold start) so all parameter attributes are set
+  correctly, then use `model.load_weights()` normally on scatter.
+- **Dequantize at stage time**: convert quantized weights to BF16
+  during stage, then load as a non-quantized model.  Trades memory
+  for compatibility.

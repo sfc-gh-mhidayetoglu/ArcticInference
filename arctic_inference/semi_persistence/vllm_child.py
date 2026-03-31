@@ -33,7 +33,8 @@ def _shard_layout(model_path):
     d = model_path.rstrip("/")
     files = sorted(_glob.glob(f"{d}/model-*.safetensors"))
     if not files:
-        files = sorted(_glob.glob(f"{d}/model.safetensors"))
+        files = sorted(_glob.glob(f"{d}/model.safetensors*"))
+    files = [f for f in files if not f.endswith(".index.json")]
 
     shards = []
     for p in files:
@@ -51,87 +52,22 @@ def _shard_layout(model_path):
     return shards
 
 
-def _get_tensor(buf_gpu, index, name):
-    offset, length, dtype_str, shape = index[name]
-    dt = SAFETENSORS_DTYPE_MAP[dtype_str]
-    return buf_gpu[offset:offset + length].view(dt).reshape(shape)
-
-
 def _scatter_into_model(model, buf_gpu, index):
-    """Copy safetensor data from GPU staging buffer into model params.
+    """Load weights from GPU staging buffer into model using vLLM's own
+    weight loading logic (handles fused params, sharding, name mapping)."""
 
-    Handles q/k/v -> qkv_proj stacking, gate/up -> gate_up_proj stacking,
-    FP8 weight transposition, per-tensor scale merging, and direct copy.
-    """
-    params = dict(model.named_parameters())
+    def _weight_iter():
+        for name in sorted(index):
+            offset, length, dtype_str, shape = index[name]
+            dt = SAFETENSORS_DTYPE_MAP[dtype_str]
+            tensor = buf_gpu[offset:offset + length].view(dt).reshape(shape)
+            yield name, tensor
 
-    STACKED = [
-        (".qkv_proj", [(".q_proj", "q"), (".k_proj", "k"), (".v_proj", "v")]),
-        (".gate_up_proj", [(".gate_proj", 0), (".up_proj", 1)]),
-    ]
+    loaded = model.load_weights(_weight_iter())
 
-    FP8_DTYPES = {torch.float8_e4m3fn, torch.float8_e5m2}
-
-    loaded = set()
-
-    for param_name, param in params.items():
-        if param_name in loaded:
-            continue
-
-        handled = False
-        for fused_suffix, shard_defs in STACKED:
-            if fused_suffix not in param_name:
-                continue
-
-            base = param_name.split(fused_suffix)[0]
-            attr = param_name.split(fused_suffix)[1]
-
-            if attr == ".weight":
-                parts = []
-                for shard_suffix, _ in shard_defs:
-                    st_name = base + shard_suffix + attr
-                    if st_name in index:
-                        parts.append(_get_tensor(buf_gpu, index, st_name))
-                if parts:
-                    stacked = torch.cat(parts, dim=0)
-                    if param.dtype in FP8_DTYPES:
-                        param.data.copy_(stacked.t())
-                    else:
-                        param.data.copy_(stacked)
-                    loaded.add(param_name)
-                    handled = True
-            elif "scale" in attr:
-                vals = []
-                for shard_suffix, _ in shard_defs:
-                    st_name = base + shard_suffix + attr
-                    if st_name in index:
-                        vals.append(_get_tensor(buf_gpu, index, st_name))
-                if vals:
-                    merged = torch.stack(vals).max()
-                    param.data.fill_(merged.item())
-                    loaded.add(param_name)
-                    handled = True
-            break
-
-        if handled:
-            continue
-
-        st_name = param_name
-        if st_name not in index:
-            if "lm_head.weight" in param_name and "model.embed_tokens.weight" in index:
-                st_name = "model.embed_tokens.weight"
-            else:
-                continue
-
-        src = _get_tensor(buf_gpu, index, st_name)
-
-        if param.dtype in FP8_DTYPES and src.dim() == 2:
-            param.data.copy_(src.t())
-        elif param.numel() == 1 and src.numel() == 1:
-            param.data.fill_(src.item())
-        else:
-            param.data.copy_(src)
-        loaded.add(param_name)
+    total_params = len(dict(model.named_parameters()))
+    print(f"[scatter] loaded {len(loaded)}/{total_params} params "
+          f"(index has {len(index)} tensors)", flush=True)
 
     return loaded
 
@@ -149,15 +85,24 @@ def _readinto_until_full(path, view, lo, size):
 
 def _load_shard(shard_path, buf_np, buf_offset, data_offset, data_size,
                 use_odirect):
-    """Load one shard file into its pinned fragment."""
+    """Load one shard file into its pinned fragment.
+
+    data_offset is relative to the start of the data section in the
+    safetensors file.  We add the header prefix (8-byte length + JSON
+    header) to get the absolute file offset.
+    """
+    with open(shard_path, "rb") as fh:
+        header_len = struct.unpack("<Q", fh.read(8))[0]
+    abs_offset = 8 + header_len + data_offset
+
     if use_odirect:
         from kvikio import CuFile
         dst = buf_np[buf_offset:buf_offset + data_size]
         with CuFile(shard_path, "r") as f:
-            f.read(dst, size=data_size, file_offset=data_offset)
+            f.read(dst, size=data_size, file_offset=abs_offset)
     else:
         view = memoryview(buf_np[buf_offset:buf_offset + data_size])
-        _readinto_until_full(shard_path, view, data_offset, data_size)
+        _readinto_until_full(shard_path, view, abs_offset, data_size)
 
 
 def _read_header(path):
@@ -180,12 +125,18 @@ def vllm_child_loop(pipe_conn, rank, use_odirect, arch):
     # >4 GiB (msgspec Ext limit) and is slow even for small models (~16s
     # vs 0.2s). With =0, apply_model calls the function directly.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+    _devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_devnull, 2)
+    os.close(_devnull)
+
     torch.cuda.set_device(0)
 
     llm = None
     model_path = None
     buf_gpu = None
     index = None
+    gpu_index = None
 
     pinned_buf = None
     fragment_info = None
@@ -251,12 +202,23 @@ def vllm_child_loop(pipe_conn, rank, use_odirect, arch):
 
             elif cmd == "sleep":
                 llm.sleep(level=2)
+                torch.cuda.synchronize(0)
+                torch.cuda.empty_cache()
 
             elif cmd == "stage":
                 stage_path = kwargs.get("data_path") or model_path
 
                 if fragment_info is None:
                     raise RuntimeError("stage requires attach first")
+                if not fragment_info:
+                    _clog("  no fragments to stage (dummy weights?), skipping")
+                    info["bytes"] = 0
+                    elapsed = time.perf_counter() - t0
+                    status = "OK"
+                    _clog(f"<<< {cmd} {status} ({elapsed:.3f}s)")
+                    info["arch"] = arch
+                    pipe_conn.send((cmd, elapsed, None, info))
+                    continue
                 if pinned_buf is None:
                     raise RuntimeError("pinned_buf not set")
 
@@ -276,8 +238,10 @@ def vllm_child_loop(pipe_conn, rank, use_odirect, arch):
                     if f.startswith("model-") and f.endswith(".safetensors")
                 )
                 if not shard_files:
-                    shard_files = [f for f in os.listdir(stage_path)
-                                   if f == "model.safetensors"]
+                    shard_files = sorted(
+                        f for f in os.listdir(stage_path)
+                        if f.startswith("model.safetensors") and not f.endswith(".index.json")
+                    )
 
                 frag_by_name = {}
                 for shard_path, buf_offset, data_offset, data_size in fragment_info:
@@ -344,20 +308,27 @@ def vllm_child_loop(pipe_conn, rank, use_odirect, arch):
                             gpu_off = gpu_base + (cpu_off - buf_offset)
                             gpu_index[name] = (gpu_off, length, dtype_str, shape)
                             break
-                index = gpu_index
 
             elif cmd == "scatter":
-                staging_ptr_val = buf_gpu.data_ptr()
                 def _scatter(model):
-                    return _scatter_into_model(model, buf_gpu, index)
+                    return _scatter_into_model(model, buf_gpu, gpu_index)
                 llm.apply_model(_scatter)
-                del _scatter, buf_gpu
+                del _scatter
+                buf_gpu.storage().resize_(0)
+                del buf_gpu
                 buf_gpu = None
-                torch.cuda.caching_allocator_delete(staging_ptr_val)
                 torch.cuda.empty_cache()
 
             elif cmd == "wake_up_kv_cache":
                 llm.wake_up(tags=["kv_cache"])
+
+            elif cmd == "generate":
+                from vllm import SamplingParams
+                sp = SamplingParams(**kwargs["sampling_params"])
+                outputs = llm.generate(kwargs["prompts"], sp)
+                info["outputs"] = [
+                    [o.text for o in req.outputs] for req in outputs
+                ]
 
             else:
                 error = f"unknown command: {cmd}"

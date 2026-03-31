@@ -10,6 +10,35 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 
+class OrchestratorBase(ABC):
+    """Abstract interface for an orchestrator that manages named model instances."""
+
+    @staticmethod
+    @abstractmethod
+    def init(local_cache: str, gpu_carveout_gb: float = 0) -> None:
+        """Discover GPUs and configure the orchestrator."""
+
+    @staticmethod
+    @abstractmethod
+    def register(model_id: str, vllm_config: dict) -> str:
+        """Register a model under *model_id* with the given vLLM config."""
+
+    @staticmethod
+    @abstractmethod
+    def generate(model_id: str, prompts: list[str], sampling_params: dict) -> list:
+        """Run inference on the registered model."""
+
+    @staticmethod
+    @abstractmethod
+    def remove(model_id: str) -> None:
+        """Tear down and de-register the model."""
+
+    @staticmethod
+    @abstractmethod
+    def print_status() -> None:
+        """Print GPU view and registered models."""
+
+
 class InstanceBase(ABC):
     """Abstract interface for a vLLM instance.
 

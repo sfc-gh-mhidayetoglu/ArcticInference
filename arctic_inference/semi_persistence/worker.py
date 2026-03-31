@@ -40,7 +40,8 @@ def _weight_footprint(model_path):
     d = model_path.rstrip("/")
     files = sorted(_glob.glob(f"{d}/model-*.safetensors"))
     if not files:
-        files = sorted(_glob.glob(f"{d}/model.safetensors"))
+        files = sorted(_glob.glob(f"{d}/model.safetensors*"))
+    files = [f for f in files if not f.endswith(".index.json")]
     total = 0
     for p in files:
         with open(p, "rb") as f:
@@ -65,7 +66,8 @@ def _shard_layout(model_path):
     d = model_path.rstrip("/")
     files = sorted(_glob.glob(f"{d}/model-*.safetensors"))
     if not files:
-        files = sorted(_glob.glob(f"{d}/model.safetensors"))
+        files = sorted(_glob.glob(f"{d}/model.safetensors*"))
+    files = [f for f in files if not f.endswith(".index.json")]
 
     shards = []
     for p in files:
@@ -144,6 +146,20 @@ def _get_descendant_pids(pid):
     children = [c for c in children if "resource_tracker" not in " ".join(c.cmdline())]
     children.reverse()
     return [c.pid for c in children]
+
+
+def _kill_process_tree(pid):
+    """SIGKILL a process and all its descendants (leaves first)."""
+    import signal as _sig
+    for desc_pid in _get_descendant_pids(pid):
+        try:
+            os.kill(desc_pid, _sig.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.kill(pid, _sig.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 class CUuuid(ctypes.Structure):
@@ -275,11 +291,7 @@ def _child_thread(rank, child_pid, pipe, arch,
                 pipe.send(("exit", {}))
                 pipe.recv()
             pipe.close()
-            import signal as _sig
-            try:
-                os.kill(child_pid, _sig.SIGKILL)
-            except ProcessLookupError:
-                pass
+            _kill_process_tree(child_pid)
             _tlog("exited")
             break
 
@@ -326,12 +338,8 @@ def _child_thread(rank, child_pid, pipe, arch,
             error = None
             info = {"arch": arch}
             try:
-                if state == "alive":
-                    pipe.send(("exit", {}))
-                    pipe.recv()
                 pipe.close()
-                import signal as _sig
-                os.kill(child_pid, _sig.SIGKILL)
+                _kill_process_tree(child_pid)
                 state = "removed"
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
@@ -420,7 +428,11 @@ def worker_loop(rank, cmd_queue, result_queue, completed_counter,
             if child_thread_obj is not None:
                 child_thread_obj.join(timeout=30)
             if child_proc is not None:
-                child_proc.join(timeout=30)
+                child_proc.join(timeout=5)
+                if child_proc.is_alive():
+                    _wlog("child_proc still alive after join, force-killing")
+                    _kill_process_tree(child_proc.pid)
+                    child_proc.join(timeout=5)
             break
 
         if cmd == "exit":
@@ -429,7 +441,11 @@ def worker_loop(rank, cmd_queue, result_queue, completed_counter,
             if child_thread_obj is not None:
                 child_thread_obj.join(timeout=30)
             if child_proc is not None:
-                child_proc.join(timeout=30)
+                child_proc.join(timeout=5)
+                if child_proc.is_alive():
+                    _wlog("child_proc still alive after join, force-killing")
+                    _kill_process_tree(child_proc.pid)
+                    child_proc.join(timeout=5)
             result_queue.put(("exit", 0.0, None, {}))
             break
 
