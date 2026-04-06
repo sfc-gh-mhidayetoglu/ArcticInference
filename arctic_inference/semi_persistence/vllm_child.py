@@ -1,148 +1,66 @@
 """vLLM child process loop.
 
-Spawned (not forked) by the worker process.  Owns CUDA and vLLM.
+Spawned by the worker process.  Owns CUDA and vLLM.
 Reads (cmd, kwargs) from a pipe, puts results on result_queue.
 
-On attach, allocates its own pinned CPU memory via torch pin_memory.
-On detach, frees it.  stage loads shards into the pinned buffer.
-h2d copies to GPU.  scatter places weights into model params.
+Init loads real weights (load_format=auto) so that vLLM runs
+process_weights_after_loading and produces its internal kernel format
+(Marlin-packed for GPTQ, cutlass layout for FP8, plain tensors for
+BF16).
+
+Attach allocates pinned CPU memory sized to model.named_parameters().
+Stage snapshots the post-processed GPU parameters into the pinned
+buffer.  h2d copies the pinned buffer to a GPU staging buffer.
+Scatter copies directly into model parameters by name.
 """
-import sys, os, time, ctypes, json, struct
-import glob as _glob
-from concurrent.futures import ThreadPoolExecutor
+import ctypes, os, sys, time
 
 import torch
 
-
-SAFETENSORS_DTYPE_MAP = {
-    "F16": torch.float16, "BF16": torch.bfloat16,
-    "F32": torch.float32, "F64": torch.float64,
-    "F8_E4M3": torch.float8_e4m3fn,
-    "I8": torch.int8, "I16": torch.int16,
-    "I32": torch.int32, "I64": torch.int64,
-    "U8": torch.uint8, "BOOL": torch.bool,
-}
+_cudart = ctypes.CDLL("libcudart.so")
+_cudart.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+_cudart.cudaHostUnregister.restype = ctypes.c_int
+_cudart.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+_cudart.cudaHostRegister.restype = ctypes.c_int
 
 
-def _shard_layout(model_path):
-    """Read safetensors headers and return per-shard info.
-
-    Returns list of (shard_path, data_offset, data_size, tensors) where
-    tensors is [(name, start, end, dtype, shape), ...].
-    """
-    d = model_path.rstrip("/")
-    files = sorted(_glob.glob(f"{d}/model-*.safetensors"))
-    if not files:
-        files = sorted(_glob.glob(f"{d}/model.safetensors*"))
-    files = [f for f in files if not f.endswith(".index.json")]
-
-    shards = []
-    for p in files:
-        with open(p, "rb") as f:
-            n = struct.unpack("<Q", f.read(8))[0]
-            header = json.loads(f.read(n))
-        tensors = [(name, info["data_offsets"][0], info["data_offsets"][1],
-                     info["dtype"], info["shape"])
-                    for name, info in header.items() if name != "__metadata__"]
-        if not tensors:
-            continue
-        lo = min(s for _, s, _, _, _ in tensors)
-        hi = max(e for _, _, e, _, _ in tensors)
-        shards.append((p, lo, hi - lo, tensors))
-    return shards
+def _unpin_buffer(buf):
+    ret = _cudart.cudaHostUnregister(ctypes.c_void_p(buf.data_ptr()))
+    if ret != 0:
+        raise RuntimeError(f"cudaHostUnregister failed with cudaError={ret}")
 
 
-def _scatter_into_model(model, buf_gpu, index):
-    """Load weights from GPU staging buffer into model using vLLM's own
-    weight loading logic (handles fused params, sharding, name mapping)."""
-
-    def _weight_iter():
-        for name in sorted(index):
-            offset, length, dtype_str, shape = index[name]
-            dt = SAFETENSORS_DTYPE_MAP[dtype_str]
-            tensor = buf_gpu[offset:offset + length].view(dt).reshape(shape)
-            yield name, tensor
-
-    loaded = model.load_weights(_weight_iter())
-
-    total_params = len(dict(model.named_parameters()))
-    print(f"[scatter] loaded {len(loaded)}/{total_params} params "
-          f"(index has {len(index)} tensors)", flush=True)
-
-    return loaded
+def _repin_buffer(buf):
+    ret = _cudart.cudaHostRegister(
+        ctypes.c_void_p(buf.data_ptr()),
+        ctypes.c_size_t(buf.numel() * buf.element_size()),
+        ctypes.c_uint(0),
+    )
+    if ret != 0:
+        raise RuntimeError(f"cudaHostRegister failed with cudaError={ret}")
 
 
-def _readinto_until_full(path, view, lo, size):
-    with open(path, "rb") as f:
-        f.seek(lo)
-        while size > 0:
-            n = f.readinto(view)
-            if n == 0:
-                raise RuntimeError(f"short read: {path}")
-            size -= n
-            view = view[n:]
-
-
-def _load_shard(shard_path, buf_np, buf_offset, data_offset, data_size,
-                use_odirect):
-    """Load one shard file into its pinned fragment.
-
-    data_offset is relative to the start of the data section in the
-    safetensors file.  We add the header prefix (8-byte length + JSON
-    header) to get the absolute file offset.
-    """
-    with open(shard_path, "rb") as fh:
-        header_len = struct.unpack("<Q", fh.read(8))[0]
-    abs_offset = 8 + header_len + data_offset
-
-    if use_odirect:
-        from kvikio import CuFile
-        dst = buf_np[buf_offset:buf_offset + data_size]
-        with CuFile(shard_path, "r") as f:
-            f.read(dst, size=data_size, file_offset=abs_offset)
-    else:
-        view = memoryview(buf_np[buf_offset:buf_offset + data_size])
-        _readinto_until_full(shard_path, view, abs_offset, data_size)
-
-
-def _read_header(path):
-    with open(path, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        return json.loads(f.read(n))
-
-
-def vllm_child_loop(pipe_conn, rank, use_odirect, arch):
-    """Runs in a spawned child process: owns CUDA and vLLM.
-
-    Reads (cmd, kwargs) from pipe_conn.  Sends result tuples back
-    through the same pipe; the worker's child thread relays them
-    to the fork-context result_queue.
-    """
+def vllm_child_loop(pipe_conn, rank):
+    """Runs in a spawned child process: owns CUDA and vLLM."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
-    # Run EngineCore in-process to avoid IPC serialization of GPU tensors
-    # during scatter (apply_model). With multiprocessing=1, the closure
-    # capturing buf_gpu gets pickled over ZMQ, which fails for models
-    # >4 GiB (msgspec Ext limit) and is slow even for small models (~16s
-    # vs 0.2s). With =0, apply_model calls the function directly.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-
-    _devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(_devnull, 2)
-    os.close(_devnull)
+    os.environ["USE_LIBUV"] = "0"
 
     torch.cuda.set_device(0)
 
     llm = None
-    model_path = None
+    pinned_buf = None
+    index = None       # {name: (offset, nbytes, dtype, shape)}
     buf_gpu = None
-    index = None
     gpu_index = None
 
-    pinned_buf = None
-    fragment_info = None
-
     def _clog(msg):
-        print(f"[gpu{rank}] [{time.strftime('%H:%M:%S', time.localtime())}] {msg}", flush=True)
+        try:
+            print(f"[gpu{rank}] [{time.strftime('%H:%M:%S', time.localtime())}] {msg}", flush=True)
+        except OSError:
+            pass
+
+    _stdout_fixed = False
 
     while True:
         try:
@@ -150,10 +68,19 @@ def vllm_child_loop(pipe_conn, rank, use_odirect, arch):
         except EOFError:
             break
 
+        if not _stdout_fixed:
+            try:
+                sys.stdout.write("")
+                sys.stdout.flush()
+            except OSError:
+                _devnull = open(os.devnull, "w")
+                sys.stdout = _devnull
+                sys.stderr = _devnull
+                _stdout_fixed = True
+
         if cmd == "exit":
             _clog("exit")
             pinned_buf = None
-            fragment_info = None
             pipe_conn.send("exit_ack")
             break
 
@@ -165,40 +92,56 @@ def vllm_child_loop(pipe_conn, rank, use_odirect, arch):
         try:
             if cmd == "init":
                 vllm_config = dict(kwargs["vllm_config"])
-                vllm_config["load_format"] = "dummy"
                 vllm_config["enable_sleep_mode"] = True
-                model_path = vllm_config["model"]
 
                 from vllm import LLM
                 llm = LLM(**vllm_config)
                 info["pid"] = os.getpid()
 
             elif cmd == "attach":
-                attach_path = kwargs.get("model_path") or model_path
-                if attach_path is None:
-                    raise RuntimeError("attach requires model_path (call init first or pass explicitly)")
+                if llm is None:
+                    raise RuntimeError("attach requires init first")
 
-                shards = _shard_layout(attach_path)
-                total_size = sum(size for _, _, size, _ in shards)
+                def _compute_layout(model):
+                    layout = []
+                    for name, param in model.named_parameters():
+                        d = param.data
+                        layout.append((name, d.nbytes, d.dtype, tuple(d.shape)))
+                    return layout
 
-                pinned_buf = torch.empty(total_size, dtype=torch.uint8,
-                                         pin_memory=True)
+                layout = llm.apply_model(_compute_layout)[0]
+                total_size = sum(nbytes for _, nbytes, _, _ in layout)
 
-                buf_offset = 0
-                fragment_info = []
-                for shard_path, data_offset, data_size, tensors in shards:
-                    fragment_info.append((shard_path, buf_offset, data_offset, data_size))
-                    buf_offset += data_size
+                pinned_buf = torch.empty(total_size, dtype=torch.uint8)
+
+                index = {}
+                offset = 0
+                for name, nbytes, dtype, shape in layout:
+                    index[name] = (offset, nbytes, dtype, shape)
+                    offset += nbytes
 
                 info["pinned_bytes"] = total_size
-                _clog(f"  allocated {total_size / 2**30:.2f} GiB pinned memory")
+                _clog(f"  allocated {total_size / 2**30:.2f} GiB pinned memory "
+                      f"({len(layout)} params)")
 
             elif cmd == "detach":
                 if pinned_buf is not None:
                     total = pinned_buf.numel()
                     pinned_buf = None
-                    fragment_info = None
+                    index = None
                     _clog(f"  freed {total / 2**30:.2f} GiB pinned memory")
+
+            elif cmd == "unpin":
+                if pinned_buf is None:
+                    raise RuntimeError("unpin requires attach first")
+                _unpin_buffer(pinned_buf)
+                _clog(f"  unpinned {pinned_buf.numel() / 2**30:.2f} GiB")
+
+            elif cmd == "repin":
+                if pinned_buf is None:
+                    raise RuntimeError("repin requires attach first")
+                _repin_buffer(pinned_buf)
+                _clog(f"  repinned {pinned_buf.numel() / 2**30:.2f} GiB")
 
             elif cmd == "sleep":
                 llm.sleep(level=2)
@@ -206,121 +149,166 @@ def vllm_child_loop(pipe_conn, rank, use_odirect, arch):
                 torch.cuda.empty_cache()
 
             elif cmd == "stage":
-                stage_path = kwargs.get("data_path") or model_path
-
-                if fragment_info is None:
-                    raise RuntimeError("stage requires attach first")
-                if not fragment_info:
-                    _clog("  no fragments to stage (dummy weights?), skipping")
-                    info["bytes"] = 0
-                    elapsed = time.perf_counter() - t0
-                    status = "OK"
-                    _clog(f"<<< {cmd} {status} ({elapsed:.3f}s)")
-                    info["arch"] = arch
-                    pipe_conn.send((cmd, elapsed, None, info))
-                    continue
                 if pinned_buf is None:
-                    raise RuntimeError("pinned_buf not set")
+                    raise RuntimeError("stage requires attach first")
+                if index is None:
+                    raise RuntimeError("no index (call attach first)")
 
-                buf_np = pinned_buf.numpy()
+                _pinned = pinned_buf
+                _index = index
 
-                if use_odirect:
-                    try:
-                        import kvikio.defaults
-                        kvikio.defaults.set("num_threads", max(len(fragment_info), 1))
-                        kvikio.defaults.set("task_size", 1 * 1024 * 1024)
-                    except ImportError:
-                        _clog("  kvikio not available, falling back to regular I/O")
-                        use_odirect = False
+                def _stage_weights(model):
+                    for name, param in model.named_parameters():
+                        offset, nbytes, dtype, shape = _index[name]
+                        src = param.data.contiguous().reshape(-1).view(torch.uint8)
+                        _pinned[offset:offset + nbytes].copy_(src, non_blocking=True)
+                    torch.cuda.synchronize()
 
-                shard_files = sorted(
-                    f for f in os.listdir(stage_path)
-                    if f.startswith("model-") and f.endswith(".safetensors")
-                )
-                if not shard_files:
-                    shard_files = sorted(
-                        f for f in os.listdir(stage_path)
-                        if f.startswith("model.safetensors") and not f.endswith(".index.json")
-                    )
+                llm.apply_model(_stage_weights)
 
-                frag_by_name = {}
-                for shard_path, buf_offset, data_offset, data_size in fragment_info:
-                    fname = os.path.basename(shard_path)
-                    frag_by_name[fname] = (shard_path, buf_offset, data_offset, data_size)
-
-                with ThreadPoolExecutor(max_workers=len(fragment_info)) as ex:
-                    futures = []
-                    for fname in shard_files:
-                        if fname not in frag_by_name:
-                            continue
-                        sp, bo, do, ds = frag_by_name[fname]
-                        stage_shard = os.path.join(stage_path, fname)
-                        futures.append(ex.submit(
-                            _load_shard, stage_shard, buf_np, bo, do, ds,
-                            use_odirect))
-                    for fut in futures:
-                        fut.result()
-
-                total_bytes = 0
-                index = {}
-                for shard_path, buf_offset, data_offset, data_size in fragment_info:
-                    fname = os.path.basename(shard_path)
-                    h = _read_header(os.path.join(stage_path, fname))
-                    lo = data_offset
-                    for name, tinfo in h.items():
-                        if name == "__metadata__":
-                            continue
-                        start, end = tinfo["data_offsets"]
-                        L = end - start
-                        index[name] = (buf_offset + (start - lo), L,
-                                       tinfo["dtype"], tinfo["shape"])
-                    total_bytes += data_size
-
+                total_bytes = pinned_buf.numel()
                 info["bytes"] = total_bytes
+                _clog(f"  staged {len(index)} params "
+                      f"({total_bytes / 2**30:.2f} GiB)")
 
             elif cmd == "wake_up_weights":
                 llm.wake_up(tags=["weights"])
 
             elif cmd == "h2d":
-                total_bytes = sum(ds for _, _, _, ds in fragment_info)
+                if pinned_buf is None or index is None:
+                    raise RuntimeError("h2d requires attach+stage first")
+
+                total_bytes = pinned_buf.numel()
                 info["bytes"] = total_bytes
 
                 torch.cuda.synchronize(0)
                 buf_gpu = torch.empty(total_bytes, dtype=torch.uint8,
                                       device="cuda:0")
-
-                cpu_to_gpu = {}
-                gpu_offset = 0
-                for shard_path, buf_offset, data_offset, data_size in fragment_info:
-                    src = pinned_buf[buf_offset:buf_offset + data_size]
-                    dst = buf_gpu[gpu_offset:gpu_offset + data_size]
-                    dst.copy_(src, non_blocking=True)
-                    cpu_to_gpu[buf_offset] = gpu_offset
-                    gpu_offset += data_size
-
+                buf_gpu.copy_(pinned_buf, non_blocking=True)
                 torch.cuda.synchronize(0)
 
-                gpu_index = {}
-                for name, (cpu_off, length, dtype_str, shape) in index.items():
-                    for shard_path, buf_offset, data_offset, data_size in fragment_info:
-                        if buf_offset <= cpu_off < buf_offset + data_size:
-                            gpu_base = cpu_to_gpu[buf_offset]
-                            gpu_off = gpu_base + (cpu_off - buf_offset)
-                            gpu_index[name] = (gpu_off, length, dtype_str, shape)
-                            break
+                gpu_index = index
 
             elif cmd == "scatter":
-                def _scatter(model):
-                    return _scatter_into_model(model, buf_gpu, gpu_index)
-                llm.apply_model(_scatter)
-                del _scatter
+                if buf_gpu is None or gpu_index is None:
+                    raise RuntimeError("scatter requires h2d first")
+
+                _buf = buf_gpu
+                _gi = gpu_index
+
+                def _scatter_direct(model):
+                    params = dict(model.named_parameters())
+                    loaded = 0
+                    for name, (offset, nbytes, dtype, shape) in _gi.items():
+                        src = _buf[offset:offset + nbytes].view(dtype).reshape(shape)
+                        params[name].data.copy_(src)
+                        loaded += 1
+                    return loaded
+
+                result = llm.apply_model(_scatter_direct)
+                _clog(f"  scattered {result[0]}/{len(gpu_index)} params")
+
                 buf_gpu.storage().resize_(0)
                 del buf_gpu
                 buf_gpu = None
+                gpu_index = None
                 torch.cuda.empty_cache()
 
             elif cmd == "wake_up_kv_cache":
                 llm.wake_up(tags=["kv_cache"])
+
+            elif cmd == "get_pipe_fd":
+                info["pipe_fd"] = pipe_conn.fileno()
+
+            elif cmd == "prepare_criu_dump":
+                closed_fds = []
+                unmapped = []
+                destroyed_pg = False
+                pid = os.getpid()
+
+                try:
+                    import torch.distributed as dist
+                    if dist.is_initialized():
+                        dist.destroy_process_group()
+                        destroyed_pg = True
+                except Exception as _e:
+                    _clog(f"  prepare_criu_dump: dist teardown error: {_e}")
+
+                if destroyed_pg:
+                    store_names = ("pt_tcpstore", "pt_nccl_watchdg",
+                                   "pt_nccl_heartbt")
+                    for _attempt in range(50):
+                        alive = []
+                        for tid_name in os.listdir(f"/proc/{pid}/task"):
+                            try:
+                                comm = open(
+                                    f"/proc/{pid}/task/{tid_name}/comm"
+                                ).read().strip()
+                                if any(comm.startswith(s)
+                                       for s in store_names):
+                                    alive.append(f"{tid_name}({comm})")
+                            except (OSError, ValueError):
+                                pass
+                        if not alive:
+                            _clog(f"  prepare_criu_dump: store threads "
+                                  f"exited after {_attempt} polls")
+                            break
+                        time.sleep(0.05)
+                    else:
+                        _clog(f"  prepare_criu_dump: WARNING store threads "
+                              f"still alive: {alive}")
+
+                pipe_fd = kwargs.get("pipe_fd", -1)
+                devnull = os.open(os.devnull, os.O_RDWR)
+                for std_fd in (1, 2):
+                    os.dup2(devnull, std_fd)
+                os.close(devnull)
+
+                keep_prefixes = ("/dev/nvidia", "/dev/shm", "anon_inode:",
+                                 "socket:", "pipe:")
+                for fd_name in sorted(os.listdir(f"/proc/{pid}/fd"),
+                                      key=int):
+                    try:
+                        fd_int = int(fd_name)
+                        if fd_int == pipe_fd or fd_int <= 2:
+                            continue
+                        link = os.readlink(f"/proc/{pid}/fd/{fd_name}")
+                        if any(link.startswith(p) for p in keep_prefixes):
+                            continue
+                        os.close(fd_int)
+                        closed_fds.append(fd_int)
+                    except (OSError, ValueError):
+                        pass
+
+                libc = ctypes.CDLL("libc.so.6")
+                with open(f"/proc/{pid}/maps") as f:
+                    for line in f:
+                        if "io_uring" in line:
+                            addr_range = line.split()[0]
+                            start_s, end_s = addr_range.split("-")
+                            start = int(start_s, 16)
+                            length = int(end_s, 16) - start
+                            libc.munmap(ctypes.c_void_p(start),
+                                        ctypes.c_size_t(length))
+                            unmapped.append(f"0x{start:x}")
+
+                remaining_threads = []
+                for tid_name in os.listdir(f"/proc/{pid}/task"):
+                    try:
+                        comm = open(
+                            f"/proc/{pid}/task/{tid_name}/comm"
+                        ).read().strip()
+                        if comm != "python":
+                            remaining_threads.append(f"{tid_name}({comm})")
+                    except (OSError, ValueError):
+                        pass
+                info["closed_fds"] = closed_fds
+                info["unmapped"] = unmapped
+                info["destroyed_pg"] = destroyed_pg
+                info["remaining_threads"] = remaining_threads
+                _clog(f"  prepare_criu_dump: fds={closed_fds}, "
+                      f"unmapped={unmapped}, destroyed_pg={destroyed_pg}, "
+                      f"remaining_threads={remaining_threads}")
 
             elif cmd == "generate":
                 from vllm import SamplingParams
@@ -341,5 +329,4 @@ def vllm_child_loop(pipe_conn, rank, use_odirect, arch):
         elapsed = time.perf_counter() - t0
         status = "OK" if error is None else "FAILED"
         _clog(f"<<< {cmd} {status} ({elapsed:.3f}s)")
-        info["arch"] = arch
         pipe_conn.send((cmd, elapsed, error, info))

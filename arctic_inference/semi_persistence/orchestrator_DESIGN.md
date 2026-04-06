@@ -42,10 +42,9 @@ Two-phase design: download is **blocking** (main thread), GPU work is
 2. **Rewrite vllm_config** -- creates a copy with `model` set to the
    local path.
 
-Downloads run in the main thread to avoid a fork/tqdm conflict:
-`Instance.init()` uses `mp.get_context("fork")` to spawn workers, and
-forking while tqdm (used by `snapshot_download`) is active in another
-thread corrupts tqdm's class-level `_lock`.
+Downloads run in the main thread to avoid concurrent download
+contention and to ensure model files are available before submitting
+GPU work to the thread pool.
 
 ### Phase 2: GPU cold-start (pool thread, non-blocking)
 
@@ -56,10 +55,12 @@ Submits `_register_sync` to the thread pool.  The future is stored in
    available, then picks the one with the most free memory.  Multiple
    models can init in parallel on different GPUs.
 2. **Cold-start sequence** --
-   `Instance(vllm_config).init(gpu).attach().stage().sleep().checkpoint().wait()`.
-   - `init(gpu)` -- spawn vLLM with dummy weights on the GPU.
-   - `attach()` -- allocate pinned CPU buffer sized to model weights.
-   - `stage()` -- load safetensors from disk into pinned CPU buffer.
+   `Instance(vllm_config).init(gpu).attach().repin().stage().unpin().sleep().checkpoint().wait()`.
+   - `init(gpu)` -- spawn vLLM with real weights on the GPU.
+   - `attach()` -- allocate unpinned CPU buffer sized to model params.
+   - `repin()` -- `cudaHostRegister` the buffer for DMA transfers.
+   - `stage()` -- snapshot GPU model params into the CPU buffer.
+   - `unpin()` -- `cudaHostUnregister` the buffer (speeds up restore).
    - `sleep()` -- free GPU memory (vLLM sleep mode).
    - `checkpoint()` -- CUDA-checkpoint the process (freeze it).
 3. **Release GPU** -- discards the GPU from `_assigned_gpus` and
@@ -68,7 +69,7 @@ Submits `_register_sync` to the thread pool.  The future is stored in
    "vllm_config": vllm_config}`.
 
 After registration, the instance is checkpointed with weights staged
-in pinned CPU memory.  The GPU is free for other models.
+in unpinned CPU memory.  The GPU is free for other models.
 
 With N GPUs, up to N models cold-start in parallel.  Additional models
 queue on the GPU condition variable and proceed as GPUs free up.
@@ -86,16 +87,18 @@ a `Future[list]`.
 3. **Restore and run inference** (timed as `restore` phase) --
    ```
    restore(gpu)          -- unfreeze checkpointed process onto GPU
-   wake_up(["weights"])  -- re-allocate weight tensors on GPU
-   h2d()                 -- copy staged weights from pinned CPU → GPU
+   repin()               -- cudaHostRegister the CPU buffer for DMA
+   wake_up_weights()     -- re-allocate weight tensors on GPU
+   h2d()                 -- copy staged weights from CPU buffer → GPU
    scatter()             -- place weights into model parameters
-   wake_up(["kv_cache"]) -- re-allocate KV cache on GPU
+   wake_up_kv_cache()    -- re-allocate KV cache on GPU
    wait()                -- block until ready
    ```
 4. **Generate** (timed as `generate` phase) --
    `generate(prompts, sp).wait()`.
 5. **Re-checkpoint** (timed as `checkpoint` phase) --
-   `sleep().checkpoint().wait()` to free GPU memory and re-freeze.
+   `unpin().sleep().checkpoint().wait()` to unregister pinned memory,
+   free GPU memory, and re-freeze.
 6. **Release GPU** -- notify waiting threads.
 7. **Return results** -- `inst.last_generate_result`, a list of lists
    (one inner list per prompt, multiple outputs if `n > 1`).
@@ -179,7 +182,7 @@ breakdowns in their console messages.
 (time from GPU acquisition through init, attach, stage, sleep,
 checkpoint).
 
-**Generate**: `wait` (GPU queue), `restore` (restore + wake_up +
+**Generate**: `wait` (GPU queue), `restore` (restore + wake_up_weights +
 h2d + scatter + wake_up_kv_cache), `generate` (llm.generate), and
 `checkpoint` (sleep + checkpoint).
 
@@ -219,27 +222,21 @@ wait()                    |
   |                       |
 generate("b") -----> Thread 4: _generate_sync
                        acquire GPU 1
-                       restore -> wake_up -> h2d -> scatter -> wake_up -> generate -> wait
-                       sleep -> checkpoint -> wait
+                       restore -> repin -> wake_up_weights -> h2d -> scatter -> wake_up_kv_cache -> generate -> wait
+                       unpin -> sleep -> checkpoint -> wait
                        release GPU 1
 ```
 
 ## GPU Assignment
 
-Pick the GPU with the most free memory from the snapshot taken at
-`init()` time.  A `threading.Condition` protects the selection so
-concurrent register threads don't pick the same GPU.  GPUs are released
-after checkpoint completes, allowing the next queued model to proceed.
+GPUs are managed via a `queue.Queue` (FIFO).  `init()` populates the
+queue with all discovered GPU IDs.  `_acquire_gpu(label)` blocks on
+`queue.get()` until a GPU is available.  `_release_gpu(gpu)` returns
+the GPU via `queue.put()`.  Both `_register_sync` and `_generate_sync`
+use the same acquire/release pattern.
 
-The acquire/release logic is factored into `_acquire_gpu(label)` and
-`_release_gpu(gpu)` static methods, shared by both `_register_sync` and
-`_generate_sync`.
-
-A separate `_attach_lock` (a `threading.Lock`) serializes the
-`attach()` step across concurrent registrations.  `attach()` calls
-`torch.empty(..., pin_memory=True)` which invokes `cudaHostAlloc` under
-the hood; concurrent `cudaHostAlloc` calls from multiple processes can
-deadlock the CUDA driver.
+With N GPUs, up to N operations proceed in parallel.  Additional
+requests block on the queue until a GPU is released.
 
 ## Process Cleanup
 

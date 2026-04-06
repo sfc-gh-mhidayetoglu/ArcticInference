@@ -21,11 +21,11 @@ def main():
     Instance.print_status()
 
     instance.restore(gpu=1)
-    instance.wake_up(["weights"])
+    instance.wake_up_weights()
     instance.stage("/data-fast/nvidia/Llama-3.1-70B-Instruct-FP8")
     instance.h2d()
     instance.scatter()
-    instance.wake_up(["kv_cache"])
+    instance.wake_up_kv_cache()
     instance.wait()
 
     Instance.print_status()

@@ -46,17 +46,15 @@ vllm_config_3 = {"model": "Qwen/Qwen3-32B"}
 
 A model is composed of an a) architecture, and b) weights.  For example,
 Qwen3-32B and Qwen3-32B-Instruct have the same model architecture yet
-different weights.  In the initialization, we only read the model
-architecture and weight headers from the model file, therefore the
-configs can be a generic HF model.
+different weights.
 
 ```python
 instance_1 = Instance(vllm_config_1)
 instance_2 = Instance(vllm_config_2)
 ```
 
-Instances 1 and 2 initialize in parallel with random weights.  The GPU
-is specified at `init()` time:
+Instances 1 and 2 initialize in parallel with real weights
+(`load_format=auto`).  The GPU is specified at `init()` time:
 
 ```python
 instance_1.init(gpu=0)
@@ -65,17 +63,15 @@ instance_2.init(gpu=1)
 
 ## Process Hierarchy
 
-Each Instance owns one **worker process**, created when `init(gpu)` is
-called.  The worker is **forked** from the main process (cheap, inherits
-file descriptors and queues).  The worker then spawns the vLLM child via
-`mp.get_context("spawn")` when it receives the `init` command.
+Each Instance owns one **worker process**, created when `init(gpu)` or
+`load(filename)` is called.  Both the worker and the vLLM child are **spawned** via
+`mp.get_context("spawn")`.  Spawning is safe to call from any thread
+(e.g. from a `ThreadPoolExecutor` in the orchestrator), unlike fork
+which can deadlock on glibc mutexes held by other threads.
 
-The two-level fork-then-spawn design:
-
-- **Worker (forked)**: fast to create, runs the command loop, executes
-checkpoint/restore via `cuCheckpointProcess`* ctypes.  CUDA driver
-bindings are lazily initialized per-process (tracked by PID) so they
-work correctly after fork.
+- **Worker (spawned)**: runs the command loop, executes
+checkpoint/restore via `cuCheckpointProcess`* ctypes.  Queues and
+shared counters are passed as constructor args.
 - **vLLM child (spawned)**: starts with a clean address space -- no
 inherited CUDA contexts.  vLLM can freely use its own multiprocessing
 internally.  Tensor parallelism works.
@@ -86,21 +82,21 @@ otherwise pickle GPU tensors across processes, failing for models >4 GiB
 and adding ~16s latency even for small models).
 
 ```
-Main process  [mp.set_start_method("fork")]
+Main process
   |
   |-- Instance 1  (handle, main-process side)
   |     |
-  |     `-- Worker process 1  (forked from main)
+  |     `-- Worker process 1  (spawned)
   |           |-- [checkpoint/restore via cuCheckpointProcess ctypes]
   |           |
-  |           `-- vLLM child process  (spawned via mp.get_context("spawn"))
-  |                 |-- owns pinned CPU memory (allocated on attach)
+  |           `-- vLLM child process  (spawned)
+  |                 |-- owns CPU buffer (allocated on attach, pinned via repin)
   |                 |-- EngineCore (in-process, holds GPU memory)
   |                 `-- resource_tracker  (no GPU, skipped during checkpoint)
   |
   |-- Instance 2  (handle, main-process side)
   |     |
-  |     `-- Worker process 2  (forked from main)
+  |     `-- Worker process 2  (spawned)
   |           `-- vLLM child process  (spawned)
   |                 |-- EngineCore (in-process)
   |                 `-- resource_tracker
@@ -108,11 +104,9 @@ Main process  [mp.set_start_method("fork")]
   `-- ...
 ```
 
-**Important**: The main process must never initialize CUDA (e.g. via
-`torch.cuda.*` calls) because workers are forked from it.  A
-CUDA-initialized parent produces children with corrupted driver state
-where `cuInit` fails with `CUresult=3`.  GPU memory queries use
-`nvidia-smi` instead of `torch.cuda.mem_get_info` for this reason.
+**Important**: GPU memory queries use `nvidia-smi` instead of
+`torch.cuda.mem_get_info` to avoid initializing CUDA in the main
+process.
 
 ## Primitives
 
@@ -128,104 +122,88 @@ primitives must be:
 
 | Primitive               | What it does                                                 | Executed in                                |
 | ----------------------- | ------------------------------------------------------------ | ------------------------------------------ |
-| `init(gpu)`             | Cold start a model with random weights on the given GPU.  Spawns the worker process and vLLM child. | Worker + Child                 |
+| `init(gpu)`             | Cold start a model with real weights on the given GPU.  Spawns the worker process and vLLM child. | Worker + Child                 |
 | `wait()`                | Block the main process until all pending commands complete.  | Main process                               |
-| `after(instance)`       | Sync with another instance (non-blocking from main process). | Worker (blocks until dependency satisfied) |
 | `sleep()`               | `llm.sleep(level=2)` -- frees GPU memory.                    | Child                                      |
 | `checkpoint()`          | Save CUDA state to CPU via `cuCheckpointProcess`*.  Instance becomes stateless (`gpu=None`). | Worker (ctypes) |
+| `save(filename)`        | CRIU-dump the child process tree to disk (non-destructive).  Uses `--leave-running` so the child stays alive.  Writes `meta.json` with `vllm_config` and CRIU metadata. | Worker (child thread) |
+| `load(filename)`        | Restore a process from a CRIU image on disk.  Validates that the image's `vllm_config` matches this instance.  Spawns a new worker and CRIU-restores the child. | Worker |
 | `restore(gpu)`          | Restore checkpointed CUDA state onto the specified GPU.  `gpu` is required. | Worker (ctypes) |
-| `attach()`              | Allocate pinned CPU memory and register for DMA.             | Child                                      |
-| `detach()`              | Free pinned CPU memory.                                      | Child                                      |
-| `stage(model_path)`     | Load safetensors into pinned CPU buffer.                     | Child                                      |
-| `h2d()`                 | Async host-to-device transfer, then synchronize.             | Child                                      |
-| `scatter()`             | Place weights from GPU staging buffer into model params.     | Child                                      |
-| `wake_up(["weights"])`  | Re-allocate weight tensors on GPU.                           | Child                                      |
-| `wake_up(["kv_cache"])` | Re-allocate KV cache on GPU.                                 | Child                                      |
+| `attach()`              | Allocate unpinned CPU memory sized to `model.named_parameters()`. | Child                                  |
+| `detach()`              | Free CPU memory buffer.                                      | Child                                      |
+| `repin()`               | `cudaHostRegister` the buffer for DMA transfers.             | Child                                      |
+| `unpin()`               | `cudaHostUnregister` the buffer (data stays, CUDA registration removed). | Child                           |
+| `stage()`               | Snapshot model params (GPU -> pinned CPU) in vLLM's internal format. | Child                                |
+| `h2d()`                 | Copy pinned buffer to GPU staging buffer, then synchronize.  | Child                                      |
+| `scatter()`             | Copy staged tensors directly into model params by name.      | Child                                      |
+| `wake_up_weights()`     | Re-allocate weight tensors on GPU.                           | Child                                      |
+| `wake_up_kv_cache()`    | Re-allocate KV cache on GPU.                                 | Child                                      |
 | `generate(prompts, sp)` | Run inference via `llm.generate()`.  Result stored in `last_generate_result`. | Child                     |
 | `teardown()`            | Tear down the instance, worker, and child.  Resets to created state, ready for `init(gpu)` again. | Worker + Child |
 | `remove()`              | Remove from the instance registry.  Call after `teardown().wait()`. | Main process |
 
 
-## `after(instance)` -- Cross-Instance Dependencies
+## CPU Buffer and Pin Management
 
-`after(other)` is **non-blocking** from the main process.  It enqueues a
-`wait_for` command on `self`'s worker and returns `self` immediately.
-The **worker** (not the main process) blocks until the dependency is
-satisfied before processing subsequent commands.
+`attach()` allocates a regular (unpinned) CPU buffer via
+`torch.empty(total_size, dtype=torch.uint8)`.  The buffer is sized to
+the total bytes of all `model.named_parameters()`, computed via
+`apply_model` after init.  An `index` dict maps each parameter name to
+its `(offset, nbytes, dtype, shape)` in the buffer.
 
-This allows the main process to keep issuing commands to other instances
-while one instance's worker waits on a dependency.
+Pinning is a separate step: `repin()` calls `cudaHostRegister` (via
+ctypes on `libcudart.so`) to register the buffer for DMA transfers.
+`unpin()` calls `cudaHostUnregister` to remove the registration while
+keeping the memory allocated and data intact.
 
-### Implementation
+`detach()` frees the CPU buffer entirely.
 
-Each Instance has:
+### Why separate attach / repin / unpin
 
-- `_completed_counter`: an `mp.Value('i', 0)` shared with its worker.
-The worker increments it after each command completes.
-- `_total_sent`: a plain int (main-process side) tracking total commands
-ever enqueued.
+`cuCheckpointProcessRestore` must re-map all CUDA-registered (pinned)
+host memory pages, which dominates restore latency (5-7s for large
+models).  By unpinning before checkpoint and re-pinning after restore,
+restore only needs to reconstruct the GPU context (~1s) and the pin
+cost is paid separately via `cudaHostRegister` (~1-3s depending on
+buffer size).  Net savings: ~1.5-2s per restore cycle for large models.
 
-`after(other)` snapshots `target = other._total_sent` and enqueues
-`("wait_for", {"instance_id": other.instance_id, "target": target})`
-on `self`'s cmd_queue.  The worker resolves the counter from a
-module-level `_counter_registry` (inherited at fork time) and polls
-until `other._completed_counter.value >= target`.
+Using `cudaHostRegister` / `cudaHostUnregister` (instead of
+`cudaHostAlloc` / `cudaHostFree`) is required because `cudaHostAlloc`
+memory cannot be selectively unregistered -- `cudaHostUnregister` only
+works on memory registered via `cudaHostRegister`.
 
-Only the instance ID (an int) is sent through the queue -- not the
-`mp.Value` itself, which cannot be pickled.  The `_counter_registry`
-maps instance IDs to their `mp.Value` counters and is inherited by all
-workers at fork time.
+### Standard sequences
 
-This works across instances on different GPUs / different worker
-processes because `mp.Value` is backed by shared memory (`/dev/shm`).
-
-## Pinned Memory
-
-Each child allocates its own pinned CPU memory on `attach()` via
-`torch.empty(total_size, dtype=torch.uint8, pin_memory=True)`.  This
-uses `cudaHostAlloc` under the hood, which allocates memory that is both
-page-locked and registered with the CUDA driver for DMA -- no separate
-`cudaHostRegister` step needed.
-
-On `detach()`, the pinned tensor is deleted, freeing the memory via
-`cudaHostFree`.
-
-The pinned buffer is sized to the model's total weight footprint
-(computed from safetensors headers, no data I/O).
+- **Registration**: `attach() -> repin() -> stage() -> unpin() -> sleep() -> checkpoint()`
+- **Save to disk**: `... -> checkpoint() -> save(filename)`
+- **Load from disk**: `load(filename) -> restore(gpu) -> ...`
+- **Generate restore**: `restore(gpu) -> wake_up_weights() -> repin() -> h2d() -> scatter() -> wake_up_kv_cache() -> ...`
+- **Generate checkpoint**: `... -> unpin() -> sleep() -> checkpoint()`
 
 ## stage / h2d / scatter Pipeline
 
-### stage (NVMe -> pinned CPU, one thread per shard)
+### stage (GPU model params -> pinned CPU)
 
-Each `.safetensors` shard file is loaded by its own thread into its
-corresponding region of the pinned buffer using O_DIRECT via kvikio.
-Since each thread writes to a disjoint region, no synchronization is
-needed.
+`stage()` uses `apply_model` to iterate `model.named_parameters()` and
+copy each parameter's `.data` (contiguous, viewed as uint8) into the
+pinned buffer at the offset recorded in `index`.  This captures weights
+in vLLM's post-processed internal format (e.g. Marlin-packed for GPTQ,
+cutlass layout for FP8, plain tensors for BF16).
 
-### h2d (pinned CPU -> GPU, async per shard)
+### h2d (pinned CPU -> GPU)
 
-Each shard's pinned region is copied to a GPU staging buffer via
-`dst.copy_(src, non_blocking=True)`.  All shards are launched async,
-then a single `torch.cuda.synchronize()` waits for completion.
-
-### Index separation (CPU vs GPU offsets)
-
-`stage` builds an `index` dict mapping weight names to
-`(byte_offset, length, dtype, shape)` tuples.  These offsets point into
-the pinned CPU buffer and are **never mutated** after `stage`.
-
-`h2d` builds a separate `gpu_index` dict by remapping CPU offsets to
-GPU staging buffer offsets.  `gpu_index` is rebuilt fresh on every
-`h2d` call, so the CPU `index` remains valid across generate cycles
-without any save/restore bookkeeping.
+The entire pinned buffer is copied to a GPU staging buffer via
+`buf_gpu.copy_(pinned_buf, non_blocking=True)` followed by
+`torch.cuda.synchronize()`.  The `gpu_index` is the same as `index`
+since the buffer layout is identical.
 
 ### scatter (GPU staging -> model params)
 
-`_scatter_into_model` iterates over `gpu_index` and yields
-`(name, tensor)` pairs to `model.load_weights()` -- vLLM's own weight
-loader.  This delegates all name mapping, fused parameter handling
-(q/k/v -> qkv_proj, gate/up -> gate_up_proj), and per-tensor scale
-merging to vLLM internals.
+`scatter` uses `apply_model` to iterate `model.named_parameters()` and
+copy each tensor from the GPU staging buffer directly into the
+parameter via `param.data.copy_(src)`.  No `model.load_weights()` or
+`process_weights_after_loading()` is needed because the staged data is
+already in vLLM's internal format.
 
 After scatter, the staging buffer is freed via
 `buf_gpu.storage().resize_(0)` followed by `torch.cuda.empty_cache()`.
@@ -240,14 +218,48 @@ keeping allocator metadata consistent for CRIU checkpoint/restore.
 instance_1 = Instance(vllm_config_1)
 instance_2 = Instance(vllm_config_2)
 
-instance_1.init(gpu=0).attach().stage().sleep().checkpoint()
-instance_2.init(gpu=1).attach().stage().sleep().checkpoint()
+instance_1.init(gpu=0).attach().repin().stage().unpin().sleep().checkpoint()
+instance_2.init(gpu=1).attach().repin().stage().unpin().sleep().checkpoint()
 ```
 
-`attach()` allocates pinned CPU memory sized to the model's weight
-footprint.  `stage()` loads safetensors from disk into the pinned
-buffer.  The pinned buffer survives `sleep()` and `checkpoint()` since
-it is CPU memory, not GPU.
+`init()` loads real weights via `load_format=auto`, so vLLM runs
+`process_weights_after_loading()` and the model is ready to use.
+`attach()` allocates an unpinned CPU buffer sized to the model's
+parameters.  `repin()` registers it with CUDA for DMA.  `stage()`
+snapshots the post-processed GPU parameters into the buffer.  `unpin()`
+removes the CUDA registration so that `checkpoint()` is fast (the CUDA
+driver does not need to re-map pinned pages on restore).  The buffer
+data survives `unpin()`, `sleep()`, and `checkpoint()` since it is CPU
+memory.
+
+### Save to disk and restore (same run)
+
+After checkpoint, `save()` writes a CRIU image to disk using
+`--leave-running`.  The child process stays alive, so the instance can
+continue directly to `restore(gpu)` without a separate `load()`:
+
+```python
+inst = Instance(vllm_config)
+inst.init(gpu=0).attach().repin().stage().unpin().sleep().checkpoint()
+inst.save("/data-fast/image-cache/my_model").wait()
+
+inst.restore(gpu=2).wake_up_weights().repin().h2d().scatter().wake_up_kv_cache()
+inst.generate(prompts, sampling_params).wait()
+```
+
+### Load from disk (later run)
+
+On a subsequent run, `load()` restores the process from the on-disk
+image.  The instance's `vllm_config` must match the saved image's
+config (validated automatically):
+
+```python
+inst = Instance(vllm_config)
+inst.load("/data-fast/image-cache/my_model").wait()
+
+inst.restore(gpu=0).wake_up_weights().repin().h2d().scatter().wake_up_kv_cache()
+inst.generate(prompts, sampling_params).wait()
+```
 
 ### Initialize a new instance after another finishes
 
@@ -255,30 +267,27 @@ We need to wait for instance 1's checkpoint on GPU 0 before
 initializing instance 3 on the same GPU.
 
 ```python
+instance_1.wait()
+
 instance_3 = Instance(vllm_config_3)
-instance_3.after(instance_1).init(gpu=0).attach().stage().sleep().checkpoint()
+instance_3.init(gpu=0).attach().repin().stage().unpin().sleep().checkpoint()
 
 instance_3.wait()
 instance_2.wait()
 ```
 
-We do not have to wait on instance 1.  The same sequence with chaining:
-
-```python
-instance_3 = Instance(vllm_config_3).after(instance_1).init(gpu=0).attach().stage().sleep().checkpoint()
-```
-
 ### Restore and generate (hot path)
 
-After cold-start, weights are already staged in pinned CPU memory.
-Restore only needs to move them CPU→GPU:
+After cold-start, weights are already staged in pinned CPU memory
+(unpinned from CUDA).  Restore re-pins and moves them CPU→GPU:
 
 ```python
 instance_1.restore(gpu=0)
-instance_1.wake_up(["weights"])
+instance_1.repin()
+instance_1.wake_up_weights()
 instance_1.h2d()
 instance_1.scatter()
-instance_1.wake_up(["kv_cache"])
+instance_1.wake_up_kv_cache()
 instance_1.generate(prompts, sampling_params)
 instance_1.wait()
 result = instance_1.last_generate_result
@@ -287,37 +296,19 @@ result = instance_1.last_generate_result
 To re-checkpoint after generate:
 
 ```python
-instance_1.sleep().checkpoint().wait()
-```
-
-### Restore with different weights
-
-`stage(data_path)` can load a different set of weights as long as the
-architecture matches.  This replaces the pinned buffer contents:
-
-```python
-instance_1.restore(gpu=0)
-instance_1.wake_up(["weights"])
-instance_1.stage("/data-fast/Qwen/Qwen3-1.7B-finetuned")
-instance_1.h2d()
-instance_1.scatter()
-instance_1.wake_up(["kv_cache"])
-instance_1.generate(prompts, sampling_params)
-instance_1.wait()
+instance_1.unpin().sleep().checkpoint().wait()
 ```
 
 ### Swap active model on a GPU
 
 ```python
-instance_1.sleep().checkpoint()
+instance_1.unpin().sleep().checkpoint().wait()
 
-instance_3.after(instance_1)
-instance_3.restore(gpu=0)
-instance_3.wake_up(["weights"])
-instance_3.stage("/data-fast/Qwen/Qwen3-32B")
+instance_3.restore(gpu=0).repin()
+instance_3.wake_up_weights()
 instance_3.h2d()
 instance_3.scatter()
-instance_3.wake_up(["kv_cache"])
+instance_3.wake_up_kv_cache()
 instance_3.wait()
 ```
 
@@ -330,14 +321,15 @@ vllm_config_5 = {"model": "Qwen/Qwen3-1.7B", "gpu_memory_utilization": 0.4}
 instance_4 = Instance(vllm_config_4)
 instance_5 = Instance(vllm_config_5)
 
-instance_2.sleep().detach().checkpoint()
+instance_2.sleep().detach().checkpoint().wait()
 
-instance_4.after(instance_2).init(gpu=1)
-instance_5.after(instance_4).init(gpu=1)
-instance_4.attach()
-instance_5.attach()
-instance_4.sleep().checkpoint()
-instance_5.sleep().checkpoint()
+instance_4.init(gpu=1)
+instance_4.wait()
+instance_5.init(gpu=1)
+instance_4.attach().repin().stage()
+instance_5.attach().repin().stage()
+instance_4.unpin().sleep().checkpoint()
+instance_5.unpin().sleep().checkpoint()
 instance_4.wait()
 instance_5.wait()
 ```
@@ -345,15 +337,15 @@ instance_5.wait()
 Reload both on the same GPU at the same time:
 
 ```python
-instance_4.restore(gpu=1).wake_up(["weights"]).stage("/data-fast/Qwen/Qwen2.5-1.5B").h2d().scatter().wake_up(["kv_cache"])
-instance_5.restore(gpu=1).wake_up(["weights"]).stage("/data-fast/Qwen/Qwen3-1.7B").h2d().scatter().wake_up(["kv_cache"])
+instance_4.restore(gpu=1).repin().wake_up_weights().h2d().scatter().wake_up_kv_cache()
+instance_5.restore(gpu=1).repin().wake_up_weights().h2d().scatter().wake_up_kv_cache()
 
 instance_4.wait()
 instance_5.wait()
 ```
 
-If on the same GPU, `init()` does not overlap.  It is the user's
-responsibility to serialize using `after`.
+If on the same GPU, `init()` does not overlap.  It is the caller's
+responsibility to serialize (e.g. by calling `wait()` between inits).
 
 ### Cross-GPU migration
 
@@ -363,12 +355,12 @@ GPU.
 
 ```python
 instance = Instance(vllm_config)
-instance.init(gpu=0).attach().sleep().checkpoint().wait()
+instance.init(gpu=0).attach().repin().stage().unpin().sleep().checkpoint().wait()
 # instance.gpu is now None
 
 # Restore on GPU 1
-instance.restore(gpu=1)
-instance.wake_up(["weights"]).stage(path).h2d().scatter().wake_up(["kv_cache"])
+instance.restore(gpu=1).repin()
+instance.wake_up_weights().h2d().scatter().wake_up_kv_cache()
 instance.wait()
 # instance.gpu is now 1
 ```
@@ -408,7 +400,7 @@ instance from its result_queue.  You can batch many commands and call
 `wait()` once:
 
 ```python
-instance.sleep().checkpoint().wait()
+instance.unpin().sleep().checkpoint().wait()
 ```
 
 ## Checkpoint / Restore Ordering
@@ -460,7 +452,7 @@ by reading `config.json` from the model path and extracting:
 ```
 semi_persistence/
   instance.py        -- Instance class (GPU-agnostic handle, owns worker process)
-  worker.py          -- Worker loop, child thread, checkpoint/restore/migrate ctypes
+  worker.py          -- Worker loop, child thread, checkpoint/restore/CRIU save/load
   vllm_child.py      -- vLLM child process (owns GPU, pinned memory, staging)
   orchestrator.py    -- Orchestrator class (see orchestrator_DESIGN.md)
   abstract.py        -- Abstract InstanceBase interface (reference only)
@@ -468,7 +460,9 @@ semi_persistence/
   demo.ipynb         -- Jupyter notebook demo
   main_test.py       -- Integration test
   test_migrate.py    -- Cross-GPU migration test
+  test_image.py      -- CRIU save/load image cache test
   instance_DESIGN.md -- This file
+  CRIU_PLUMBING.md   -- CRIU dump/restore complications and fixes
 ```
 
 ## Known Issues
@@ -490,41 +484,11 @@ metadata and subsequent GPU allocations crash with
 `free` path, keeping block metadata consistent across
 checkpoint/restore cycles.
 
-### Quantized models not supported (GPTQ, FP8)
+### Cold start is slower than dummy-weight init
 
-Quantized models (GPTQ-Int4, FP8) are **not supported** by the
-semi-persistence scatter path.  The issue has three layers:
-
-1. **`model.load_weights()` fails** — with `load_format=dummy`, vLLM
-   creates some quantized parameters as plain `nn.Parameter` without
-   the custom `weight_loader` / `output_dim` attributes that
-   `model.load_weights()` expects.  This causes `AttributeError` on
-   the first scatter call.
-
-2. **Direct copy is insufficient** — even if weights are copied into
-   model parameters by name, quantized kernels (Marlin for GPTQ,
-   cutlass for FP8) require `process_weights_after_loading()` to
-   repack weights from HF format into kernel-specific layout (e.g.
-   Marlin packing, scale reordering).
-
-3. **Repacking after sleep/wake fails** — `sleep(level=2)` discards
-   all GPU memory.  `wake_up(["weights"])` re-allocates empty tensors.
-   `process_weights_after_loading()` expects the original weight
-   format, but after wake-up the memory is zeroed.  The repacking
-   produces garbage because it operates on empty data.
-
-Non-quantized models (BF16, FP32) work correctly because their weights
-are plain tensors that can be directly copied without post-processing.
-
-To support quantized models, one of these approaches would be needed:
-
-- **Store repacked weights**: after the initial `load_format=auto`
-  load, save the Marlin-repacked tensors to the pinned CPU buffer
-  instead of the raw HF safetensor data.  Scatter would then copy
-  pre-repacked data directly, skipping `process_weights_after_loading`.
-- **Use `load_format=auto` during init**: load real weights at init
-  time (slower cold start) so all parameter attributes are set
-  correctly, then use `model.load_weights()` normally on scatter.
-- **Dequantize at stage time**: convert quantized weights to BF16
-  during stage, then load as a non-quantized model.  Trades memory
-  for compatibility.
+`init()` uses `load_format=auto` to load real weights from disk and
+run `process_weights_after_loading()`.  This is slower than the
+previous `load_format=dummy` approach, but it only happens once per
+instance.  The benefit is that `stage()` captures weights in vLLM's
+internal format, so restore works correctly for all model types
+including quantized models (GPTQ, FP8).

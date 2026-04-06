@@ -1,39 +1,21 @@
 """Worker process for a single Instance.
 
-Each worker is forked from the main process.  On "init", it spawns the
+Each worker is spawned from the main process.  On "init", it spawns the
 vLLM child via mp.get_context("spawn").  Checkpoint/restore run in the
-worker via CUDA driver ctypes.
+worker via CUDA driver ctypes.  CRIU save/load enables dumping the
+child process tree to disk and restoring it with new PIDs.
 
 Command protocol:  (cmd, kwargs)
 Result protocol:   (cmd, elapsed, error, info)
 """
-import json, os, sys, time, ctypes, threading, queue, struct
+import json, os, shutil, subprocess, sys, time, ctypes, threading, queue, struct
 import glob as _glob
 
 import torch.multiprocessing as mp
 
 # ---------------------------------------------------------------------------
-# Architecture / weight helpers
+# Weight helpers
 # ---------------------------------------------------------------------------
-
-_ARCH_FIELDS = (
-    "architectures", "hidden_size", "num_hidden_layers",
-    "num_attention_heads", "num_key_value_heads", "intermediate_size",
-    "head_dim", "vocab_size",
-)
-
-
-def _read_architecture(model_path):
-    """Read config.json and return a hashable architecture key."""
-    cfg_path = os.path.join(model_path, "config.json")
-    with open(cfg_path) as f:
-        cfg = json.load(f)
-    vals = []
-    for field in _ARCH_FIELDS:
-        v = cfg.get(field)
-        vals.append(tuple(v) if isinstance(v, list) else v)
-    return tuple(vals)
-
 
 def _weight_footprint(model_path):
     """Compute total weight bytes by reading safetensors headers (no data I/O)."""
@@ -57,34 +39,6 @@ def _weight_footprint(model_path):
     return total
 
 
-def _shard_layout(model_path):
-    """Read safetensors headers and return per-shard info.
-
-    Returns list of (shard_path, data_offset, data_size, tensors) where
-    tensors is [(name, start, end, dtype, shape), ...].
-    """
-    d = model_path.rstrip("/")
-    files = sorted(_glob.glob(f"{d}/model-*.safetensors"))
-    if not files:
-        files = sorted(_glob.glob(f"{d}/model.safetensors*"))
-    files = [f for f in files if not f.endswith(".index.json")]
-
-    shards = []
-    for p in files:
-        with open(p, "rb") as f:
-            n = struct.unpack("<Q", f.read(8))[0]
-            header = json.loads(f.read(n))
-        tensors = [(name, info["data_offsets"][0], info["data_offsets"][1],
-                     info["dtype"], info["shape"])
-                    for name, info in header.items() if name != "__metadata__"]
-        if not tensors:
-            continue
-        lo = min(s for _, s, _, _, _ in tensors)
-        hi = max(e for _, _, e, _, _ in tensors)
-        shards.append((p, lo, hi - lo, tensors))
-    return shards
-
-
 # ---------------------------------------------------------------------------
 # CUDA driver API bindings (checkpoint / restore)
 # ---------------------------------------------------------------------------
@@ -102,7 +56,7 @@ def _check_cu(name, ret, *, ignore=None):
 
 
 def _get_cu():
-    """Return CUDA driver bindings, re-initializing after fork."""
+    """Return CUDA driver bindings, lazily initializing per-process."""
     global _cu_bindings, _cu_bindings_pid
     with _cu_lock:
         if _cu_bindings_pid != os.getpid():
@@ -117,17 +71,11 @@ def _get_cu():
             lib.cuCheckpointProcessCheckpoint.argtypes = [ctypes.c_int, ctypes.c_void_p]
             lib.cuCheckpointProcessCheckpoint.restype = ctypes.c_int
 
-            lib.cuCheckpointProcessRestore.argtypes = [ctypes.c_int, ctypes.c_void_p]
-            lib.cuCheckpointProcessRestore.restype = ctypes.c_int
-
             lib.cuCheckpointProcessUnlock.argtypes = [ctypes.c_int, ctypes.c_void_p]
             lib.cuCheckpointProcessUnlock.restype = ctypes.c_int
 
-            lib.cuDeviceGetUuid.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            lib.cuDeviceGetUuid.restype = ctypes.c_int
-
-            lib.cuDeviceGetCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
-            lib.cuDeviceGetCount.restype = ctypes.c_int
+            lib.cuCheckpointProcessRestore.argtypes = [ctypes.c_int, ctypes.c_void_p]
+            lib.cuCheckpointProcessRestore.restype = ctypes.c_int
 
             _check_cu("cuInit", lib.cuInit(0))
             _cu_bindings = lib
@@ -143,9 +91,16 @@ def _get_descendant_pids(pid):
     except psutil.NoSuchProcess:
         return []
     children = proc.children(recursive=True)
-    children = [c for c in children if "resource_tracker" not in " ".join(c.cmdline())]
-    children.reverse()
-    return [c.pid for c in children]
+    filtered = []
+    for c in children:
+        try:
+            if "resource_tracker" in " ".join(c.cmdline()):
+                continue
+        except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+            pass
+        filtered.append(c.pid)
+    filtered.reverse()
+    return filtered
 
 
 def _kill_process_tree(pid):
@@ -162,111 +117,371 @@ def _kill_process_tree(pid):
         pass
 
 
-class CUuuid(ctypes.Structure):
-    _fields_ = [("bytes", ctypes.c_char * 16)]
+_is_root = os.geteuid() == 0
 
 
-class CUcheckpointGpuPair(ctypes.Structure):
-    _fields_ = [
-        ("oldUuid", CUuuid),
-        ("newUuid", CUuuid),
-    ]
+def _run_cuda_checkpoint(action, pid, ignore_state_err=False, device_map=None):
+    """Run sudo cuda-checkpoint --action <action> --pid <pid>."""
+    cmd = ["sudo", "cuda-checkpoint", "--action", action, "--pid", str(pid)]
+    if device_map:
+        cmd.extend(["--device-map", device_map])
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        err_msg = (r.stderr or r.stdout or "")
+        if ignore_state_err and "present state" in err_msg.lower():
+            return
+        raise RuntimeError(f"cuda-checkpoint {action}({pid}) failed: {err_msg}")
 
 
-_PTR_SIZE = ctypes.sizeof(ctypes.c_void_p)
+def _worker_checkpoint(child_pid, unlock=True):
+    """Checkpoint the vLLM child and all its GPU-holding descendants.
 
+    If unlock=False, leaves processes in CUDA 'checkpointed' state
+    (for a subsequent CRIU dump — the CRIU CUDA plugin will skip the
+    redundant lock+checkpoint cycle when it sees the process is already
+    checkpointed).
 
-class CUcheckpointRestoreArgs(ctypes.Structure):
-    _pack_ = 1
-    _fields_ = [
-        ("gpuPairs", ctypes.POINTER(CUcheckpointGpuPair)),
-        ("gpuPairsCount", ctypes.c_uint),
-        ("reserved", ctypes.c_char * (52 - _PTR_SIZE)),
-        ("reserved1", ctypes.c_uint64),
-    ]
-
-
-def _get_device_uuid(cu, ordinal):
-    """Get the CUuuid for a GPU by device ordinal."""
-    uuid = CUuuid()
-    _check_cu(f"cuDeviceGetUuid({ordinal})",
-              cu.cuDeviceGetUuid(ctypes.byref(uuid), ordinal))
-    return uuid
-
-
-def _get_device_count(cu):
-    count = ctypes.c_int(0)
-    _check_cu("cuDeviceGetCount", cu.cuDeviceGetCount(ctypes.byref(count)))
-    return count.value
-
-
-def _make_restore_args(cu, old_gpu, new_gpu):
-    """Build CUcheckpointRestoreArgs with GPU pair for cross-GPU restore.
-
-    Every GPU visible to CUDA must be listed. The mapping must be a
-    valid permutation (bijective): old_gpu swaps with new_gpu, all
-    others map to themselves.
+    Uses driver API directly when running as root, falls back to the
+    cuda-checkpoint CLI via sudo otherwise.
     """
-    dev_count = _get_device_count(cu)
-    pairs = (CUcheckpointGpuPair * dev_count)()
-    for i in range(dev_count):
-        pairs[i].oldUuid = _get_device_uuid(cu, i)
-        if i == old_gpu:
-            pairs[i].newUuid = _get_device_uuid(cu, new_gpu)
-        elif i == new_gpu:
-            pairs[i].newUuid = _get_device_uuid(cu, old_gpu)
-        else:
-            pairs[i].newUuid = _get_device_uuid(cu, i)
-
-    args = CUcheckpointRestoreArgs()
-    ctypes.memset(ctypes.byref(args), 0, ctypes.sizeof(args))
-    args.gpuPairsCount = dev_count
-    args.gpuPairs = pairs
-    return args, pairs
-
-
-def _worker_checkpoint(child_pid):
-    """Checkpoint the vLLM child and all its GPU-holding descendants."""
-    cu = _get_cu()
     descendant_pids = _get_descendant_pids(child_pid)
     all_pids = descendant_pids + [child_pid]
-    for pid in all_pids:
-        _check_cu(f"Lock({pid})", cu.cuCheckpointProcessLock(pid, None))
-        _check_cu(f"Checkpoint({pid})", cu.cuCheckpointProcessCheckpoint(pid, None))
-        _check_cu(f"Unlock({pid})", cu.cuCheckpointProcessUnlock(pid, None),
-                  ignore=_CU_CHECKPOINT_ALREADY_DONE)
+    if _is_root:
+        cu = _get_cu()
+        for pid in all_pids:
+            _check_cu(f"Lock({pid})", cu.cuCheckpointProcessLock(pid, None))
+            _check_cu(f"Checkpoint({pid})", cu.cuCheckpointProcessCheckpoint(pid, None))
+            if unlock:
+                _check_cu(f"Unlock({pid})", cu.cuCheckpointProcessUnlock(pid, None),
+                          ignore=_CU_CHECKPOINT_ALREADY_DONE)
+    else:
+        for pid in all_pids:
+            _run_cuda_checkpoint("lock", pid)
+            _run_cuda_checkpoint("checkpoint", pid)
+            if unlock:
+                _run_cuda_checkpoint("unlock", pid, ignore_state_err=True)
     return all_pids
 
 
-def _worker_restore(pids, old_gpu=None, new_gpu=None):
-    """Restore processes in top-down order (reverse of checkpoint order).
+def _gpu_uuids():
+    """Return list of GPU UUID strings from nvidia-smi."""
+    return [u.strip() for u in subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=gpu_uuid", "--format=csv,noheader"],
+        text=True).strip().splitlines()]
 
-    If old_gpu and new_gpu are set, remaps the checkpoint from old_gpu
-    to new_gpu using CUcheckpointGpuPair UUID mapping.
+
+def _build_full_device_map(old_gpu, new_gpu):
+    """Build full GPU device map string for cuda-checkpoint --device-map.
+
+    cuda-checkpoint requires a bijective mapping of ALL visible GPUs,
+    not just the pair being swapped.
+    Format: oldUuid1=newUuid1,oldUuid2=newUuid2,...
     """
-    cu = _get_cu()
-    restore_arg = None
-    _pairs_ref = None
-    if old_gpu is not None and new_gpu is not None and old_gpu != new_gpu:
-        restore_arg, _pairs_ref = _make_restore_args(cu, old_gpu, new_gpu)
-    for pid in reversed(pids):
-        if restore_arg is not None:
-            cu.cuCheckpointProcessRestore.argtypes = [ctypes.c_int, ctypes.POINTER(CUcheckpointRestoreArgs)]
-            _check_cu(f"Restore({pid})",
-                      cu.cuCheckpointProcessRestore(pid, ctypes.byref(restore_arg)))
-            cu.cuCheckpointProcessRestore.argtypes = [ctypes.c_int, ctypes.c_void_p]
+    uuids = _gpu_uuids()
+    pairs = []
+    for i, uuid in enumerate(uuids):
+        if i == old_gpu:
+            pairs.append(f"{uuid}={uuids[new_gpu]}")
+        elif i == new_gpu:
+            pairs.append(f"{uuid}={uuids[old_gpu]}")
         else:
-            _check_cu(f"Restore({pid})",
-                      cu.cuCheckpointProcessRestore(pid, None))
-        _check_cu(f"Unlock({pid})", cu.cuCheckpointProcessUnlock(pid, None))
+            pairs.append(f"{uuid}={uuid}")
+    return ",".join(pairs)
+
+
+def _build_restore_args(old_gpu, new_gpu):
+    """Build a CUcheckpointRestoreArgs ctypes buffer for GPU migration.
+
+    Layout (64-bit):
+      gpuPairs*      (8 bytes pointer)
+      gpuPairsCount  (4 bytes, unsigned int)
+      reserved       (44 bytes, zeroed)
+      reserved1      (8 bytes, zeroed)
+    Each CUcheckpointGpuPair is oldUuid(16) + newUuid(16) = 32 bytes.
+    """
+    uuids_str = _gpu_uuids()
+    uuids = [bytes.fromhex(u.replace("GPU-", "").replace("-", ""))
+             for u in uuids_str]
+
+    pairs_data = bytearray()
+    for i in range(len(uuids)):
+        old_uuid = uuids[i]
+        if i == old_gpu:
+            new_uuid = uuids[new_gpu]
+        elif i == new_gpu:
+            new_uuid = uuids[old_gpu]
+        else:
+            new_uuid = uuids[i]
+        pairs_data += old_uuid + new_uuid
+
+    pairs_buf = (ctypes.c_char * len(pairs_data))(*pairs_data)
+    pairs_ptr = ctypes.cast(pairs_buf, ctypes.c_void_p)
+
+    args_data = bytearray(64)
+    struct.pack_into("<Q", args_data, 0, pairs_ptr.value)
+    struct.pack_into("<I", args_data, 8, len(uuids))
+    args_buf = (ctypes.c_char * 64)(*args_data)
+    return args_buf, pairs_buf
+
+
+def _worker_restore(pids, old_gpu=None, new_gpu=None):
+    """Restore CUDA context on pids.
+
+    State machine: checkpointed → restore → locked → unlock → running
+
+    Uses driver API directly when running as root, falls back to the
+    cuda-checkpoint CLI via sudo otherwise.
+    """
+    if _is_root:
+        cu = _get_cu()
+        args_ptr = None
+        _kept_alive = None
+        if old_gpu is not None and new_gpu is not None and old_gpu != new_gpu:
+            args_buf, pairs_buf = _build_restore_args(old_gpu, new_gpu)
+            args_ptr = ctypes.cast(args_buf, ctypes.c_void_p)
+            _kept_alive = (args_buf, pairs_buf)
+        for pid in reversed(pids):
+            _check_cu(f"Restore({pid})", cu.cuCheckpointProcessRestore(pid, args_ptr))
+            _check_cu(f"Unlock({pid})", cu.cuCheckpointProcessUnlock(pid, None),
+                      ignore=_CU_CHECKPOINT_ALREADY_DONE)
+    else:
+        device_map = None
+        if old_gpu is not None and new_gpu is not None and old_gpu != new_gpu:
+            device_map = _build_full_device_map(old_gpu, new_gpu)
+        for pid in reversed(pids):
+            _run_cuda_checkpoint("restore", pid, device_map=device_map)
+            _run_cuda_checkpoint("unlock", pid, ignore_state_err=True)
+
+
+# ---------------------------------------------------------------------------
+# CRIU save / load (process image to/from disk)
+# ---------------------------------------------------------------------------
+
+_CRIU_PREFIX = ["sudo", "criu"]
+
+
+def _resolve_fd_resource(pid, fd):
+    """Read /proc/<pid>/fd/<fd> to determine the CRIU resource identifier."""
+    link = os.readlink(f"/proc/{pid}/fd/{fd}")
+    return link
+
+
+def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, rank,
+                      meta_extra=None):
+    """Dump the vLLM child process tree to disk via CRIU.
+
+    Uses --leave-running (-R): the child stays alive after the dump so the
+    instance can continue to be used without a separate load().
+    """
+    os.makedirs(image_dir, exist_ok=True)
+
+    for stale in _glob.glob("/dev/shm/link_remap.*"):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+    for sem in _glob.glob("/dev/shm/sem.*"):
+        try:
+            os.remove(sem)
+        except OSError:
+            pass
+
+    external_unix = []
+    nvidia_fds = {}
+    proc_fd_dir = f"/proc/{child_pid}/fd"
+    for fd_name in os.listdir(proc_fd_dir):
+        try:
+            link = os.readlink(f"{proc_fd_dir}/{fd_name}")
+            if link.startswith("socket:["):
+                ino = link.split("[")[1].rstrip("]")
+                external_unix.append(f"unix[{ino}]")
+            elif "/dev/nvidia" in link:
+                nvidia_fds[int(fd_name)] = link
+        except OSError:
+            pass
+
+    cmd = [
+        "sudo",
+        "criu", "dump",
+        "-t", str(child_pid),
+        "-D", image_dir,
+        "-o", "dump.log",
+        "--shell-job",
+        "--tcp-close",
+        "--ext-unix-sk",
+        "--link-remap",
+        "--libdir", "/usr/lib/criu/empty",
+        "-R",
+        "-v4",
+    ]
+    for ext in external_unix:
+        cmd.extend(["--external", ext])
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    subprocess.run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", image_dir],
+                   capture_output=True)
+    if result.returncode != 0:
+        detail = result.stderr or result.stdout or "(no output)"
+        log_path = os.path.join(image_dir, "dump.log")
+        if os.path.exists(log_path):
+            with open(log_path) as f:
+                detail += "\n--- dump.log ---\n" + f.read()[-2000:]
+        raise RuntimeError(
+            f"criu dump failed (rc={result.returncode}): {detail}")
+
+    meta = {
+        "child_pid": child_pid,
+        "pipe_fd": pipe_fd,
+        "pipe_resource": pipe_resource,
+        "nvidia_fds": {str(k): v for k, v in nvidia_fds.items()},
+        "rank": rank,
+    }
+    if meta_extra:
+        meta.update(meta_extra)
+    with open(os.path.join(image_dir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    return meta
+
+
+def _find_pid_by_pipe(pipe_inode):
+    """Scan /proc to find the PID that holds a socket with the given inode."""
+    target = f"socket:[{pipe_inode}]"
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        fd_dir = f"/proc/{entry}/fd"
+        try:
+            for fd_name in os.listdir(fd_dir):
+                try:
+                    link = os.readlink(f"{fd_dir}/{fd_name}")
+                    if link == target:
+                        return int(entry)
+                except OSError:
+                    pass
+        except (OSError, PermissionError):
+            pass
+    return None
+
+
+def _worker_criu_load(image_dir, new_pipe_fd):
+    """Restore a vLLM child process tree from a CRIU image on disk.
+
+    Uses a new PID namespace so the same image can be restored multiple
+    times without PID collisions.  Discovers the host PID by scanning
+    /proc for the process holding the inherited pipe fd.
+    """
+    import fcntl
+
+    meta_path = os.path.join(image_dir, "meta.json")
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    pipe_resource = meta["pipe_resource"]
+    pidfile = os.path.join(image_dir, "restored.pid")
+    for _stale in [pidfile, os.path.join(image_dir, "restore.log")]:
+        if os.path.exists(_stale):
+            os.remove(_stale)
+    original_pid = meta.get("child_pid")
+
+    flags = fcntl.fcntl(new_pipe_fd, fcntl.F_GETFD)
+    fcntl.fcntl(new_pipe_fd, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
+
+    pipe_inode = os.readlink(f"/proc/self/fd/{new_pipe_fd}")
+    if pipe_inode.startswith("socket:["):
+        pipe_inode = pipe_inode.split("[")[1].rstrip("]")
+
+    # sudo closes all FDs >= 3, so we pass the pipe fd to the child via
+    # a Unix domain socket (SCM_RIGHTS) bound to a temp path that sudo
+    # can connect to.
+    import socket as _socket, tempfile, array, threading
+
+    sock_path = os.path.join(tempfile.gettempdir(),
+                             f"criu_fd_{os.getpid()}_{new_pipe_fd}.sock")
+    if os.path.exists(sock_path):
+        os.remove(sock_path)
+
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    os.chmod(sock_path, 0o777)
+    srv.listen(1)
+
+    def _send_fd():
+        conn, _ = srv.accept()
+        conn.sendmsg(
+            [b"\x00"],
+            [(_socket.SOL_SOCKET, _socket.SCM_RIGHTS,
+              array.array("i", [new_pipe_fd]))]
+        )
+        conn.close()
+        srv.close()
+
+    sender = threading.Thread(target=_send_fd, daemon=True)
+    sender.start()
+
+    criu_argv = [
+        "criu", "restore",
+        "-D", image_dir,
+        "-o", "restore.log",
+        "--shell-job",
+        "--tcp-close",
+        "--inherit-fd", f"fd[{new_pipe_fd}]:{pipe_resource}",
+        "--inherit-fd", "fd[1]:stdout",
+        "--inherit-fd", "fd[2]:stderr",
+        "--pidfile", pidfile,
+        "--link-remap",
+        "-d",
+        "-v4",
+    ]
+    helper_script = (
+        "import os, socket, array\n"
+        f"s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        f"s.connect({sock_path!r})\n"
+        f"msg, ancdata, _, _ = s.recvmsg(1, socket.CMSG_LEN(4))\n"
+        f"for cl, ct, cd in ancdata:\n"
+        f"    if cl == socket.SOL_SOCKET and ct == socket.SCM_RIGHTS:\n"
+        f"        fds = array.array('i'); fds.frombytes(cd)\n"
+        f"        received = fds[0]\n"
+        f"s.close()\n"
+        f"os.dup2(received, {new_pipe_fd})\n"
+        f"if received != {new_pipe_fd}: os.close(received)\n"
+        f"os.execvp({criu_argv[0]!r}, {criu_argv!r})\n"
+    )
+    cmd = ["sudo", "python3", "-c", helper_script]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True,
+    )
+    sender.join(timeout=2)
+    try:
+        os.remove(sock_path)
+    except OSError:
+        pass
+    subprocess.run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", image_dir],
+                   capture_output=True)
+    if result.returncode != 0:
+        detail = result.stderr or result.stdout or "(no output)"
+        log_path = os.path.join(image_dir, "restore.log")
+        if os.path.exists(log_path):
+            with open(log_path) as f:
+                detail += "\n--- restore.log ---\n" + f.read()[-2000:]
+        raise RuntimeError(
+            f"criu restore failed (rc={result.returncode}): {detail}")
+
+    new_pid = _find_pid_by_pipe(pipe_inode)
+    if new_pid is None:
+        with open(pidfile) as f:
+            new_pid = int(f.read().strip())
+
+    return new_pid, meta
 
 
 # ---------------------------------------------------------------------------
 # Child thread -- communicates with the vLLM child process via pipe
 # ---------------------------------------------------------------------------
 
-def _child_thread(rank, child_pid, pipe, arch,
-                  child_queue, result_queue, completed_counter):
+def _child_thread(rank, child_pid, pipe,
+                  child_queue, result_queue, completed_counter,
+                  initial_state="alive"):
     """Thread that owns the single child.  Pulls commands from child_queue,
     executes them serially, puts results on result_queue."""
 
@@ -279,8 +494,11 @@ def _child_thread(rank, child_pid, pipe, arch,
         with completed_counter.get_lock():
             completed_counter.value += 1
 
-    state = "alive"
-    checkpointed_pids = None
+    state = initial_state
+    checkpointed_pids = (
+        _get_descendant_pids(child_pid) + [child_pid]
+        if initial_state == "checkpointed" else None
+    )
 
     while True:
         cmd, kwargs = child_queue.get()
@@ -298,9 +516,9 @@ def _child_thread(rank, child_pid, pipe, arch,
         if cmd == "checkpoint":
             t0 = time.perf_counter()
             error = None
-            info = {"arch": arch}
+            info = {}
             try:
-                checkpointed_pids = _worker_checkpoint(child_pid)
+                checkpointed_pids = _worker_checkpoint(child_pid, unlock=False)
                 _tlog(f"  checkpointed pids: {checkpointed_pids}")
                 state = "checkpointed"
             except Exception as e:
@@ -314,8 +532,21 @@ def _child_thread(rank, child_pid, pipe, arch,
             t0 = time.perf_counter()
             error = None
             target_gpu = kwargs["gpu"]
-            info = {"arch": arch}
+            info = {}
             try:
+                if state == "alive":
+                    checkpointed_pids = _get_descendant_pids(child_pid) + [child_pid]
+                    _tlog(f"  process is alive, checkpointing before restore...")
+                    if _is_root:
+                        cu = _get_cu()
+                        for _p in checkpointed_pids:
+                            _check_cu(f"Lock({_p})", cu.cuCheckpointProcessLock(_p, None))
+                            _check_cu(f"Checkpoint({_p})", cu.cuCheckpointProcessCheckpoint(_p, None))
+                    else:
+                        for _p in checkpointed_pids:
+                            _run_cuda_checkpoint("lock", _p)
+                            _run_cuda_checkpoint("checkpoint", _p)
+                    state = "checkpointed"
                 if checkpointed_pids is None:
                     raise RuntimeError("restore called but no checkpointed PIDs stored")
                 _worker_restore(checkpointed_pids,
@@ -333,10 +564,51 @@ def _child_thread(rank, child_pid, pipe, arch,
             _emit_result(cmd, elapsed, error, info)
             continue
 
+        if cmd == "save":
+            t0 = time.perf_counter()
+            error = None
+            info = {}
+            try:
+                image_dir = kwargs["filename"]
+                pipe.send(("get_pipe_fd", {}))
+                fd_result = pipe.recv()
+                _fd_cmd, _fd_elapsed, _fd_error, fd_info = fd_result
+                if _fd_error is not None:
+                    raise RuntimeError(f"get_pipe_fd failed: {_fd_error}")
+                child_pipe_fd = fd_info["pipe_fd"]
+                _tlog(f"  child pipe fd: {child_pipe_fd}")
+
+                pipe.send(("prepare_criu_dump", {"pipe_fd": child_pipe_fd}))
+                prep_result = pipe.recv()
+                _pr_cmd, _pr_elapsed, _pr_error, pr_info = prep_result
+                if _pr_error is not None:
+                    _tlog(f"  WARNING: prepare_criu_dump failed: {_pr_error}")
+                else:
+                    _tlog(f"  prepare_criu_dump: fds={pr_info.get('closed_fds', [])}, "
+                          f"unmapped={pr_info.get('unmapped', [])}")
+
+                pipe_resource = _resolve_fd_resource(child_pid, child_pipe_fd)
+
+                meta = _worker_criu_save(
+                    child_pid, image_dir, child_pipe_fd, pipe_resource, rank,
+                    meta_extra=kwargs.get("meta_extra"),
+                )
+                info["image_dir"] = image_dir
+                info["meta"] = meta
+                state = "checkpointed"
+                _tlog(f"  CRIU saved to {image_dir} (child still alive)")
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                error = f"{type(e).__name__}: {e}"
+            elapsed = time.perf_counter() - t0
+            _tlog(f"<<< save {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
+            _emit_result(cmd, elapsed, error, info)
+            continue
+
         if cmd == "teardown":
             t0 = time.perf_counter()
             error = None
-            info = {"arch": arch}
+            info = {}
             try:
                 pipe.close()
                 _kill_process_tree(child_pid)
@@ -359,19 +631,12 @@ def _child_thread(rank, child_pid, pipe, arch,
 # Worker main loop
 # ---------------------------------------------------------------------------
 
-def worker_loop(rank, cmd_queue, result_queue, completed_counter,
-                use_odirect=True):
-    """Main loop for a per-Instance worker process.
-
-    Forked from the main process.  Spawns the vLLM child via
-    mp.get_context("spawn") on "init".  Checkpoint/restore run in the
-    child thread via CUDA driver ctypes.
-    """
+def worker_loop(rank, cmd_queue, result_queue, completed_counter):
+    """Main loop for a per-Instance worker process."""
     child_pid = None
     child_proc = None
     child_queue = None
     child_thread_obj = None
-    arch = None
 
     def _wlog(msg):
         print(f"[worker{rank}] [{time.strftime('%H:%M:%S')}] (pid={os.getpid()}) {msg}", flush=True)
@@ -382,29 +647,17 @@ def worker_loop(rank, cmd_queue, result_queue, completed_counter,
         cmd, kwargs = cmd_queue.get()
         _wlog(f">>> {cmd}")
 
-        if cmd == "wait_for":
-            from instance import _counter_registry
-            counter = _counter_registry[kwargs["instance_id"]]
-            target = kwargs["target"]
-            _wlog(f"wait_for target={target} (current={counter.value})")
-            while counter.value < target:
-                time.sleep(0.01)
-            _wlog(f"wait_for satisfied ({counter.value}/{target})")
-            continue
-
         if cmd == "init":
             from vllm_child import vllm_child_loop
 
             vllm_config = kwargs["vllm_config"]
-            model_path = vllm_config["model"]
-            arch = _read_architecture(model_path)
 
             pipe_parent, pipe_child = mp.Pipe()
 
             spawn_ctx = mp.get_context("spawn")
             child_proc = spawn_ctx.Process(
                 target=vllm_child_loop,
-                args=(pipe_child, rank, use_odirect, arch),
+                args=(pipe_child, rank),
             )
             child_proc.start()
             pipe_child.close()
@@ -413,13 +666,54 @@ def worker_loop(rank, cmd_queue, result_queue, completed_counter,
             child_queue = queue.Queue()
             child_thread_obj = threading.Thread(
                 target=_child_thread,
-                args=(rank, child_pid, pipe_parent, arch,
+                args=(rank, child_pid, pipe_parent,
                       child_queue, result_queue, completed_counter),
                 daemon=True,
             )
             child_thread_obj.start()
 
             child_queue.put((cmd, kwargs))
+            continue
+
+        if cmd == "load":
+            t0 = time.perf_counter()
+            error = None
+            info = {}
+            try:
+                image_dir = kwargs["filename"]
+
+                pipe_parent, pipe_child = mp.Pipe()
+                new_pipe_fd = pipe_child.fileno()
+
+                new_pid, meta = _worker_criu_load(image_dir, new_pipe_fd)
+                pipe_child.close()
+
+                child_pid = new_pid
+                child_proc = None
+                old_rank = meta.get("rank", rank)
+
+                child_queue = queue.Queue()
+                child_thread_obj = threading.Thread(
+                    target=_child_thread,
+                    args=(old_rank, child_pid, pipe_parent,
+                          child_queue, result_queue, completed_counter,
+                          "checkpointed"),
+                    daemon=True,
+                )
+                child_thread_obj.start()
+
+                info["pid"] = new_pid
+                info["rank"] = old_rank
+                info["image_dir"] = image_dir
+                _wlog(f"  CRIU restored pid={new_pid} (checkpointed, awaiting restore)")
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                error = f"{type(e).__name__}: {e}"
+            elapsed = time.perf_counter() - t0
+            _wlog(f"<<< load {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
+            result_queue.put(("load", elapsed, error, info))
+            with completed_counter.get_lock():
+                completed_counter.value += 1
             continue
 
         if cmd == "teardown":

@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import os
 import subprocess
-import threading
+import queue
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import Any
 
 from huggingface_hub import snapshot_download
@@ -29,32 +28,13 @@ def _console(msg: str) -> None:
     out.flush()
 
 
-@dataclass
-class GPUView:
-    gpu_id: int
-    name: str
-    free_bytes: int
-    total_bytes: int
-
-
-def _discover_gpus() -> list[GPUView]:
-    """Discover GPUs via nvidia-smi without initializing CUDA."""
+def _discover_gpu_ids() -> list[int]:
+    """Return GPU device indices via nvidia-smi without initializing CUDA."""
     out = subprocess.check_output(
-        ["nvidia-smi",
-         "--query-gpu=index,name,memory.free,memory.total",
-         "--format=csv,noheader,nounits"],
+        ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
         text=True,
     )
-    gpus = []
-    for line in out.strip().splitlines():
-        idx, name, free_mib, total_mib = (x.strip() for x in line.split(","))
-        gpus.append(GPUView(
-            gpu_id=int(idx),
-            name=name,
-            free_bytes=int(free_mib) * 1024 * 1024,
-            total_bytes=int(total_mib) * 1024 * 1024,
-        ))
-    return gpus
+    return [int(line.strip()) for line in out.strip().splitlines()]
 
 
 class Orchestrator:
@@ -62,73 +42,62 @@ class Orchestrator:
 
     _registry: dict[str, Any] = {}
     _futures: dict[str, Future] = {}
-    _gpus: list[GPUView] = []
-    _assigned_gpus: set[int] = set()
-    _local_cache: str | None = None
+    _gpu_ids: list[int] = []
+    _model_cache: str | None = None
+    _image_cache: str | None = None
     _pool: ThreadPoolExecutor | None = None
-    _gpu_available = threading.Condition()
-    _attach_lock = threading.Lock()
+    _gpu_queue: queue.Queue[int] = queue.Queue()
 
     @staticmethod
     def _acquire_gpu(label: str) -> int:
-        """Block until a GPU is free, assign it, and return its ID."""
-        announced = False
-        with Orchestrator._gpu_available:
-            while True:
-                available = [g for g in Orchestrator._gpus
-                             if g.gpu_id not in Orchestrator._assigned_gpus]
-                if available:
-                    gpu = min(g.gpu_id for g in available)
-                    Orchestrator._assigned_gpus.add(gpu)
-                    _console(f"{label}: acquired GPU {gpu}")
-                    print(f"[orchestrator] {label}: acquired GPU {gpu}")
-                    return gpu
-                if not announced:
-                    _console(f"{label}: waiting for GPU...")
-                    announced = True
-                print(f"[orchestrator] {label}: waiting for GPU ...")
-                Orchestrator._gpu_available.wait()
+        """Block (FIFO) until a GPU is free and return its ID."""
+        _console(f"{label}: waiting for GPU...")
+        print(f"[orchestrator] {label}: waiting for GPU ...")
+        gpu = Orchestrator._gpu_queue.get()
+        _console(f"{label}: acquired GPU {gpu}")
+        print(f"[orchestrator] {label}: acquired GPU {gpu}")
+        return gpu
 
     @staticmethod
     def _release_gpu(gpu: int) -> None:
-        """Release a GPU and wake up any waiters."""
-        with Orchestrator._gpu_available:
-            Orchestrator._assigned_gpus.discard(gpu)
-            Orchestrator._gpu_available.notify_all()
+        """Return a GPU to the pool."""
+        Orchestrator._gpu_queue.put(gpu)
 
     @staticmethod
-    def init(local_cache: str = "/data-fast/model-cache",
-             gpu_carveout_gb: float = 0) -> None:
-        """Discover GPUs, create cache dir, and start the thread pool."""
-        Orchestrator._gpus = _discover_gpus()
-        Orchestrator._local_cache = local_cache
-        os.makedirs(local_cache, exist_ok=True)
+    def init(model_cache: str = "/data-fast/model-cache",
+             image_cache: str = "/data-fast/image-cache",
+             gpus: list[int] | None = None) -> None:
+        """Discover GPUs, create cache dirs, and start the thread pool."""
+        Orchestrator._gpu_ids = gpus if gpus is not None else _discover_gpu_ids()
+        Orchestrator._model_cache = model_cache
+        Orchestrator._image_cache = image_cache
+        os.makedirs(model_cache, exist_ok=True)
+        os.makedirs(image_cache, exist_ok=True)
         Orchestrator._pool = ThreadPoolExecutor()
-        print(f"[orchestrator] init  local_cache={local_cache}  "
-              f"gpus={[g.gpu_id for g in Orchestrator._gpus]}")
+        Orchestrator._gpu_queue = queue.Queue()
+        for gpu_id in Orchestrator._gpu_ids:
+            Orchestrator._gpu_queue.put(gpu_id)
+        print(f"[orchestrator] init  model_cache={model_cache}  "
+              f"image_cache={image_cache}  gpus={Orchestrator._gpu_ids}")
 
     # ------------------------------------------------------------------
     # register
     # ------------------------------------------------------------------
 
     @staticmethod
-    def register(model_id: str, vllm_config: dict) -> None:
-        """Submit model download + GPU registration to the pool."""
-        _console(f"{model_id}: register received")
-        print(f"[orchestrator] register  model_id={model_id}  "
-              f"model={vllm_config['model']}")
-
-        fut = Orchestrator._pool.submit(
-            Orchestrator._register_sync, model_id, vllm_config,
-        )
-        Orchestrator._futures[model_id] = fut
+    def _image_dir_for(model_id: str) -> str:
+        """Return the image-cache directory for a given model_id."""
+        safe_name = model_id.replace("/", "--")
+        return os.path.join(Orchestrator._image_cache, safe_name)
 
     @staticmethod
-    def _register_sync(model_id: str, vllm_config: dict) -> None:
-        """Download model then do blocking GPU registration (runs in a pool thread)."""
+    def register(model_id: str, vllm_config: dict) -> None:
+        """Download model weights, then submit GPU registration to the pool."""
+        _console(f"{model_id}: register received")
         hf_model = vllm_config["model"]
-        local_dir = os.path.join(Orchestrator._local_cache, hf_model)
+        print(f"[orchestrator] register  model_id={model_id}  model={hf_model}")
 
+        local_dir = os.path.join(Orchestrator._model_cache, hf_model)
         t0 = time.perf_counter()
         print(f"[orchestrator] {model_id}: downloading {hf_model} ...")
         snapshot_download(hf_model, local_dir=local_dir)
@@ -136,28 +105,51 @@ class Orchestrator:
         print(f"[orchestrator] {model_id}: download done  ({t_dl:.1f}s)")
 
         vllm_config = dict(vllm_config, model=local_dir)
-        gpu = Orchestrator._acquire_gpu(model_id)
-        t_acquired = time.perf_counter()
+        fut = Orchestrator._pool.submit(
+            Orchestrator._register_sync, model_id, vllm_config,
+        )
+        Orchestrator._futures[model_id] = fut
 
-        inst = Instance(vllm_config).init(gpu)
-        with Orchestrator._attach_lock:
-            inst.attach()
-        inst.stage().sleep().checkpoint().wait()
+    @staticmethod
+    def _register_sync(model_id: str, vllm_config: dict) -> None:
+        """Blocking GPU registration (runs in a pool thread).
 
-        t_done = time.perf_counter()
-        t_wait = t_acquired - t0
-        t_exec = t_done - t_acquired
-        print(f"[orchestrator] {model_id}: cold-start done on GPU {gpu}  "
-              f"({t_done - t0:.1f}s)")
+        On image-cache hit: load from disk (no GPU needed).
+        On miss: acquire GPU, cold-start, save image, release GPU.
+        """
+        t0 = time.perf_counter()
+        image_dir = Orchestrator._image_dir_for(model_id)
+        cache_hit = os.path.isfile(os.path.join(image_dir, "meta.json"))
+        inst = Instance(vllm_config)
 
-        Orchestrator._release_gpu(gpu)
+        if cache_hit:
+            print(f"[orchestrator] {model_id}: image cache HIT — loading from {image_dir}")
+            inst.load(image_dir).wait()
+            t_done = time.perf_counter()
+            print(f"[orchestrator] {model_id}: loaded from image  ({t_done - t0:.1f}s)")
+            _console(f"{model_id}: registered via image load ({t_done - t0:.1f}s)")
+        else:
+            print(f"[orchestrator] {model_id}: image cache MISS — cold-starting")
+            gpu = Orchestrator._acquire_gpu(model_id)
+            t_acquired = time.perf_counter()
+
+            inst.init(gpu).attach().repin().stage().unpin().sleep().checkpoint().wait()
+            inst.save(image_dir).wait()
+            print(f"[orchestrator] {model_id}: image saved to {image_dir}")
+
+            Orchestrator._release_gpu(gpu)
+            t_done = time.perf_counter()
+            t_wait = t_acquired - t0
+            t_exec = t_done - t_acquired
+            print(f"[orchestrator] {model_id}: cold-start done on GPU {gpu}  "
+                  f"({t_done - t0:.1f}s)")
+            _console(f"{model_id}: registered via cold-start "
+                     f"(wait={t_wait:.1f}s, register={t_exec:.1f}s, total={t_wait + t_exec:.1f}s)")
 
         Orchestrator._registry[model_id] = {
             "instance": inst,
             "vllm_config": vllm_config,
         }
-        print(f"[orchestrator] {model_id}: registered  ({t_done - t0:.1f}s total)")
-        _console(f"{model_id}: registered (wait={t_wait:.1f}s, register={t_exec:.1f}s, total={t_wait + t_exec:.1f}s)")
 
     # ------------------------------------------------------------------
     # generate
@@ -198,10 +190,11 @@ class Orchestrator:
         t_acquired = time.perf_counter()
 
         inst.restore(gpu) \
-            .wake_up(["weights"]) \
+            .repin() \
+            .wake_up_weights() \
             .h2d() \
             .scatter() \
-            .wake_up(["kv_cache"]) \
+            .wake_up_kv_cache() \
             .wait()
         t_ready = time.perf_counter()
 
@@ -209,7 +202,7 @@ class Orchestrator:
         result = inst.last_generate_result
         t_generated = time.perf_counter()
 
-        inst.sleep().checkpoint().wait()
+        inst.unpin().sleep().checkpoint().wait()
         Orchestrator._release_gpu(gpu)
         t_done = time.perf_counter()
 
@@ -279,18 +272,30 @@ class Orchestrator:
     @staticmethod
     def print_status() -> None:
         """Print GPUs and registered models."""
-        if not Orchestrator._gpus:
+        if not Orchestrator._gpu_ids:
             _console("Orchestrator not initialized. Call Orchestrator.init() first.")
             return
 
-        _console(f"\nOrchestrator  local_cache={Orchestrator._local_cache}")
+        _console(f"\nOrchestrator  model_cache={Orchestrator._model_cache}  image_cache={Orchestrator._image_cache}")
 
-        _console(f"\nGPUs ({len(Orchestrator._gpus)}):")
-        for g in Orchestrator._gpus:
-            used = g.total_bytes - g.free_bytes
-            _console(f"  GPU {g.gpu_id}: {g.name}  "
-                     f"{used / 2**30:.1f} / {g.total_bytes / 2**30:.1f} GiB used  "
-                     f"({g.free_bytes / 2**30:.1f} GiB free)")
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi",
+                 "--query-gpu=index,name,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                text=True,
+            )
+            _console(f"\nGPUs ({len(Orchestrator._gpu_ids)}):")
+            for line in out.strip().splitlines():
+                idx, name, used_mib, total_mib = (x.strip() for x in line.split(","))
+                used = int(used_mib) / 1024
+                total = int(total_mib) / 1024
+                free = total - used
+                _console(f"  GPU {idx}: {name}  "
+                         f"{used:.1f} / {total:.1f} GiB used  "
+                         f"({free:.1f} GiB free)")
+        except Exception:
+            _console(f"\nGPUs: {Orchestrator._gpu_ids}")
 
         if not Orchestrator._registry:
             _console("\nNo models registered.\n")

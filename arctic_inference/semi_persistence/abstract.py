@@ -2,8 +2,7 @@
 
 Each Instance is a GPU-agnostic handle for a vLLM engine.  The GPU is
 specified at init(gpu) time.  All primitives are non-blocking (except
-wait) and return Self for chaining.  Cross-instance dependencies are
-expressed via after().
+wait) and return Self for chaining.
 """
 from __future__ import annotations
 
@@ -15,8 +14,8 @@ class OrchestratorBase(ABC):
 
     @staticmethod
     @abstractmethod
-    def init(local_cache: str, gpu_carveout_gb: float = 0) -> None:
-        """Discover GPUs and configure the orchestrator."""
+    def init(model_cache: str, image_cache: str) -> None:
+        """Discover GPUs, configure cache dirs, and start the orchestrator."""
 
     @staticmethod
     @abstractmethod
@@ -59,20 +58,28 @@ class InstanceBase(ABC):
         """
 
     @abstractmethod
-    def after(self, other: InstanceBase) -> InstanceBase:
-        """Wait for all of other's pending commands before proceeding.
-
-        Non-blocking from the main process: enqueues a wait_for on the
-        worker, which blocks until the dependency is satisfied.
-        """
-
-    @abstractmethod
     def sleep(self) -> InstanceBase:
         """Free GPU memory for weights and KV cache (vLLM sleep level=2)."""
 
     @abstractmethod
     def checkpoint(self) -> InstanceBase:
         """Save CUDA state to CPU. Instance becomes stateless (gpu=None)."""
+
+    @abstractmethod
+    def save(self, filename: str) -> InstanceBase:
+        """CRIU-dump the child process tree to disk (non-destructive).
+
+        Uses --leave-running so the child stays alive after the dump.
+        Writes meta.json with vllm_config and CRIU metadata.
+        """
+
+    @abstractmethod
+    def load(self, filename: str | None = None) -> InstanceBase:
+        """Restore a live process from a CRIU image on disk.
+
+        Validates that the image's vllm_config matches this instance.
+        Spawns a new worker and CRIU-restores the child.
+        """
 
     @abstractmethod
     def restore(self, gpu: int) -> InstanceBase:
@@ -94,8 +101,12 @@ class InstanceBase(ABC):
         """
 
     @abstractmethod
-    def wake_up(self, tags: list[str]) -> InstanceBase:
-        """Re-allocate tensors on GPU.  tags: ["weights"] or ["kv_cache"]."""
+    def wake_up_weights(self) -> InstanceBase:
+        """Re-allocate weight tensors on GPU."""
+
+    @abstractmethod
+    def wake_up_kv_cache(self) -> InstanceBase:
+        """Re-allocate KV cache on GPU."""
 
     @abstractmethod
     def h2d(self) -> InstanceBase:

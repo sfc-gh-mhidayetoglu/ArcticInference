@@ -2,24 +2,67 @@
 
 Each Instance is a GPU-agnostic handle.  The GPU is specified at
 init(gpu) time, which also spawns the worker process.  All primitives
-are non-blocking and return self for chaining.  Cross-instance
-dependencies are expressed via after().
+are non-blocking and return self for chaining.
 
-Usage:
-    instance = Instance({"model": "/data-fast/Qwen/Qwen3-32B"})
-    instance.init(gpu=0).attach().sleep().checkpoint().wait()
+Instances can be saved to disk via CRIU after CUDA checkpoint, then
+restored (possibly on a different GPU):
+
+    inst.unpin().sleep().checkpoint().save(filename="/data-fast/ckpt/m").wait()
+    inst.restore(gpu=2).wake_up_weights().repin().h2d().scatter().wake_up_kv_cache().wait()
+
+On a later run, load() restores from the on-disk image:
+
+    inst = Instance(vllm_config)
+    inst.load("/data-fast/ckpt/m").wait()
+    inst.restore(gpu=0).wake_up_weights().repin().h2d().scatter().wake_up_kv_cache().wait()
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 import weakref
 
 import torch.multiprocessing as mp
 
-from worker import worker_loop, _read_architecture, _weight_footprint
+from worker import worker_loop, _weight_footprint
 
-_fork_ctx = mp.get_context("fork")
+_spawn_ctx = mp.get_context("spawn")
+
+
+def _print_process_tree(pid, indent=0):
+    """Print the process tree rooted at *pid* using /proc."""
+    prefix = " " * indent
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            name = comm = ""
+            threads = 0
+            state = ""
+            for line in f:
+                if line.startswith("Name:"):
+                    name = line.split(":", 1)[1].strip()
+                elif line.startswith("State:"):
+                    state = line.split(":", 1)[1].strip()
+                elif line.startswith("Threads:"):
+                    threads = int(line.split(":", 1)[1].strip())
+        with open(f"/proc/{pid}/cmdline") as f:
+            raw = f.read()
+        cmdline = raw.replace("\x00", " ").strip()
+        if len(cmdline) > 60:
+            cmdline = cmdline[:57] + "..."
+        thr_info = f" [{threads} threads]" if threads > 1 else ""
+        print(f"{prefix}{pid}  {state}  {name}{thr_info}  {cmdline}", flush=True)
+    except (FileNotFoundError, ProcessLookupError):
+        print(f"{prefix}{pid}  (not running)", flush=True)
+        return
+
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            children = [int(c) for c in f.read().split() if c]
+    except (FileNotFoundError, ProcessLookupError):
+        children = []
+    for child in children:
+        _print_process_tree(child, indent=indent + 4)
 
 
 def _gpu_mem_info(gpu_id: int) -> tuple[int, int]:
@@ -44,7 +87,6 @@ def _gpu_count() -> int:
     return len(out.strip().splitlines())
 
 _next_instance_id = 0
-_counter_registry: dict[int, mp.Value] = {}
 
 
 def _alloc_instance_id():
@@ -57,37 +99,61 @@ class Instance:
 
     _all: weakref.WeakValueDictionary[int, "Instance"] = weakref.WeakValueDictionary()
 
-    def __init__(self, vllm_config: dict, *, use_odirect: bool = True):
+    def __init__(self, vllm_config: dict):
         self.gpu = None
         self.vllm_config = vllm_config
         self.instance_id = _alloc_instance_id()
         Instance._all[self.instance_id] = self
 
         model_path = vllm_config["model"]
-        self.arch = _read_architecture(model_path)
         self.weight_bytes = _weight_footprint(model_path)
 
         self.pid = None
         self.state = "created"
         self.pinned_bytes = 0
+        self._image_dir = None
         self._pending_count = 0
         self._pending_cmds = []
         self._total_sent = 0
-        self._use_odirect = use_odirect
 
-        self._cmd_queue = _fork_ctx.Queue()
-        self._result_queue = _fork_ctx.Queue()
-        self._completed_counter = _fork_ctx.Value('i', 0)
-        _counter_registry[self.instance_id] = self._completed_counter
+        self._cmd_queue = None
+        self._result_queue = None
+        self._completed_counter = None
         self._worker = None
         self.last_generate_result = None
 
+    def _ensure_queues(self):
+        """Create mp queues/counter on demand, right before spawning a worker."""
+        if self._cmd_queue is None:
+            self._cmd_queue = _spawn_ctx.Queue()
+            self._result_queue = _spawn_ctx.Queue()
+            self._completed_counter = _spawn_ctx.Value('i', 0)
+            self._pending_count = 0
+            self._pending_cmds = []
+            self._total_sent = 0
+
     def __repr__(self):
-        return (f"Instance(id={self.instance_id}, gpu={self.gpu}, "
-                f"pid={self.pid}, state={self.state}, "
-                f"pinned={self.pinned_bytes / 2**30:.2f} GiB)")
+        parts = [f"id={self.instance_id}", f"gpu={self.gpu}",
+                 f"pid={self.pid}", f"state={self.state}",
+                 f"pinned={self.pinned_bytes / 2**30:.2f} GiB"]
+        if self._image_dir:
+            parts.append(f"image={self._image_dir}")
+        return f"Instance({', '.join(parts)})"
 
     # -- Internal helpers -------------------------------------------------------
+
+    def _close_queues(self):
+        """Deterministically close mp queues so semaphores are released now."""
+        for q in (self._cmd_queue, self._result_queue):
+            if q is not None:
+                try:
+                    q.close()
+                    q.join_thread()
+                except Exception:
+                    pass
+        self._cmd_queue = None
+        self._result_queue = None
+        self._completed_counter = None
 
     def _reset(self):
         """Reset instance to created state after teardown completes."""
@@ -102,6 +168,7 @@ class Instance:
                     pass
                 self._worker.join(timeout=5)
             self._worker = None
+        self._close_queues()
         self.state = "created"
         self.gpu = None
         self.pid = None
@@ -119,21 +186,30 @@ class Instance:
     def init(self, gpu: int):
         self.gpu = gpu
         self._log("init")
-        self._worker = _fork_ctx.Process(
+        self._ensure_queues()
+        self._worker = _spawn_ctx.Process(
             target=worker_loop,
             args=(gpu, self._cmd_queue, self._result_queue,
-                  self._completed_counter, self._use_odirect),
+                  self._completed_counter),
         )
         self._worker.start()
         return self._send("init", vllm_config=self.vllm_config)
 
     def attach(self):
         self._log("attach")
-        return self._send("attach", model_path=self.vllm_config["model"])
+        return self._send("attach")
 
     def detach(self):
         self._log("detach")
         return self._send("detach")
+
+    def unpin(self):
+        self._log("unpin")
+        return self._send("unpin")
+
+    def repin(self):
+        self._log("repin")
+        return self._send("repin")
 
     def sleep(self):
         self._log("sleep")
@@ -143,28 +219,70 @@ class Instance:
         self._log("checkpoint")
         return self._send("checkpoint")
 
+    def save(self, filename: str):
+        """CRIU-dump the child process tree to disk (non-destructive).
+
+        Must be called after checkpoint() (GPU resources released).
+        Uses --leave-running so the child stays alive after the dump.
+        After save(), the instance remains in 'checkpointed' state and
+        can proceed directly to restore(gpu).  The on-disk image can
+        also be used later via load() on a fresh instance.
+        """
+        self._log(f"save({filename})")
+        self._image_dir = filename
+        return self._send("save", filename=filename,
+                          meta_extra={"vllm_config": self.vllm_config,
+                                      "weight_bytes": self.weight_bytes,
+                                      "pinned_bytes": self.pinned_bytes})
+
+    def load(self, filename: str | None = None):
+        """Restore a live process from a CRIU image on disk.
+
+        If filename is None, uses the image from the last save().
+        Validates that the image's vllm_config matches this instance's
+        config (raises RuntimeError on mismatch).  Spawns a new worker
+        and CRIU-restores the child.  After load completes the instance
+        is in 'checkpointed' state, ready for restore(gpu).
+        """
+        if filename is None:
+            filename = self._image_dir
+        if filename is None:
+            raise RuntimeError("load() requires a filename or prior save()")
+        meta_path = os.path.join(filename, "meta.json")
+        if os.path.isfile(meta_path):
+            with open(meta_path) as f:
+                saved_config = json.load(f).get("vllm_config")
+            if saved_config is not None and saved_config != self.vllm_config:
+                raise RuntimeError(
+                    f"vllm_config mismatch: instance has {self.vllm_config} "
+                    f"but image at {filename} was saved with {saved_config}")
+        self._log(f"load({filename})")
+        self._image_dir = filename
+        self._close_queues()
+        self._ensure_queues()
+        self._worker = _spawn_ctx.Process(
+            target=worker_loop,
+            args=(0, self._cmd_queue, self._result_queue,
+                  self._completed_counter),
+        )
+        self._worker.start()
+        return self._send("load", filename=filename)
+
     def restore(self, gpu: int):
         self._log(f"restore(gpu={gpu})")
         return self._send("restore", gpu=gpu)
 
-    def stage(self, data_path=None):
-        if data_path is not None:
-            data_arch = _read_architecture(data_path)
-            if data_arch != self.arch:
-                raise ValueError(
-                    f"architecture mismatch: instance arch {self.arch} "
-                    f"!= data arch {data_arch} at {data_path}")
+    def stage(self):
         self._log("stage")
-        return self._send("stage", data_path=data_path)
+        return self._send("stage")
 
-    def wake_up(self, tags):
-        self._log(f"wake_up({tags})")
-        if tags == ["weights"]:
-            return self._send("wake_up_weights")
-        elif tags == ["kv_cache"]:
-            return self._send("wake_up_kv_cache")
-        else:
-            raise ValueError(f"unsupported wake_up tags: {tags}")
+    def wake_up_weights(self):
+        self._log("wake_up_weights")
+        return self._send("wake_up_weights")
+
+    def wake_up_kv_cache(self):
+        self._log("wake_up_kv_cache")
+        return self._send("wake_up_kv_cache")
 
     def h2d(self):
         self._log("h2d")
@@ -187,26 +305,6 @@ class Instance:
         """Remove from the instance registry."""
         self._log("remove")
         Instance._all.pop(self.instance_id, None)
-
-    # -- Cross-instance dependency ---------------------------------------------
-
-    def after(self, other: Instance):
-        """Wait for all of other's currently pending commands before proceeding.
-
-        Non-blocking from the main process.  The worker blocks until
-        other._completed_counter >= target.
-
-        We send only the instance ID (not the Value itself) through the
-        queue.  The worker resolves it via _counter_registry, which it
-        inherited at fork time.
-        """
-        target = other._total_sent
-        self._log(f"after(inst{other.instance_id}, target={target})")
-        self._cmd_queue.put(("wait_for", {
-            "instance_id": other.instance_id,
-            "target": target,
-        }))
-        return self
 
     # -- Synchronization -------------------------------------------------------
 
@@ -238,6 +336,13 @@ class Instance:
                 elif cmd == "detach":
                     self.pinned_bytes = 0
                 elif cmd == "checkpoint":
+                    self.gpu = None
+                    self.state = "checkpointed"
+                elif cmd == "save":
+                    self._image_dir = info.get("image_dir", self._image_dir)
+                    self.state = "checkpointed"
+                elif cmd == "load":
+                    self.pid = info.get("pid")
                     self.gpu = None
                     self.state = "checkpointed"
                 elif cmd == "restore":
@@ -283,6 +388,13 @@ class Instance:
                 elif cmd == "checkpoint":
                     self.gpu = None
                     self.state = "checkpointed"
+                elif cmd == "save":
+                    self._image_dir = info.get("image_dir", self._image_dir)
+                    self.state = "checkpointed"
+                elif cmd == "load":
+                    self.pid = info.get("pid")
+                    self.gpu = None
+                    self.state = "checkpointed"
                 elif cmd == "restore":
                     self.gpu = info.get("gpu", self.gpu)
                     self.state = "alive"
@@ -315,25 +427,24 @@ class Instance:
             print(f"  GPU {gpu}:  {used / 2**30:.2f} GiB / {total / 2**30:.2f} GiB used  "
                   f"({free / 2**30:.2f} GiB free)", flush=True)
             for inst in by_gpu[gpu]:
-                marker = "*" if inst.state == "alive" else " "
-                model = inst.vllm_config["model"].split("/")[-1]
-                model_w = f"{model} ({inst.weight_bytes / 2**30:.2f} GiB)"
-                pinned = f"pinned={inst.pinned_bytes / 2**30:.2f} GiB"
-                pending = inst._pending_cmds or []
-                print(f"    [{marker}] inst{inst.instance_id:<3} {inst.state:<15} "
-                      f"{model_w:<45} {pinned:<18} "
-                      f"pending={pending}", flush=True)
+                cls._print_instance(inst, marker="*" if inst.state == "alive" else " ")
         if unassigned:
             print(f"  Unassigned:", flush=True)
             for inst in unassigned:
-                model = inst.vllm_config["model"].split("/")[-1]
-                model_w = f"{model} ({inst.weight_bytes / 2**30:.2f} GiB)"
-                pinned = f"pinned={inst.pinned_bytes / 2**30:.2f} GiB"
-                pending = inst._pending_cmds or []
-                print(f"    [ ] inst{inst.instance_id:<3} {inst.state:<15} "
-                      f"{model_w:<45} {pinned:<18} "
-                      f"pending={pending}", flush=True)
+                cls._print_instance(inst, marker=" ")
         print(f"{'=' * 80}\n", flush=True)
+
+    @staticmethod
+    def _print_instance(inst, marker=" "):
+        model = inst.vllm_config["model"].split("/")[-1]
+        model_w = f"{model} ({inst.weight_bytes / 2**30:.2f} GiB)"
+        pinned = f"pinned={inst.pinned_bytes / 2**30:.2f} GiB"
+        pending = inst._pending_cmds or []
+        print(f"    [{marker}] inst{inst.instance_id:<3} {inst.state:<15} "
+              f"{model_w:<45} {pinned:<18} "
+              f"pending={pending}", flush=True)
+        if inst.pid is not None:
+            _print_process_tree(inst.pid, indent=10)
 
     # -- Logging ---------------------------------------------------------------
 
