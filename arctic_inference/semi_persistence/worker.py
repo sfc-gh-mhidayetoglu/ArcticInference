@@ -8,36 +8,9 @@ child process tree to disk and restoring it with new PIDs.
 Command protocol:  (cmd, kwargs)
 Result protocol:   (cmd, elapsed, error, info)
 """
-import json, os, shutil, subprocess, sys, time, ctypes, threading, queue, struct
-import glob as _glob
+import json, os, subprocess, sys, time, ctypes, threading, queue, struct
 
 import torch.multiprocessing as mp
-
-# ---------------------------------------------------------------------------
-# Weight helpers
-# ---------------------------------------------------------------------------
-
-def _weight_footprint(model_path):
-    """Compute total weight bytes by reading safetensors headers (no data I/O)."""
-    d = model_path.rstrip("/")
-    files = sorted(_glob.glob(f"{d}/model-*.safetensors"))
-    if not files:
-        files = sorted(_glob.glob(f"{d}/model.safetensors*"))
-    files = [f for f in files if not f.endswith(".index.json")]
-    total = 0
-    for p in files:
-        with open(p, "rb") as f:
-            n = struct.unpack("<Q", f.read(8))[0]
-            header = json.loads(f.read(n))
-        offsets = [info["data_offsets"][1]
-                   for name, info in header.items() if name != "__metadata__"]
-        if offsets:
-            total += max(offsets) - min(
-                info["data_offsets"][0]
-                for name, info in header.items() if name != "__metadata__"
-            )
-    return total
-
 
 # ---------------------------------------------------------------------------
 # CUDA driver API bindings (checkpoint / restore)
@@ -241,7 +214,8 @@ def _worker_restore(pids, old_gpu=None, new_gpu=None):
             args_ptr = ctypes.cast(args_buf, ctypes.c_void_p)
             _kept_alive = (args_buf, pairs_buf)
         for pid in reversed(pids):
-            _check_cu(f"Restore({pid})", cu.cuCheckpointProcessRestore(pid, args_ptr))
+            _check_cu(f"Restore({pid})", cu.cuCheckpointProcessRestore(pid, args_ptr),
+                      ignore=_CU_CHECKPOINT_ALREADY_DONE)
             _check_cu(f"Unlock({pid})", cu.cuCheckpointProcessUnlock(pid, None),
                       ignore=_CU_CHECKPOINT_ALREADY_DONE)
     else:
@@ -257,9 +231,6 @@ def _worker_restore(pids, old_gpu=None, new_gpu=None):
 # CRIU save / load (process image to/from disk)
 # ---------------------------------------------------------------------------
 
-_CRIU_PREFIX = ["sudo", "criu"]
-
-
 def _resolve_fd_resource(pid, fd):
     """Read /proc/<pid>/fd/<fd> to determine the CRIU resource identifier."""
     link = os.readlink(f"/proc/{pid}/fd/{fd}")
@@ -268,24 +239,12 @@ def _resolve_fd_resource(pid, fd):
 
 def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, rank,
                       meta_extra=None):
-    """Dump the vLLM child process tree to disk via CRIU.
+    """Dump the vLLM child process tree to disk via CRIU (destructive).
 
-    Uses --leave-running (-R): the child stays alive after the dump so the
-    instance can continue to be used without a separate load().
+    The child process is killed after a successful dump.  The on-disk
+    image is later restored via load().
     """
     os.makedirs(image_dir, exist_ok=True)
-
-    for stale in _glob.glob("/dev/shm/link_remap.*"):
-        try:
-            os.remove(stale)
-        except OSError:
-            pass
-
-    for sem in _glob.glob("/dev/shm/sem.*"):
-        try:
-            os.remove(sem)
-        except OSError:
-            pass
 
     external_unix = []
     nvidia_fds = {}
@@ -312,7 +271,6 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, rank,
         "--ext-unix-sk",
         "--link-remap",
         "--libdir", "/usr/lib/criu/empty",
-        "-R",
         "-v4",
     ]
     for ext in external_unix:
@@ -367,9 +325,8 @@ def _find_pid_by_pipe(pipe_inode):
 def _worker_criu_load(image_dir, new_pipe_fd):
     """Restore a vLLM child process tree from a CRIU image on disk.
 
-    Uses a new PID namespace so the same image can be restored multiple
-    times without PID collisions.  Discovers the host PID by scanning
-    /proc for the process holding the inherited pipe fd.
+    Discovers the host PID by scanning /proc for the process holding
+    the inherited pipe fd.
     """
     import fcntl
 
@@ -382,7 +339,6 @@ def _worker_criu_load(image_dir, new_pipe_fd):
     for _stale in [pidfile, os.path.join(image_dir, "restore.log")]:
         if os.path.exists(_stale):
             os.remove(_stale)
-    original_pid = meta.get("child_pid")
 
     flags = fcntl.fcntl(new_pipe_fd, fcntl.F_GETFD)
     fcntl.fcntl(new_pipe_fd, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
@@ -483,7 +439,13 @@ def _child_thread(rank, child_pid, pipe,
                   child_queue, result_queue, completed_counter,
                   initial_state="alive"):
     """Thread that owns the single child.  Pulls commands from child_queue,
-    executes them serially, puts results on result_queue."""
+    executes them serially, puts results on result_queue.
+
+    Generate commands are fire-and-forget on the pipe.  The child sends
+    back ("generate_done", ...) when done (new async child) or
+    ("generate", ...) immediately (old CRIU-restored child with sync
+    llm.generate).  The worker accepts both.
+    """
 
     def _tlog(msg):
         print(f"[worker{rank}] [{time.strftime('%H:%M:%S')}] {msg}",
@@ -494,6 +456,63 @@ def _child_thread(rank, child_pid, pipe,
         with completed_counter.get_lock():
             completed_counter.value += 1
 
+    _pending_generates = 0
+
+    def _handle_pipe_result(result):
+        """Handle a single result tuple from the pipe.  Returns True if
+        it was a generate completion, False otherwise (caller should
+        handle it)."""
+        nonlocal _pending_generates
+        if isinstance(result, tuple) and len(result) == 4:
+            if result[0] in ("generate_done", "generate"):
+                _pending_generates -= 1
+                _emit_result("generate", result[1], result[2], result[3])
+                return True
+        return False
+
+    def _drain_pipe_generates():
+        nonlocal _pending_generates
+        while _pending_generates > 0:
+            try:
+                result = pipe.recv()
+            except (BrokenPipeError, ConnectionResetError, EOFError):
+                while _pending_generates > 0:
+                    _emit_result("generate", 0.0,
+                                 "child process died during generate", {})
+                    _pending_generates -= 1
+                break
+            _handle_pipe_result(result)
+
+    def _recv_sync():
+        """Receive a synchronous command response, transparently consuming
+        any generate completions that arrive first."""
+        while True:
+            result = pipe.recv()
+            if not _handle_pipe_result(result):
+                return result
+
+    def _get_next_command():
+        """Get next command, polling pipe for generate results while waiting."""
+        nonlocal _pending_generates
+        if _pending_generates == 0:
+            return child_queue.get()
+        while True:
+            while _pending_generates > 0 and pipe.poll(0):
+                try:
+                    result = pipe.recv()
+                except (BrokenPipeError, ConnectionResetError, EOFError):
+                    while _pending_generates > 0:
+                        _emit_result("generate", 0.0,
+                                     "child process died during generate", {})
+                        _pending_generates -= 1
+                    break
+                _handle_pipe_result(result)
+            try:
+                return child_queue.get(timeout=0.01)
+            except queue.Empty:
+                if _pending_generates == 0:
+                    return child_queue.get()
+
     state = initial_state
     checkpointed_pids = (
         _get_descendant_pids(child_pid) + [child_pid]
@@ -501,19 +520,24 @@ def _child_thread(rank, child_pid, pipe,
     )
 
     while True:
-        cmd, kwargs = child_queue.get()
+        cmd, kwargs = _get_next_command()
         _tlog(f">>> {cmd}")
 
         if cmd == "exit":
             if state == "alive":
+                _drain_pipe_generates()
                 pipe.send(("exit", {}))
-                pipe.recv()
+                while True:
+                    result = pipe.recv()
+                    if not _handle_pipe_result(result):
+                        break
             pipe.close()
             _kill_process_tree(child_pid)
             _tlog("exited")
             break
 
         if cmd == "checkpoint":
+            _drain_pipe_generates()
             t0 = time.perf_counter()
             error = None
             info = {}
@@ -549,9 +573,27 @@ def _child_thread(rank, child_pid, pipe,
                     state = "checkpointed"
                 if checkpointed_pids is None:
                     raise RuntimeError("restore called but no checkpointed PIDs stored")
-                _worker_restore(checkpointed_pids,
-                                old_gpu=rank,
-                                new_gpu=target_gpu)
+                _all_settled = True
+                for _wp in checkpointed_pids:
+                    _settled = False
+                    for _wi in range(50):
+                        try:
+                            with open(f"/proc/{_wp}/status") as _sf:
+                                _st = _sf.read()
+                            if "State:\tS" in _st or "State:\tT" in _st:
+                                _settled = True
+                                break
+                        except Exception:
+                            break
+                        time.sleep(0.1)
+                    if not _settled:
+                        _all_settled = False
+                if _all_settled:
+                    _worker_restore(checkpointed_pids,
+                                    old_gpu=rank,
+                                    new_gpu=target_gpu)
+                else:
+                    _tlog(f"  process still running after CRIU restore, skipping CUDA restore")
                 _tlog(f"  restored pids: {checkpointed_pids}")
                 info["gpu"] = target_gpu
                 rank = target_gpu
@@ -565,13 +607,14 @@ def _child_thread(rank, child_pid, pipe,
             continue
 
         if cmd == "save":
+            _drain_pipe_generates()
             t0 = time.perf_counter()
             error = None
             info = {}
             try:
                 image_dir = kwargs["filename"]
                 pipe.send(("get_pipe_fd", {}))
-                fd_result = pipe.recv()
+                fd_result = _recv_sync()
                 _fd_cmd, _fd_elapsed, _fd_error, fd_info = fd_result
                 if _fd_error is not None:
                     raise RuntimeError(f"get_pipe_fd failed: {_fd_error}")
@@ -579,7 +622,7 @@ def _child_thread(rank, child_pid, pipe,
                 _tlog(f"  child pipe fd: {child_pipe_fd}")
 
                 pipe.send(("prepare_criu_dump", {"pipe_fd": child_pipe_fd}))
-                prep_result = pipe.recv()
+                prep_result = _recv_sync()
                 _pr_cmd, _pr_elapsed, _pr_error, pr_info = prep_result
                 if _pr_error is not None:
                     _tlog(f"  WARNING: prepare_criu_dump failed: {_pr_error}")
@@ -595,17 +638,22 @@ def _child_thread(rank, child_pid, pipe,
                 )
                 info["image_dir"] = image_dir
                 info["meta"] = meta
-                state = "checkpointed"
-                _tlog(f"  CRIU saved to {image_dir} (child still alive)")
+                state = "saved"
+                _tlog(f"  CRIU saved to {image_dir} (child killed by dump)")
             except Exception as e:
                 import traceback; traceback.print_exc()
                 error = f"{type(e).__name__}: {e}"
             elapsed = time.perf_counter() - t0
             _tlog(f"<<< save {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
             _emit_result(cmd, elapsed, error, info)
-            continue
+            try:
+                pipe.close()
+            except OSError:
+                pass
+            break
 
         if cmd == "teardown":
+            _drain_pipe_generates()
             t0 = time.perf_counter()
             error = None
             info = {}
@@ -620,8 +668,35 @@ def _child_thread(rank, child_pid, pipe,
             _emit_result(cmd, elapsed, error, info)
             break
 
-        pipe.send((cmd, kwargs))
-        result = pipe.recv()
+        if cmd == "generate":
+            try:
+                pipe.send((cmd, kwargs))
+                _pending_generates += 1
+            except (BrokenPipeError, ConnectionResetError, EOFError):
+                _alive = os.path.exists(f"/proc/{child_pid}")
+                _tlog(f"<<< generate FAILED (child pipe broken, pid={child_pid} alive={_alive})")
+                _emit_result(cmd, 0.0, "child process died", {})
+            continue
+
+        try:
+            _drain_pipe_generates()
+            pipe.send((cmd, kwargs))
+            result = _recv_sync()
+        except (BrokenPipeError, ConnectionResetError, EOFError) as _pipe_err:
+            _alive = os.path.exists(f"/proc/{child_pid}")
+            _tlog(f"<<< {cmd} FAILED (child pipe broken, pid={child_pid} alive={_alive})")
+            _emit_result(cmd, 0.0, "child process died", {})
+            _orphaned = 0
+            while not child_queue.empty():
+                try:
+                    _ocmd, _okw = child_queue.get_nowait()
+                    _emit_result(_ocmd, 0.0, "child process died", {})
+                    _orphaned += 1
+                except queue.Empty:
+                    break
+            if _orphaned:
+                _tlog(f"  flushed {_orphaned} orphaned commands")
+            break
         _emit_result(*result)
 
     _tlog("child thread done")
@@ -682,11 +757,30 @@ def worker_loop(rank, cmd_queue, result_queue, completed_counter):
             try:
                 image_dir = kwargs["filename"]
 
-                pipe_parent, pipe_child = mp.Pipe()
-                new_pipe_fd = pipe_child.fileno()
-
-                new_pid, meta = _worker_criu_load(image_dir, new_pipe_fd)
-                pipe_child.close()
+                max_retries = 5
+                for _attempt in range(max_retries):
+                    pipe_parent, pipe_child = mp.Pipe()
+                    new_pipe_fd = pipe_child.fileno()
+                    try:
+                        new_pid, meta = _worker_criu_load(image_dir, new_pipe_fd)
+                        pipe_child.close()
+                        break
+                    except RuntimeError as exc:
+                        # Kill any orphaned process tree from the failed restore
+                        _pipe_ino = os.readlink(f"/proc/self/fd/{new_pipe_fd}")
+                        if _pipe_ino.startswith("socket:["):
+                            _pipe_ino = _pipe_ino.split("[")[1].rstrip("]")
+                        _orphan = _find_pid_by_pipe(_pipe_ino)
+                        if _orphan:
+                            _wlog(f"  killing orphan pid={_orphan} from failed restore")
+                            _kill_process_tree(_orphan)
+                        pipe_child.close()
+                        pipe_parent.close()
+                        if "File exists" in str(exc) and _attempt < max_retries - 1:
+                            _wlog(f"  PID collision, retrying ({_attempt + 1}/{max_retries})")
+                            time.sleep(0.5)
+                            continue
+                        raise
 
                 child_pid = new_pid
                 child_proc = None

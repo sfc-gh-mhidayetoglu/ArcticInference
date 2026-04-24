@@ -9,13 +9,45 @@ backends, io_uring rings, POSIX semaphores, and hundreds of file
 descriptors.  CRIU is strict: every FD, memory mapping, and file
 reference in the image must be restorable at restore time, or it fails.
 
-The dump uses `--leave-running` (`-R`) so the child process **stays
-alive** after the dump.  This makes `save()` non-destructive: the
-instance remains in "checkpointed" state and can proceed directly to
-`restore(gpu)` without needing a separate `load()`.  The on-disk image
-can also be used later via `load()` on a fresh instance (second run).
+The dump is **destructive**: CRIU kills the child process after writing
+the image to disk.  Every subsequent use of the model goes through
+`load()` which creates a fresh process from the on-disk image.  This
+avoids dangling processes from non-destructive (`-R`) dumps and
+simplifies the state machine — after `save()`, the model is always
+in `"saved"` state with no live process.
 
 This document describes the complications we hit and how each is handled.
+
+---
+
+## Installation (Ubuntu 24.04)
+
+CRIU is not in the default Ubuntu repos at a recent-enough version.
+Install from the official CRIU PPA:
+
+```bash
+# 1. Add the CRIU PPA
+sudo apt-get install -y software-properties-common
+sudo add-apt-repository -y ppa:criu/ppa
+sudo apt-get update
+
+# 2. Install CRIU (brings in crit, protobuf, etc.)
+sudo apt-get install -y criu
+
+# 3. Verify
+criu --version          # should print 4.x
+which crit              # /usr/sbin/crit  (CRIU image tool)
+```
+
+After installing, create the empty plugin directory that the dump
+command references via `--libdir`:
+
+```bash
+sudo mkdir -p /usr/lib/criu/empty
+```
+
+Without this directory the dump aborts at plugin initialization
+(see Complication 7 below).
 
 ---
 
@@ -29,15 +61,11 @@ This document describes the complications we hit and how each is handled.
   3. Redirect stdout/stderr to /dev/null
   4. Close io_uring FDs
   5. Munmap io_uring memory regions
-  6. Remove /dev/shm/sem.* files (before dump, in worker)
-  7. Remove /dev/shm/link_remap.* stale files (before dump, in worker)
-  8. → CRIU dump with -R (--leave-running): image written, child stays alive
+  6. Remove /dev/shm/sem.* (CRIU captures mapping as anonymous memory)
+  --- (back in worker) ---
+  7. → CRIU dump (destructive): image written, child killed
 
-[After dump — first run continues]
-
-  Instance is in "checkpointed" state → restore(gpu) → wake_up_weights → ... → wake_up_kv_cache → generate → ...
-
-[Restore side — _worker_criu_load in worker.py, used on second run]
+[Every use after dump — load from image]
 
   1. Pass pipe FD via Unix socket (SCM_RIGHTS)
   2. → CRIU restore brings a new process from the image
@@ -76,21 +104,18 @@ and the memory mappings show up in `/proc/<pid>/maps`.
 ## Complication 3: POSIX Semaphores (`/dev/shm/sem.*`)
 
 **Problem:** Python's `multiprocessing` module creates POSIX named
-semaphores in `/dev/shm/`.  These are memory-mapped into the process
-(and possibly its descendants like the resource_tracker).  With
-`--leave-running`, CRIU records the semaphore file via `link_remap`.
-At restore time on a later run, the semaphore file no longer exists
-(the original process was torn down), so CRIU fails:
+semaphores in `/dev/shm/`.  These are memory-mapped into the process.
+The semaphore file is unlinked shortly after creation (standard POSIX
+pattern), so `/proc/<pid>/maps` shows the path as `(deleted)`.  CRIU
+then needs to handle the deleted file — either via ghost remaps or
+`link_remap`, both of which cause problems at restore time (see
+Complication 9).
 
-```
-Can't link dev/shm/link_remap.163 -> dev/shm/sem.XYZ: No such file or directory
-```
-
-**Fix (dump side):** In `_worker_criu_save`, glob and remove all
-`/dev/shm/sem.*` files right before the CRIU dump.  This removes the
-named file from the filesystem while the live process retains its
-existing anonymous mmap.  CRIU then captures the mapping as anonymous
-memory rather than a file-backed `link_remap` — no dangling references.
+**Fix (dump side):** In `prepare_criu_dump` (child process), delete
+all `/dev/shm/sem.*` files before the dump.  The live process retains
+its existing mmap (the kernel keeps the inode alive).  CRIU then
+captures the mapping as anonymous memory — no file reference, no ghost,
+no `link_remap`.
 
 **Side effect:** At process exit, Python's multiprocessing finalizers
 try to `sem_unlink()` the already-removed files, producing harmless
@@ -156,19 +181,19 @@ path is 2-8x faster per operation.
 
 ---
 
-## Non-destructive Save (`--leave-running`)
+## Destructive Save
 
-The CRIU dump uses `-R` (`--leave-running`) so the child process stays
-alive after the image is written to disk.  This enables two flows:
+The CRIU dump kills the child process after writing the image.  This
+simplifies the lifecycle to a single code path:
 
-- **First run (cache miss):** `init → ... → checkpoint → save → restore → generate → teardown`
-  The same process continues after save — no load needed.
-- **Second run (cache hit):** `load(image) → restore → generate → teardown`
-  A fresh process is created from the on-disk image.
+- **First run (cache miss):** `init → ... → checkpoint → save` (child dies)
+  → `load → restore → generate → teardown`
+- **Every subsequent run (cache hit):** `load → restore → generate → teardown`
 
-After `save()`, the instance is in "checkpointed" state with both the
-child process alive (CUDA-checkpointed) and a valid on-disk image.  The
-worker and child thread keep running, ready for the next command.
+After `save()`, the model is in `"saved"` state with no live process.
+The worker exits cleanly.  This eliminates dangling processes from
+non-destructive dumps and avoids the POSIX semaphore futex deadlock
+that occurred when remapping deleted shared-memory files.
 
 ---
 
@@ -197,14 +222,103 @@ The CRIU PPA package does not create it automatically.
 
 ---
 
+## Complication 8: PID Collisions at Restore
+
+**Problem:** CRIU restores the process tree with the same PIDs recorded
+in the image.  When multiple models restore concurrently, the target PID
+may already be in use by an unrelated process on the host:
+
+```
+Can't fork for 47619: File exists
+```
+
+**Fix (worker):** `worker_loop` wraps `_worker_criu_load` in a retry
+loop (up to 5 attempts with 0.5s backoff).  If the error message
+contains `"File exists"`, the attempt is retried with fresh pipe
+descriptors.  The conflicting PID is typically short-lived, so a brief
+delay is sufficient.
+
+---
+
+## Complication 9: Ghost Remap Race (CRIU 4.2)
+
+**Problem:** When a memory-mapped file has been deleted from disk (the
+path shows `(deleted)` in `/proc/<pid>/maps`), CRIU uses a *ghost
+remap*: it embeds the file content in the image and creates a temporary
+`.cr.<id>.ghost` hard link at restore time, then unlinks it afterwards.
+
+With `--link-remap`, CRIU 4.2 has a race condition: when the restored
+process has multiple threads (vLLM processes have 400+), each thread
+can attempt to unlink the same `.ghost` file.  The first `unlink()`
+succeeds; subsequent threads get `ENOENT`, causing CRIU to exit with
+`rc=1` even though the restore actually completed:
+
+```
+Couldn't unlink remap /tmp/torchinductor_root/.../tmp12345.ghost: No such file or directory
+```
+
+Two sources of `(deleted)` mappings were identified:
+
+1. **Triton JIT `.so` files** — Triton compiles kernel `.so` files,
+   `dlopen()`s them, then `unlink()`s the file from disk.  Primarily
+   affects FP8 models.
+2. **POSIX semaphores** — Python's multiprocessing creates and
+   immediately unlinks `/dev/shm/sem.*` files.
+
+Tolerating `rc=1` was attempted but led to unstable processes — the
+CUDA context was sometimes left in an inconsistent state, and
+subsequent `cudaHostRegister` (repin) calls would crash the child.
+
+Recreating deleted files from `/proc/map_files/` (worker side) was
+also attempted, but creating a new file at the same path doesn't
+clear the `(deleted)` flag on the existing mapping's inode.
+Remapping via `mmap(MAP_FIXED)` inside the child corrupted semaphore
+futex state, causing deadlocks.
+
+**Fix:** The destructive dump (no `-R`) eliminates the ghost race by
+a combination of two approaches:
+
+1. **Semaphores:** Deleted in `prepare_criu_dump` before dump.  CRIU
+   captures the mapping as anonymous memory — no file reference at all.
+2. **Triton `.so` files:** These remain as `(deleted)` mappings, but
+   with the destructive dump the number of ghost remaps is typically
+   small (only triton kernels, no semaphores).  The race is still
+   theoretically possible but far less likely with fewer ghosts.
+
+If ghost remap races resurface, the remaining fix would be to also
+handle triton `.so` files in `prepare_criu_dump` by `munmap` +
+`mmap(MAP_FIXED)` from a recreated file (safe for `.so` mappings
+which are `MAP_PRIVATE`, unlike semaphores which are `MAP_SHARED`).
+
+---
+
 ## Summary Table
 
-| Resource           | Problem at dump time               | Dump-side fix                    | Restore-side fix                |
-|--------------------|-------------------------------------|----------------------------------|---------------------------------|
-| NCCL/TCPStore      | Background threads, TCP sockets     | `destroy_process_group()` + poll | `--tcp-close`                   |
-| io_uring           | Non-serializable kernel state       | Close FDs + munmap               | —                               |
-| POSIX semaphores   | link_remap to files gone at restore | Remove `/dev/shm/sem.*` pre-dump | —                               |
-| stdout/stderr      | File size changes between dump/load | Redirect to /dev/null            | `--inherit-fd fd[1]/fd[2]`      |
-| Pipe FD            | sudo closes FDs >= 3                | —                                | SCM_RIGHTS via Unix socket      |
-| CUDA context       | GPU state not in CRIU image         | CRIU CUDA plugin at dump         | Driver API or cuda-checkpoint   |
-| Plugin directory   | `--libdir` path missing             | Create `/usr/lib/criu/empty`     | —                               |
+| Resource           | Problem at dump time               | Dump-side fix                      | Restore-side fix                     |
+|--------------------|-------------------------------------|------------------------------------|--------------------------------------|
+| NCCL/TCPStore      | Background threads, TCP sockets     | `destroy_process_group()` + poll   | `--tcp-close`                        |
+| io_uring           | Non-serializable kernel state       | Close FDs + munmap                 | —                                    |
+| POSIX semaphores   | `(deleted)` files → ghost/link remap| Delete sem files; captured as anon | —                                    |
+| stdout/stderr      | File size changes between dump/load | Redirect to /dev/null              | `--inherit-fd fd[1]/fd[2]`           |
+| Pipe FD            | sudo closes FDs >= 3                | —                                  | SCM_RIGHTS via Unix socket           |
+| CUDA context       | GPU state not in CRIU image         | CRIU CUDA plugin at dump           | Driver API or cuda-checkpoint        |
+| Plugin directory   | `--libdir` path missing             | Create `/usr/lib/criu/empty`       | —                                    |
+| PID collisions     | —                                   | —                                  | Retry loop (5 attempts, 0.5s delay)  |
+| Ghost remap race   | `(deleted)` .so → ghost race        | Destructive dump + sem deletion    | `--link-remap`                       |
+
+---
+
+## CRIU-Related Commit History
+
+Chronological summary of CRIU plumbing changes across the branch.
+
+| Commit    | Date       | Summary |
+|-----------|------------|---------|
+| `586641e` | 2026-03-27 | **Initial semi_persistence package.** GPU sleep/wake lifecycle, `cuda-checkpoint` CLI integration. No CRIU yet. |
+| `e8098d6` | 2026-03-31 | **Cross-GPU migration.** Add instance migration with `cuda-checkpoint --device-map`. |
+| `b0524b7` | 2026-03-31 | **Orchestrator + multiplexing demo.** Multi-model orchestration, first end-to-end save/load with CRIU dump/restore. |
+| `9a04880` | 2026-04-06 | **CRIU save/load, driver API, cross-GPU migration.** Replace `cuda-checkpoint` CLI with `libcuda.so` driver API (`cuCheckpointProcess*`). Add `--link-remap`, `--ext-unix-sk`, `--shell-job`, `--tcp-close`. Add pipe FD passing via SCM_RIGHTS. Add `/dev/shm/sem.*` cleanup pre-dump. Add `--leave-running` for non-destructive save. |
+| `fc3a3db` | 2026-04-07 | **State machine ladder.** `saved ↔ checkpoint ↔ up` lifecycle; CRIU load integrated into orchestrator state transitions. |
+| `ad31cca` | 2026-04-17 | **CRIU v4.2 build instructions.** Added build-from-source instructions for CRIU 4.2 with CUDA plugin support. |
+| `ccaaf81` | 2026-04-20 | **CRIU restore robustness.** Init-time cleanup of stale ghost files and `/dev/shm` leftovers. PID collision retry loop (5 attempts). Orphan process killing on failed restores. Pipe error handling in `_child_thread`. Process settle wait before CUDA restore. `CUresult=401` tolerance for redundant CUDA restores. |
+| `df7d82c` | 2026-04-21 | **Destructive dump + ghost remap fixes.** Switch from `--leave-running` to destructive dump (child killed after save). Delete `/dev/shm/sem.*` in `prepare_criu_dump` so CRIU captures semaphores as anonymous memory. Remove `_recover_deleted_mappings()`, `_clear_ghost_files()`, and debug instrumentation. Clean up orchestrator init. All models must be re-dumped. |

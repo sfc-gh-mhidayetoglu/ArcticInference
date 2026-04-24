@@ -8,6 +8,12 @@ process_weights_after_loading and produces its internal kernel format
 (Marlin-packed for GPTQ, cutlass layout for FP8, plain tensors for
 BF16).
 
+The generate path drives LLMEngine directly via add_request() + step()
+instead of using the blocking LLM.generate().  This allows the child
+to accept new generate requests (and other commands) while the engine
+is actively decoding, enabling concurrent request handling without
+asyncio or extra threads.
+
 Attach allocates pinned CPU memory sized to model.named_parameters().
 Stage snapshots the post-processed GPU parameters into the pinned
 buffer.  h2d copies the pinned buffer to a GPU staging buffer.
@@ -41,7 +47,14 @@ def _repin_buffer(buf):
 
 
 def vllm_child_loop(pipe_conn, rank):
-    """Runs in a spawned child process: owns CUDA and vLLM."""
+    """Runs in a spawned child process: owns CUDA and vLLM.
+
+    The main loop has two modes:
+    - **Idle**: blocks on pipe_conn.recv() (zero CPU).
+    - **Active** (engine has unfinished requests): alternates between
+      engine.step() and non-blocking pipe_conn.poll() so new generate
+      requests can be submitted mid-decode.
+    """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["USE_LIBUV"] = "0"
@@ -49,10 +62,16 @@ def vllm_child_loop(pipe_conn, rank):
     torch.cuda.set_device(0)
 
     llm = None
+    engine = None
     pinned_buf = None
     index = None       # {name: (offset, nbytes, dtype, shape)}
     buf_gpu = None
     gpu_index = None
+
+    _active_reqs = {}     # req_id -> {"t0", "engine_ids", "finished"}
+    _engine_to_req = {}   # engine_request_id -> req_id
+    _next_engine_id = 0
+    _deferred_cmds = []   # non-generate commands received during drain
 
     def _clog(msg):
         try:
@@ -60,32 +79,65 @@ def vllm_child_loop(pipe_conn, rank):
         except OSError:
             pass
 
-    _stdout_fixed = False
+    def _alloc_engine_id():
+        nonlocal _next_engine_id
+        eid = f"req-{_next_engine_id}"
+        _next_engine_id += 1
+        return eid
 
-    while True:
-        try:
-            cmd, kwargs = pipe_conn.recv()
-        except EOFError:
-            break
+    def _submit_generate(req_id, prompts, sampling_params_dict):
+        from vllm import SamplingParams
+        sp = SamplingParams(**sampling_params_dict)
+        engine_ids = []
+        for prompt in prompts:
+            eid = _alloc_engine_id()
+            engine.add_request(eid, prompt, sp)
+            _engine_to_req[eid] = req_id
+            engine_ids.append(eid)
+        _active_reqs[req_id] = {
+            "t0": time.perf_counter(),
+            "engine_ids": engine_ids,
+            "finished": {},
+        }
+        _clog(f"  submitted {len(prompts)} prompts for req_id={req_id}")
 
-        if not _stdout_fixed:
-            try:
-                sys.stdout.write("")
-                sys.stdout.flush()
-            except OSError:
-                _devnull = open(os.devnull, "w")
-                sys.stdout = _devnull
-                sys.stderr = _devnull
-                _stdout_fixed = True
+    def _process_step_outputs(step_outputs):
+        for output in step_outputs:
+            if not output.finished:
+                continue
+            eid = output.request_id
+            req_id = _engine_to_req.pop(eid, None)
+            if req_id is None:
+                continue
+            entry = _active_reqs.get(req_id)
+            if entry is None:
+                continue
+            entry["finished"][eid] = output
 
-        if cmd == "exit":
-            _clog("exit")
-            pinned_buf = None
-            pipe_conn.send("exit_ack")
-            break
+            if len(entry["finished"]) == len(entry["engine_ids"]):
+                ordered = [entry["finished"][e] for e in entry["engine_ids"]]
+                info = {
+                    "req_id": req_id,
+                    "outputs": [[o.text for o in r.outputs] for r in ordered],
+                    "prompt_tokens": sum(
+                        len(r.prompt_token_ids) for r in ordered
+                    ),
+                    "completion_tokens": sum(
+                        len(o.token_ids) for r in ordered for o in r.outputs
+                    ),
+                }
+                elapsed = time.perf_counter() - entry["t0"]
+                del _active_reqs[req_id]
+                _clog(f"<<< generate req_id={req_id} OK ({elapsed:.3f}s)")
+                pipe_conn.send(("generate_done", elapsed, None, info))
 
-        _clog(f">>> {cmd}")
-        t0 = time.perf_counter()
+    def _drain_engine():
+        while engine is not None and engine.has_unfinished_requests():
+            _process_step_outputs(engine.step())
+
+    def _handle_command(cmd, kwargs):
+        nonlocal llm, engine, pinned_buf, index, buf_gpu, gpu_index
+
         error = None
         info = {}
 
@@ -96,6 +148,7 @@ def vllm_child_loop(pipe_conn, rank):
 
                 from vllm import LLM
                 llm = LLM(**vllm_config)
+                engine = llm.llm_engine
                 info["pid"] = os.getpid()
 
             elif cmd == "attach":
@@ -144,6 +197,7 @@ def vllm_child_loop(pipe_conn, rank):
                 _clog(f"  repinned {pinned_buf.numel() / 2**30:.2f} GiB")
 
             elif cmd == "sleep":
+                _drain_engine()
                 llm.sleep(level=2)
                 torch.cuda.synchronize(0)
                 torch.cuda.empty_cache()
@@ -221,6 +275,8 @@ def vllm_child_loop(pipe_conn, rank):
                 info["pipe_fd"] = pipe_conn.fileno()
 
             elif cmd == "prepare_criu_dump":
+                _drain_engine()
+
                 closed_fds = []
                 unmapped = []
                 destroyed_pg = False
@@ -292,6 +348,13 @@ def vllm_child_loop(pipe_conn, rank):
                                         ctypes.c_size_t(length))
                             unmapped.append(f"0x{start:x}")
 
+                import glob as _criu_glob
+                for _sem in _criu_glob.glob("/dev/shm/sem.*"):
+                    try:
+                        os.remove(_sem)
+                    except OSError:
+                        pass
+
                 remaining_threads = []
                 for tid_name in os.listdir(f"/proc/{pid}/task"):
                     try:
@@ -310,14 +373,6 @@ def vllm_child_loop(pipe_conn, rank):
                       f"unmapped={unmapped}, destroyed_pg={destroyed_pg}, "
                       f"remaining_threads={remaining_threads}")
 
-            elif cmd == "generate":
-                from vllm import SamplingParams
-                sp = SamplingParams(**kwargs["sampling_params"])
-                outputs = llm.generate(kwargs["prompts"], sp)
-                info["outputs"] = [
-                    [o.text for o in req.outputs] for req in outputs
-                ]
-
             else:
                 error = f"unknown command: {cmd}"
 
@@ -326,6 +381,88 @@ def vllm_child_loop(pipe_conn, rank):
             traceback.print_exc()
             error = f"{type(e).__name__}: {e}"
 
+        return error, info
+
+    # -- Main loop --------------------------------------------------------------
+
+    _stdout_fixed = False
+
+    while True:
+        if engine is None and llm is not None:
+            engine = llm.llm_engine
+
+        has_active = (engine is not None and engine.has_unfinished_requests())
+
+        if has_active:
+            _process_step_outputs(engine.step())
+            if not pipe_conn.poll(0):
+                continue
+
+        if _deferred_cmds:
+            cmd, kwargs = _deferred_cmds.pop(0)
+        else:
+            try:
+                cmd, kwargs = pipe_conn.recv()
+            except EOFError:
+                break
+
+        if not _stdout_fixed:
+            try:
+                sys.stdout.write("")
+                sys.stdout.flush()
+            except OSError:
+                _devnull = open(os.devnull, "w")
+                sys.stdout = _devnull
+                sys.stderr = _devnull
+                _stdout_fixed = True
+
+        if cmd == "exit":
+            _drain_engine()
+            _clog("exit")
+            pinned_buf = None
+            pipe_conn.send("exit_ack")
+            break
+
+        _clog(f">>> {cmd}")
+
+        if cmd == "generate":
+            req_id = kwargs.get("req_id")
+            if req_id is None:
+                req_id = f"auto-{_next_engine_id}"
+            try:
+                _submit_generate(req_id, kwargs["prompts"],
+                                 kwargs["sampling_params"])
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                pipe_conn.send(("generate_done", 0.0,
+                                f"{type(e).__name__}: {e}",
+                                {"req_id": req_id}))
+            # Drain any additional generate commands already on the pipe
+            # so they get added to the engine before the first step().
+            while pipe_conn.poll(0):
+                try:
+                    cmd2, kwargs2 = pipe_conn.recv()
+                except EOFError:
+                    break
+                if cmd2 == "generate":
+                    rid2 = kwargs2.get("req_id", f"auto-{_next_engine_id}")
+                    try:
+                        _submit_generate(rid2, kwargs2["prompts"],
+                                         kwargs2["sampling_params"])
+                    except Exception as e2:
+                        import traceback
+                        traceback.print_exc()
+                        pipe_conn.send(("generate_done", 0.0,
+                                        f"{type(e2).__name__}: {e2}",
+                                        {"req_id": rid2}))
+                else:
+                    _clog(f">>> {cmd2} (deferred)")
+                    _deferred_cmds.append((cmd2, kwargs2))
+            continue
+
+        t0 = time.perf_counter()
+        error, info = _handle_command(cmd, kwargs)
         elapsed = time.perf_counter() - t0
         status = "OK" if error is None else "FAILED"
         _clog(f"<<< {cmd} {status} ({elapsed:.3f}s)")

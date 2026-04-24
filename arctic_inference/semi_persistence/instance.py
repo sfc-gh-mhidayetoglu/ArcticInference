@@ -25,66 +25,9 @@ import weakref
 
 import torch.multiprocessing as mp
 
-from worker import worker_loop, _weight_footprint
+from worker import worker_loop
 
 _spawn_ctx = mp.get_context("spawn")
-
-
-def _print_process_tree(pid, indent=0):
-    """Print the process tree rooted at *pid* using /proc."""
-    prefix = " " * indent
-    try:
-        with open(f"/proc/{pid}/status") as f:
-            name = comm = ""
-            threads = 0
-            state = ""
-            for line in f:
-                if line.startswith("Name:"):
-                    name = line.split(":", 1)[1].strip()
-                elif line.startswith("State:"):
-                    state = line.split(":", 1)[1].strip()
-                elif line.startswith("Threads:"):
-                    threads = int(line.split(":", 1)[1].strip())
-        with open(f"/proc/{pid}/cmdline") as f:
-            raw = f.read()
-        cmdline = raw.replace("\x00", " ").strip()
-        if len(cmdline) > 60:
-            cmdline = cmdline[:57] + "..."
-        thr_info = f" [{threads} threads]" if threads > 1 else ""
-        print(f"{prefix}{pid}  {state}  {name}{thr_info}  {cmdline}", flush=True)
-    except (FileNotFoundError, ProcessLookupError):
-        print(f"{prefix}{pid}  (not running)", flush=True)
-        return
-
-    try:
-        with open(f"/proc/{pid}/task/{pid}/children") as f:
-            children = [int(c) for c in f.read().split() if c]
-    except (FileNotFoundError, ProcessLookupError):
-        children = []
-    for child in children:
-        _print_process_tree(child, indent=indent + 4)
-
-
-def _gpu_mem_info(gpu_id: int) -> tuple[int, int]:
-    """Return (free_bytes, total_bytes) without initializing CUDA."""
-    import subprocess
-    out = subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=memory.free,memory.total",
-         "--format=csv,noheader,nounits", f"--id={gpu_id}"],
-        text=True,
-    )
-    free_mib, total_mib = (int(x.strip()) for x in out.split(","))
-    return free_mib * 1024 * 1024, total_mib * 1024 * 1024
-
-
-def _gpu_count() -> int:
-    """Return number of GPUs without initializing CUDA."""
-    import subprocess
-    out = subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-        text=True,
-    )
-    return len(out.strip().splitlines())
 
 _next_instance_id = 0
 
@@ -105,9 +48,6 @@ class Instance:
         self.instance_id = _alloc_instance_id()
         Instance._all[self.instance_id] = self
 
-        model_path = vllm_config["model"]
-        self.weight_bytes = _weight_footprint(model_path)
-
         self.pid = None
         self.state = "created"
         self.pinned_bytes = 0
@@ -120,7 +60,12 @@ class Instance:
         self._result_queue = None
         self._completed_counter = None
         self._worker = None
+        self._next_req_id = 0
         self.last_generate_result = None
+        self.last_prompt_tokens = None
+        self.last_completion_tokens = None
+        self.generate_results = {}  # req_id -> {outputs, prompt_tokens, completion_tokens}
+        self._external_waiter = False  # set True when orchestrator waiter owns the queue
 
     def _ensure_queues(self):
         """Create mp queues/counter on demand, right before spawning a worker."""
@@ -134,10 +79,8 @@ class Instance:
 
     def __repr__(self):
         parts = [f"id={self.instance_id}", f"gpu={self.gpu}",
-                 f"pid={self.pid}", f"state={self.state}",
+                 f"pid={self.pid}",
                  f"pinned={self.pinned_bytes / 2**30:.2f} GiB"]
-        if self._image_dir:
-            parts.append(f"image={self._image_dir}")
         return f"Instance({', '.join(parts)})"
 
     # -- Internal helpers -------------------------------------------------------
@@ -220,19 +163,16 @@ class Instance:
         return self._send("checkpoint")
 
     def save(self, filename: str):
-        """CRIU-dump the child process tree to disk (non-destructive).
+        """CRIU-dump the child process tree to disk (destructive).
 
         Must be called after checkpoint() (GPU resources released).
-        Uses --leave-running so the child stays alive after the dump.
-        After save(), the instance remains in 'checkpointed' state and
-        can proceed directly to restore(gpu).  The on-disk image can
-        also be used later via load() on a fresh instance.
+        The child process is killed after a successful dump.  The
+        on-disk image is later restored via load().
         """
         self._log(f"save({filename})")
         self._image_dir = filename
         return self._send("save", filename=filename,
                           meta_extra={"vllm_config": self.vllm_config,
-                                      "weight_bytes": self.weight_bytes,
                                       "pinned_bytes": self.pinned_bytes})
 
     def load(self, filename: str | None = None):
@@ -294,7 +234,10 @@ class Instance:
 
     def generate(self, prompts, sampling_params):
         self._log(f"generate({len(prompts)} prompts)")
-        return self._send("generate", prompts=prompts,
+        req_id = f"inst{self.instance_id}-{self._next_req_id}"
+        self._next_req_id += 1
+        self.last_req_id = req_id
+        return self._send("generate", req_id=req_id, prompts=prompts,
                            sampling_params=sampling_params)
 
     def teardown(self):
@@ -307,6 +250,42 @@ class Instance:
         Instance._all.pop(self.instance_id, None)
 
     # -- Synchronization -------------------------------------------------------
+
+    def _apply_result(self, cmd: str, info: dict) -> None:
+        """Update local state after a successful command completion."""
+        if cmd == "init":
+            self.pid = info.get("pid")
+            self.state = "alive"
+        elif cmd == "attach":
+            self.pinned_bytes = info.get("pinned_bytes", self.pinned_bytes)
+        elif cmd == "detach":
+            self.pinned_bytes = 0
+        elif cmd == "checkpoint":
+            self.gpu = None
+            self.state = "checkpointed"
+        elif cmd == "save":
+            self._image_dir = info.get("image_dir", self._image_dir)
+            self.state = "checkpointed"
+        elif cmd == "load":
+            self.pid = info.get("pid")
+            self.gpu = None
+            self.state = "checkpointed"
+        elif cmd == "restore":
+            self.gpu = info.get("gpu", self.gpu)
+            self.state = "alive"
+        elif cmd == "generate":
+            self.last_generate_result = info.get("outputs")
+            self.last_prompt_tokens = info.get("prompt_tokens")
+            self.last_completion_tokens = info.get("completion_tokens")
+            req_id = info.get("req_id")
+            if req_id is not None:
+                self.generate_results[req_id] = {
+                    "outputs": info.get("outputs"),
+                    "prompt_tokens": info.get("prompt_tokens"),
+                    "completion_tokens": info.get("completion_tokens"),
+                }
+        elif cmd == "teardown":
+            self._reset()
 
     def wait(self):
         """Block until all pending commands complete for this instance.
@@ -324,48 +303,27 @@ class Instance:
                 self._pending_cmds.pop(0)
 
             status = "OK" if error is None else "FAILED"
+            display_info = {k: v for k, v in info.items() if k != "outputs"} if cmd == "generate" else info
             self._print(f"[gpu{self.gpu}] [{time.strftime('%H:%M:%S')}] "
-                         f"{cmd} {status} ({elapsed:.3f}s) {info}")
+                         f"{cmd} {status} ({elapsed:.3f}s) {display_info}")
 
             if error is None:
-                if cmd == "init":
-                    self.pid = info.get("pid")
-                    self.state = "alive"
-                elif cmd == "attach":
-                    self.pinned_bytes = info.get("pinned_bytes", self.pinned_bytes)
-                elif cmd == "detach":
-                    self.pinned_bytes = 0
-                elif cmd == "checkpoint":
-                    self.gpu = None
-                    self.state = "checkpointed"
-                elif cmd == "save":
-                    self._image_dir = info.get("image_dir", self._image_dir)
-                    self.state = "checkpointed"
-                elif cmd == "load":
-                    self.pid = info.get("pid")
-                    self.gpu = None
-                    self.state = "checkpointed"
-                elif cmd == "restore":
-                    self.gpu = info.get("gpu", self.gpu)
-                    self.state = "alive"
-                elif cmd == "generate":
-                    self.last_generate_result = info.get("outputs")
-                elif cmd == "teardown":
-                    self._reset()
+                self._apply_result(cmd, info)
 
             if error is not None:
                 raise RuntimeError(f"GPU {self.gpu} command '{cmd}' failed: {error}")
 
         return self
 
-    # -- Status ----------------------------------------------------------------
-
     def _sync_state(self):
         """Drain completed results from the worker without blocking.
 
         Updates local state to reflect what the worker has actually finished,
         using _completed_counter to know how many results are available.
+        Skipped when an external waiter (orchestrator) owns the queue.
         """
+        if self._external_waiter:
+            return
         completed = self._completed_counter.value
         available = completed - (self._total_sent - self._pending_count)
         for _ in range(available):
@@ -378,73 +336,7 @@ class Instance:
             if self._pending_cmds:
                 self._pending_cmds.pop(0)
             if error is None:
-                if cmd == "init":
-                    self.pid = info.get("pid")
-                    self.state = "alive"
-                elif cmd == "attach":
-                    self.pinned_bytes = info.get("pinned_bytes", self.pinned_bytes)
-                elif cmd == "detach":
-                    self.pinned_bytes = 0
-                elif cmd == "checkpoint":
-                    self.gpu = None
-                    self.state = "checkpointed"
-                elif cmd == "save":
-                    self._image_dir = info.get("image_dir", self._image_dir)
-                    self.state = "checkpointed"
-                elif cmd == "load":
-                    self.pid = info.get("pid")
-                    self.gpu = None
-                    self.state = "checkpointed"
-                elif cmd == "restore":
-                    self.gpu = info.get("gpu", self.gpu)
-                    self.state = "alive"
-                elif cmd == "teardown":
-                    self._reset()
-
-    @classmethod
-    def print_status(cls):
-        from collections import defaultdict
-        by_gpu = defaultdict(list)
-        unassigned = []
-        for inst in cls._all.values():
-            inst._sync_state()
-            if inst.gpu is None:
-                unassigned.append(inst)
-            else:
-                by_gpu[inst.gpu].append(inst)
-
-        num_gpus = _gpu_count()
-        gpu_mem = {}
-        for g in range(num_gpus):
-            gpu_mem[g] = _gpu_mem_info(g)
-
-        print(f"\n{'=' * 80}", flush=True)
-        print(f"  Instance Status  [{time.strftime('%H:%M:%S')}]", flush=True)
-        print(f"{'=' * 80}", flush=True)
-        for gpu in range(num_gpus):
-            free, total = gpu_mem[gpu]
-            used = total - free
-            print(f"  GPU {gpu}:  {used / 2**30:.2f} GiB / {total / 2**30:.2f} GiB used  "
-                  f"({free / 2**30:.2f} GiB free)", flush=True)
-            for inst in by_gpu[gpu]:
-                cls._print_instance(inst, marker="*" if inst.state == "alive" else " ")
-        if unassigned:
-            print(f"  Unassigned:", flush=True)
-            for inst in unassigned:
-                cls._print_instance(inst, marker=" ")
-        print(f"{'=' * 80}\n", flush=True)
-
-    @staticmethod
-    def _print_instance(inst, marker=" "):
-        model = inst.vllm_config["model"].split("/")[-1]
-        model_w = f"{model} ({inst.weight_bytes / 2**30:.2f} GiB)"
-        pinned = f"pinned={inst.pinned_bytes / 2**30:.2f} GiB"
-        pending = inst._pending_cmds or []
-        print(f"    [{marker}] inst{inst.instance_id:<3} {inst.state:<15} "
-              f"{model_w:<45} {pinned:<18} "
-              f"pending={pending}", flush=True)
-        if inst.pid is not None:
-            _print_process_tree(inst.pid, indent=10)
+                self._apply_result(cmd, info)
 
     # -- Logging ---------------------------------------------------------------
 

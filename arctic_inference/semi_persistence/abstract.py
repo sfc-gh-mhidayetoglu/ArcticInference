@@ -10,32 +10,46 @@ from abc import ABC, abstractmethod
 
 
 class OrchestratorBase(ABC):
-    """Abstract interface for an orchestrator that manages named model instances."""
+    """Abstract interface for an orchestrator that manages named model instances.
+
+    State ladder:  saved <-> checkpoint <-> sleep <-> up -> running (transient)
+    """
 
     @staticmethod
     @abstractmethod
-    def init(model_cache: str, image_cache: str) -> None:
-        """Discover GPUs, configure cache dirs, and start the orchestrator."""
+    def init(image_cache: str, gpus: list[int] | None = None) -> None:
+        """Discover GPUs, scan image cache, and populate registry."""
 
     @staticmethod
     @abstractmethod
-    def register(model_id: str, vllm_config: dict) -> str:
-        """Register a model under *model_id* with the given vLLM config."""
+    def register(model_id: str, vllm_config: dict | str) -> None:
+        """Cold-start a new model.  Ends in checkpoint state."""
 
     @staticmethod
     @abstractmethod
-    def generate(model_id: str, prompts: list[str], sampling_params: dict) -> list:
-        """Run inference on the registered model."""
+    def move(model_id: str, target: str) -> None:
+        """Walk the state ladder to *target* (saved/checkpoint/sleep/up)."""
 
     @staticmethod
     @abstractmethod
-    def remove(model_id: str) -> None:
-        """Tear down and de-register the model."""
+    def generate(model_id: str, prompts: list[str] | str,
+                 sampling_params: dict | None = None) -> object:
+        """Run inference.  Auto-transitions to up if needed."""
 
     @staticmethod
     @abstractmethod
-    def print_status() -> None:
-        """Print GPU view and registered models."""
+    def remove(model_id: str | None = None) -> None:
+        """Auto-transition to saved, delete image, de-register."""
+
+    @staticmethod
+    @abstractmethod
+    def wait(model_id: str | None = None) -> None:
+        """Block until pending operations complete."""
+
+    @staticmethod
+    @abstractmethod
+    def status() -> None:
+        """Print GPU view and registered models with states."""
 
 
 class InstanceBase(ABC):

@@ -126,7 +126,7 @@ primitives must be:
 | `wait()`                | Block the main process until all pending commands complete.  | Main process                               |
 | `sleep()`               | `llm.sleep(level=2)` -- frees GPU memory.                    | Child                                      |
 | `checkpoint()`          | Save CUDA state to CPU via `cuCheckpointProcess`*.  Instance becomes stateless (`gpu=None`). | Worker (ctypes) |
-| `save(filename)`        | CRIU-dump the child process tree to disk (non-destructive).  Uses `--leave-running` so the child stays alive.  Writes `meta.json` with `vllm_config` and CRIU metadata. | Worker (child thread) |
+| `save(filename)`        | CRIU-dump the child process tree to disk (destructive).  The child is killed after the image is written.  Writes `meta.json` with `vllm_config` and CRIU metadata. | Worker (child thread) |
 | `load(filename)`        | Restore a process from a CRIU image on disk.  Validates that the image's `vllm_config` matches this instance.  Spawns a new worker and CRIU-restores the child. | Worker |
 | `restore(gpu)`          | Restore checkpointed CUDA state onto the specified GPU.  `gpu` is required. | Worker (ctypes) |
 | `attach()`              | Allocate unpinned CPU memory sized to `model.named_parameters()`. | Child                                  |
@@ -138,7 +138,7 @@ primitives must be:
 | `scatter()`             | Copy staged tensors directly into model params by name.      | Child                                      |
 | `wake_up_weights()`     | Re-allocate weight tensors on GPU.                           | Child                                      |
 | `wake_up_kv_cache()`    | Re-allocate KV cache on GPU.                                 | Child                                      |
-| `generate(prompts, sp)` | Run inference via `llm.generate()`.  Result stored in `last_generate_result`. | Child                     |
+| `generate(prompts, sp)` | Submit inference to the engine.  Assigns a unique `req_id`; result stored in `generate_results[req_id]` and `last_generate_result`. | Child (async engine loop) |
 | `teardown()`            | Tear down the instance, worker, and child.  Resets to created state, ready for `init(gpu)` again. | Worker + Child |
 | `remove()`              | Remove from the instance registry.  Call after `teardown().wait()`. | Main process |
 
@@ -232,26 +232,24 @@ driver does not need to re-map pinned pages on restore).  The buffer
 data survives `unpin()`, `sleep()`, and `checkpoint()` since it is CPU
 memory.
 
-### Save to disk and restore (same run)
+### Save to disk
 
-After checkpoint, `save()` writes a CRIU image to disk using
-`--leave-running`.  The child process stays alive, so the instance can
-continue directly to `restore(gpu)` without a separate `load()`:
+After checkpoint, `save()` writes a CRIU image to disk.  The dump is
+destructive — the child process is killed after the image is written.
+The worker exits and the instance returns to a clean state:
 
 ```python
 inst = Instance(vllm_config)
 inst.init(gpu=0).attach().repin().stage().unpin().sleep().checkpoint()
 inst.save("/data-fast/image-cache/my_model").wait()
-
-inst.restore(gpu=2).wake_up_weights().repin().h2d().scatter().wake_up_kv_cache()
-inst.generate(prompts, sampling_params).wait()
+# child is dead, worker exits
 ```
 
-### Load from disk (later run)
+### Load from disk
 
-On a subsequent run, `load()` restores the process from the on-disk
-image.  The instance's `vllm_config` must match the saved image's
-config (validated automatically):
+Every use after save goes through `load()`, which restores a fresh
+process from the on-disk image.  The instance's `vllm_config` must
+match the saved image's config (validated automatically):
 
 ```python
 inst = Instance(vllm_config)
@@ -433,6 +431,10 @@ non-blockingly drains completed results from the worker's result queue
 (using `_completed_counter` to know how many are available).  This
 updates the instance's local state without requiring `wait()`.
 
+`_sync_state()` is skipped when `inst._external_waiter` is True.  The
+orchestrator's generate waiter thread sets this flag while it owns the
+result queue, preventing the dashboard from stealing generate results.
+
 GPU memory is queried via `nvidia-smi` (not `torch.cuda.mem_get_info`)
 to avoid initializing CUDA in the main process.
 
@@ -447,14 +449,79 @@ by reading `config.json` from the model path and extracting:
  num_key_value_heads, intermediate_size, head_dim, vocab_size)
 ```
 
+## CRIU Installation (v4.2, from source)
+
+Ubuntu archive mirrors may be unreachable on some machines.  The
+reliable path is to build CRIU and its dependencies from source using
+GitHub (which is always reachable).
+
+### Dependencies (built from source)
+
+```bash
+mkdir -p /tmp/criu-build && cd /tmp/criu-build
+
+# libcap
+git clone --depth 1 --branch libcap-2.73 https://git.kernel.org/pub/scm/libs/libcap/libcap.git
+cd libcap && make -j$(nproc) && sudo make install prefix=/usr && cd ..
+
+# protobuf-c (requires protoc + libprotobuf-dev already installed)
+#   If /usr/include/google/protobuf/compiler/ is missing, copy headers
+#   from the protobuf source matching your installed protoc version:
+#     git clone --depth 1 --branch v3.21.12 https://github.com/protocolbuffers/protobuf.git protobuf-src
+#     sudo cp -r protobuf-src/src/google/protobuf/compiler /usr/include/google/protobuf/compiler
+#   If libprotoc.so symlink is missing:
+#     sudo ln -sf /usr/lib/x86_64-linux-gnu/libprotoc.so.32 /usr/lib/x86_64-linux-gnu/libprotoc.so
+git clone --depth 1 --branch v1.5.0 https://github.com/protobuf-c/protobuf-c.git
+cd protobuf-c && ./autogen.sh && ./configure --prefix=/usr && make -j$(nproc) && sudo make install && cd ..
+
+# libnet
+git clone --depth 1 --branch v1.3 https://github.com/libnet/libnet.git
+cd libnet && ./autogen.sh && ./configure --prefix=/usr && make -j$(nproc) && sudo make install && cd ..
+
+# uuid.h (if /usr/include/uuid/uuid.h is missing)
+git clone --depth 1 --branch v2.40.4 https://github.com/util-linux/util-linux.git
+sudo mkdir -p /usr/include/uuid
+sudo cp util-linux/libuuid/src/uuid.h /usr/include/uuid/uuid.h
+sudo ln -sf /usr/lib/x86_64-linux-gnu/libuuid.so.1 /usr/lib/x86_64-linux-gnu/libuuid.so
+```
+
+### CRIU 4.2
+
+```bash
+cd /tmp/criu-build
+git clone --depth 1 --branch v4.2 https://github.com/checkpoint-restore/criu.git
+cd criu
+PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:$PKG_CONFIG_PATH" make -j$(nproc)
+sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-criu PREFIX=/usr
+sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-lib PREFIX=/usr
+sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-crit PREFIX=/usr
+
+# Empty plugin directory (required by --libdir during dump)
+sudo mkdir -p /usr/lib/criu/empty
+```
+
+### Verify
+
+```
+criu --version          # Version: 4.2
+which crit              # /usr/local/bin/crit
+ls -d /usr/lib/criu/empty
+```
+
 ## File Structure
 
 ```
 semi_persistence/
   instance.py        -- Instance class (GPU-agnostic handle, owns worker process)
   worker.py          -- Worker loop, child thread, checkpoint/restore/CRIU save/load
-  vllm_child.py      -- vLLM child process (owns GPU, pinned memory, staging)
+  vllm_child.py      -- vLLM child process (owns GPU, pinned memory, async engine loop)
   orchestrator.py    -- Orchestrator class (see orchestrator_DESIGN.md)
+  gpu_pool.py        -- GPU pool with semaphore-based acquisition
+  state_server.py    -- HTTP /state endpoint for dashboard/monitor
+  dashboard.py       -- Curses-based live dashboard (GPU/CPU tiers, requests)
+  monitor.py         -- Plotext-based live monitor (scatter + utilization charts)
+  replay.py          -- Curses replay viewer (dashboard + charts side by side)
+  compare.py         -- Side-by-side comparison of two recordings
   abstract.py        -- Abstract InstanceBase interface (reference only)
   demo.py            -- CLI demo script (stdout/stderr redirected to log file)
   demo.ipynb         -- Jupyter notebook demo
@@ -462,6 +529,7 @@ semi_persistence/
   test_migrate.py    -- Cross-GPU migration test
   test_image.py      -- CRIU save/load image cache test
   instance_DESIGN.md -- This file
+  async_generate_DETAILS.md -- Async generate implementation details
   CRIU_PLUMBING.md   -- CRIU dump/restore complications and fixes
 ```
 
