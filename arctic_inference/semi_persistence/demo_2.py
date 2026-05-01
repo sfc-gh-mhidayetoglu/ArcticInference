@@ -15,7 +15,7 @@ if __name__ == "__main__":
 
     orch.init("/data-fast/image-cache/demo", [4, 5, 6, 7])
 
-    orch.wait()
+    orch.wait_all()
     orch.status()
 
     # orch.remove("model 1")
@@ -34,7 +34,7 @@ if __name__ == "__main__":
     # orch.remove("model 14")
     # orch.remove("model 15")
 
-    orch.wait()
+    orch.wait_all()
     orch.status()
 
     # init models
@@ -54,7 +54,7 @@ if __name__ == "__main__":
     orch.register("model 14", {"model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"})
     orch.register("model 15", {"model": "Qwen/Qwen3.5-27B-GPTQ-Int4"})
 
-    orch.wait()
+    orch.wait_all()
     orch.status()
 
     prompt = "Explain the theory of relativity in a paragraph"
@@ -76,7 +76,7 @@ if __name__ == "__main__":
     orch.generate("model 14", [prompt], params)
     orch.generate("model 15", [prompt], params)
 
-    orch.wait()
+    orch.wait_all()
     orch.status()    
 
     # orch.generate("model 1", [prompt], params)
@@ -95,5 +95,5 @@ if __name__ == "__main__":
     orch.generate("model 14", [prompt], params)
     orch.generate("model 15", [prompt], params)
 
-    orch.wait()
+    orch.wait_all()
     orch.status()

@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 _t0: float = 0.0
 
@@ -13,6 +13,66 @@ def init_t0() -> None:
     """Record the orchestrator start time for relative request timestamps."""
     global _t0
     _t0 = time.perf_counter()
+
+
+def _snapshot_slots() -> tuple[dict[int, list[dict]], int]:
+    """Return ``({gpu_id: [leaf, ...]}, waiters)`` for the buddy allocator.
+
+    Each leaf is ``{"level": L, "index": I, "alloc": bool, "mid": str|None}``
+    covering ``1 / 2**(L-1)`` of GPU ``gpu_id``; ``mid`` is the model id of
+    the slot's holder for ALLOC leaves and absent for FREE leaves.  Leaves
+    are emitted in left-to-right order (DFS by ``index``) so a renderer
+    can map them onto a bar without further sorting.
+    """
+    from orchestrator import Orchestrator
+    from slots import Slots
+
+    with Slots._cv:
+        if not Slots._inited:
+            return {}, 0
+        pool_leaves: dict[int, set[tuple[int, int]]] = {}
+        for (g, L), pool in Slots._pools.items():
+            for s in pool:
+                pool_leaves.setdefault(g, set()).add((L, s.index))
+        live_leaves: dict[int, set[tuple[int, int]]] = {}
+        for s in Slots._live:
+            live_leaves.setdefault(s.gpu_id, set()).add((s.level, s.index))
+        gpus = sorted(set(Slots._last_used.keys()))
+        waiters = len(Slots._waiters)
+
+    # Reverse-map (gpu, level, index) -> mid by scanning the registry once.
+    # Slotless residents (slot is None) don't appear here; they're handled
+    # by the dashboard as ghosts via ``state == "sleep" && slot_level is None``.
+    slot_to_mid: dict[tuple[int, int, int], str] = {}
+    for mid, entry in Orchestrator._registry.items():
+        s = entry.get("slot")
+        if s is not None:
+            slot_to_mid[(s.gpu_id, s.level, s.index)] = mid
+
+    out: dict[int, list[dict]] = {}
+    for g in gpus:
+        free = pool_leaves.get(g, set())
+        live = live_leaves.get(g, set())
+        leaves: list[dict] = []
+
+        def walk(level: int, index: int) -> None:
+            key = (level, index)
+            if key in free:
+                leaves.append({"level": level, "index": index,
+                               "alloc": False})
+                return
+            if key in live:
+                leaves.append({
+                    "level": level, "index": index, "alloc": True,
+                    "mid": slot_to_mid.get((g, level, index)),
+                })
+                return
+            walk(level + 1, 2 * index)
+            walk(level + 1, 2 * index + 1)
+
+        walk(1, 0)
+        out[g] = leaves
+    return out, waiters
 
 
 def snapshot_state() -> dict:
@@ -34,26 +94,58 @@ def snapshot_state() -> dict:
             if t0_valid and raw_since
             else None
         )
+        slot = entry.get("slot")
         models[mid] = {
             "state": entry.get("state"),
             "gpu": entry.get("gpu"),
             "pid": pid,
-            "pinned_bytes": entry.get("pinned_bytes", 0),
+            "pinned_cpu_bytes": entry.get("pinned_cpu_bytes", 0),
+            "total_gpu_bytes": entry.get("total_gpu_bytes", 0),
             "vllm_config": entry.get("vllm_config", {}),
             "state_since": entry.get("state_since", 0),
             "state_since_rel_s": state_since_rel,
+            "level": entry.get("level"),
+            "slot_level": slot.level if slot is not None else None,
+            "slot_index": slot.index if slot is not None else None,
         }
-    free_gpus = sorted(
-        s.gpu_id for s in Orchestrator._gpus.values() if s.is_free
-    )
+    busy = {
+        e.get("gpu") for e in Orchestrator._registry.values()
+        if e.get("gpu") is not None
+        and e.get("state") in ("init", "sleep", "up", "running")
+    }
+    free_gpus = sorted(g for g in Orchestrator._gpu_ids if g not in busy)
 
     requests = []
     with Orchestrator._request_lock:
+        # Index earlier-submitted records per-model for piggy-back
+        # detection: request R piggy-backs another if some earlier
+        # submit for the same model hadn't yet reached t_gen_start
+        # when R submitted, meaning R caught a ride on that request's
+        # up-cycle rather than driving its own climb.  ``piggyback``
+        # is ``None`` when R drove its own climb, otherwise the
+        # ``req_id`` of the *lead* request -- the earliest in-flight
+        # submit that R hitched onto.
+        per_model_subs: dict[str, list[tuple[int, float, float | None]]] = {}
+        for other in Orchestrator._request_log:
+            per_model_subs.setdefault(other["model_id"], []).append(
+                (other["req_id"], other["t_submit"], other["t_gen_start"]))
+
         for rec in Orchestrator._request_log:
             state = rec["state"]
             t_submit = rec["t_submit"]
             t_gen_start = rec["t_gen_start"]
             t_done = rec["t_done"]
+
+            piggyback: int | None = None
+            earliest_sub = float("inf")
+            for other_id, other_sub, other_gen in per_model_subs.get(
+                    rec["model_id"], []):
+                if other_sub >= t_submit:
+                    continue
+                if other_gen is None or other_gen > t_submit:
+                    if other_sub < earliest_sub:
+                        earliest_sub = other_sub
+                        piggyback = other_id
 
             if state == "waiting":
                 wait_s = now - t_submit
@@ -84,6 +176,14 @@ def snapshot_state() -> dict:
                 gen_start_rel_s = None
                 done_rel_s = None
 
+            if t0_valid:
+                state_log = [
+                    [round(t - _t0, 3), s]
+                    for (t, s) in rec.get("state_log", [])
+                ]
+            else:
+                state_log = []
+
             requests.append({
                 "req_id": rec["req_id"],
                 "model_id": rec["model_id"],
@@ -99,8 +199,11 @@ def snapshot_state() -> dict:
                 "submit_rel_s": submit_rel_s,
                 "gen_start_rel_s": gen_start_rel_s,
                 "done_rel_s": done_rel_s,
+                "state_log": state_log,
+                "piggyback": piggyback,
             })
 
+    slots, waiters = _snapshot_slots()
     return {
         "gpu_ids": list(Orchestrator._gpu_ids),
         "gpu_pool": free_gpus,
@@ -108,19 +211,94 @@ def snapshot_state() -> dict:
         "models": models,
         "requests": requests,
         "elapsed_s": elapsed_s,
+        "slots": slots,
+        "slot_waiters": waiters,
     }
 
 
 class StateHandler(BaseHTTPRequestHandler):
-    """Serves GET /state as a JSON snapshot of the orchestrator registry."""
+    """Serves orchestrator state and control over HTTP.
+
+    GET  /state              -- JSON snapshot of registry, slots, requests
+    POST /register           -- Orchestrator.register(model_id, vllm_config)
+    POST /move               -- Orchestrator.move(model_id, target, target_gpu)
+    POST /move_all           -- Orchestrator.move_all(target, target_gpu)
+    POST /generate           -- Orchestrator.submit_generate(...); returns req_id
+    POST /generate_all       -- Orchestrator.generate_all(...); returns req_ids
+    POST /wait               -- Orchestrator.wait(model_id) (blocks)
+    POST /wait_all           -- Orchestrator.wait_all() (blocks)
+    POST /remove             -- Orchestrator.remove(model_id)
+    POST /remove_all         -- Orchestrator.remove_all()
+    """
 
     def do_GET(self):
         if self.path != "/state":
             self.send_error(404)
             return
-        payload = snapshot_state()
+        self._json(200, snapshot_state())
+
+    def do_POST(self):
+        from orchestrator import Orchestrator
+
+        body = self._read_json()
+        try:
+            if self.path == "/register":
+                Orchestrator.register(body["model_id"], body["vllm_config"])
+                self._json(200, {"ok": True})
+            elif self.path == "/move":
+                Orchestrator.move(
+                    body["model_id"], body["target"],
+                    target_gpu=body.get("target_gpu"))
+                self._json(200, {"ok": True})
+            elif self.path == "/move_all":
+                Orchestrator.move_all(
+                    body["target"], target_gpu=body.get("target_gpu"))
+                self._json(200, {"ok": True})
+            elif self.path == "/generate":
+                req_id, _fut = Orchestrator.submit_generate(
+                    body["model_id"], body["prompts"],
+                    body.get("sampling_params"))
+                self._json(200, {"req_id": req_id})
+            elif self.path == "/generate_all":
+                req_ids = Orchestrator.generate_all(
+                    body["prompts"], body.get("sampling_params"))
+                self._json(200, {"req_ids": req_ids})
+            elif self.path == "/wait":
+                Orchestrator.wait(body["model_id"])
+                self._json(200, {"ok": True})
+            elif self.path == "/wait_all":
+                Orchestrator.wait_all()
+                self._json(200, {"ok": True})
+            elif self.path == "/remove":
+                Orchestrator.remove(body["model_id"])
+                self._json(200, {"ok": True})
+            elif self.path == "/remove_all":
+                Orchestrator.remove_all()
+                self._json(200, {"ok": True})
+            else:
+                self.send_error(404)
+        except (BrokenPipeError, ConnectionResetError):
+            # Client disconnected before we could send the response
+            # (common when a long-running call like /wait_all outlasts
+            # the client process).  No socket to report on, just drop.
+            pass
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            try:
+                self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def _read_json(self) -> dict:
+        n = int(self.headers.get("Content-Length") or 0)
+        if not n:
+            return {}
+        return json.loads(self.rfile.read(n))
+
+    def _json(self, code: int, payload: dict) -> None:
         body = json.dumps(payload).encode()
-        self.send_response(200)
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -130,8 +308,8 @@ class StateHandler(BaseHTTPRequestHandler):
         pass
 
 
-def start_state_server(port: int) -> HTTPServer:
-    server = HTTPServer(("0.0.0.0", port), StateHandler)
+def start_state_server(port: int) -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(("0.0.0.0", port), StateHandler)
     server.socket.set_inheritable(False)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()

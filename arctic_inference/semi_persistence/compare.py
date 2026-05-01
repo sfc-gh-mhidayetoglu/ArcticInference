@@ -102,10 +102,10 @@ def _hline(win, y: int, x: int, width: int, char="─", attr=0):
         _safe_addstr(win, y, x + i, char, attr)
 
 
-def _pinned_str(pinned_bytes: int) -> str:
-    if pinned_bytes <= 0:
+def _pinned_str(pinned_cpu_bytes: int) -> str:
+    if pinned_cpu_bytes <= 0:
         return ""
-    gib = pinned_bytes / (1 << 30)
+    gib = pinned_cpu_bytes / (1 << 30)
     return f" ({gib:.1f}G)"
 
 
@@ -113,7 +113,7 @@ def _gpu_mem_str(info: dict) -> str:
     gpu_mib = info.get("gpu_mem_mib", 0)
     if gpu_mib > 0:
         return f" ({gpu_mib / 1024:.1f}G)"
-    return _pinned_str(info.get("pinned_bytes", 0))
+    return _pinned_str(info.get("pinned_cpu_bytes", 0))
 
 
 def _fmt_rel_t0_hms(seconds: float) -> str:
@@ -372,7 +372,7 @@ def _render(win, state: dict | None, connected: bool, tick: int,
     requests: list[dict] = state.get("requests", [])
     total_requests = len(requests)
     all_models = list(models.items())
-    all_models.sort(key=lambda x: x[1].get("pinned_bytes", 0), reverse=True)
+    all_models.sort(key=lambda x: x[1].get("pinned_cpu_bytes", 0), reverse=True)
     n_saved_entries = max(len(all_models), 1)
     saved_tier_rows = 1 + n_saved_entries + 1 + 1
     saved_start = h - saved_tier_rows
@@ -387,7 +387,7 @@ def _render(win, state: dict | None, connected: bool, tick: int,
 
     # -- CPU tier (fills from current row to just above requests separator) --
     cpu_models = sorted(checkpoint_models,
-                        key=lambda x: x[1].get("pinned_bytes", 0), reverse=True)
+                        key=lambda x: x[1].get("pinned_cpu_bytes", 0), reverse=True)
 
     if cpu_models:
         for mid, info in cpu_models:
@@ -401,7 +401,7 @@ def _render(win, state: dict | None, connected: bool, tick: int,
             else:
                 label = mid
                 colour = curses.color_pair(C_CHECKPOINT)
-            label += _pinned_str(info.get("pinned_bytes", 0))
+            label += _pinned_str(info.get("pinned_cpu_bytes", 0))
             _safe_addstr(win, row, 2, label, colour)
             row += 1
     else:
@@ -443,7 +443,7 @@ def _render(win, state: dict | None, connected: bool, tick: int,
         for mid, info in all_models:
             vc = info.get("vllm_config", {})
             model_path = vc.get("model", "")
-            label = f"{mid}{_pinned_str(info.get('pinned_bytes', 0))}  {model_path}"
+            label = f"{mid}{_pinned_str(info.get('pinned_cpu_bytes', 0))}  {model_path}"
             if info.get("state") == "saved":
                 colour = curses.color_pair(C_SAVED)
             else:

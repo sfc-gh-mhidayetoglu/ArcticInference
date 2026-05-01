@@ -57,7 +57,7 @@ class InstanceBase(ABC):
 
     Usage:
         instance = Instance(vllm_config)
-        instance.init(gpu=0).attach().sleep().checkpoint().wait()
+        instance.init(gpu=0).attach().sleep().checkpoint_cuda().wait()
     """
 
     @abstractmethod
@@ -76,11 +76,11 @@ class InstanceBase(ABC):
         """Free GPU memory for weights and KV cache (vLLM sleep level=2)."""
 
     @abstractmethod
-    def checkpoint(self) -> InstanceBase:
+    def checkpoint_cuda(self) -> InstanceBase:
         """Save CUDA state to CPU. Instance becomes stateless (gpu=None)."""
 
     @abstractmethod
-    def save(self, filename: str) -> InstanceBase:
+    def save_image(self, filename: str) -> InstanceBase:
         """CRIU-dump the child process tree to disk (non-destructive).
 
         Uses --leave-running so the child stays alive after the dump.
@@ -88,7 +88,7 @@ class InstanceBase(ABC):
         """
 
     @abstractmethod
-    def load(self, filename: str | None = None) -> InstanceBase:
+    def load_image(self, filename: str | None = None) -> InstanceBase:
         """Restore a live process from a CRIU image on disk.
 
         Validates that the image's vllm_config matches this instance.
@@ -96,7 +96,7 @@ class InstanceBase(ABC):
         """
 
     @abstractmethod
-    def restore(self, gpu: int) -> InstanceBase:
+    def restore_cuda(self, gpu: int) -> InstanceBase:
         """Restore checkpointed CUDA state onto the specified GPU."""
 
     @abstractmethod
@@ -123,14 +123,32 @@ class InstanceBase(ABC):
         """Re-allocate KV cache on GPU."""
 
     @abstractmethod
-    def h2d(self) -> InstanceBase:
-        """Async host-to-device transfer, then synchronize."""
+    def plan_load_weights(self) -> InstanceBase:
+        """Precompute the chunk plan that the next ``load_weights()`` consumes.
+
+        Self-computes the staging budget from instance state populated
+        by ``init`` (cold start) or by ``load`` reading ``meta.json``
+        (restore):
+
+            allotment = total_gpu_bytes * gpu_memory_utilization
+            budget    = min(pinned_cpu_bytes, allotment - pinned_cpu_bytes)
+
+        Splits the parameter index into chunks of ``<= budget`` bytes
+        and caches the result on the worker.  Subsequent
+        ``load_weights()`` calls execute the cached plan.
+        """
 
     @abstractmethod
-    def scatter(self) -> InstanceBase:
-        """Place weights from GPU staging buffer into model params.
+    def load_weights(self) -> InstanceBase:
+        """Copy staged weights from pinned CPU into model parameters.
 
-        Frees the GPU staging buffer after scatter completes.
+        Pure execution against the chunk plan cached by a prior
+        ``plan_load_weights()``.  For each chunk the worker copies a
+        slice of the pinned buffer into a single reused GPU staging
+        buffer (PCIe H2D) and then scatters into
+        ``model.named_parameters()`` in place.  When no plan is cached,
+        falls back to a single-chunk path identical to the pre-chunk
+        behavior.  The staging buffer is freed before returning.
         """
 
     @abstractmethod

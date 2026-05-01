@@ -56,21 +56,78 @@ Without this directory the dump aborts at plugin initialization
 ```
 [Dump side — prepare_criu_dump in vllm_child.py + _worker_criu_save in worker.py]
 
-  1. Destroy PyTorch process group  (NCCL, TCPStore threads)
-  2. Wait for store threads to exit
-  3. Redirect stdout/stderr to /dev/null
-  4. Close io_uring FDs
-  5. Munmap io_uring memory regions
-  6. Remove /dev/shm/sem.* (CRIU captures mapping as anonymous memory)
-  --- (back in worker) ---
-  7. → CRIU dump (destructive): image written, child killed
+  (in child)
+  1. Drain in-flight engine requests
+  2. Destroy PyTorch process group   (NCCL, TCPStore threads)
+  3. Wait for store threads to exit  (poll /proc/<pid>/task, up to 2.5s)
+  4. dup2 /dev/null over stdout/stderr (fd 1, fd 2)
+  5. Walk /proc/<pid>/fd and close every FD that does not match the
+     keep-list  (see "FD Policy" below); pipe_fd and fd 0/1/2 are skipped
+  6. Munmap every "io_uring" region from /proc/<pid>/maps
+  7. Remove /dev/shm/sem.*   (mappings stay live as anonymous memory)
+  8. Audit /proc/<pid>/task for non-"python" threads (informational)
+
+  (back in worker)
+  9. Scan child fds for socket:[ino] → --external unix[ino]
+ 10. Scan child fds for /dev/nvidia*   → record into meta.json
+ 11. → criu dump (destructive): image written, child killed
 
 [Every use after dump — load from image]
 
-  1. Pass pipe FD via Unix socket (SCM_RIGHTS)
-  2. → CRIU restore brings a new process from the image
-  3. cuda-checkpoint restore / driver API restores GPU context
+  1. Pass pipe FD via Unix socket (SCM_RIGHTS) into sudo'd helper
+  2. helper dup2's the pipe fd into place, execvp's criu restore
+  3. criu restore --inherit-fd fd[N]:pipe_resource
+                  --inherit-fd fd[1]:stdout, fd[2]:stderr
+                  --link-remap --tcp-close --shell-job
+  4. cuda-checkpoint restore / driver API restores GPU context
 ```
+
+---
+
+## FD Policy at Dump Time
+
+The child does not blanket-null its FDs.  `prepare_criu_dump`
+walks `/proc/<pid>/fd/` and applies a **keep-list** based on the symlink
+target; everything else is `os.close()`'d:
+
+| FD class                | Action                                                     |
+|-------------------------|------------------------------------------------------------|
+| `fd 0` (stdin)          | left untouched (skipped: `<= 2`)                           |
+| `fd 1`, `fd 2`          | `dup2(/dev/null, …)` first, then skipped                   |
+| pipe fd to worker       | preserved (skipped explicitly via `pipe_fd` argument)      |
+| `/dev/nvidia*`          | preserved — CUDA driver fds; restored by CRIU CUDA plugin  |
+| `/dev/shm/*`            | preserved — POSIX shm, including pinned host buffers       |
+| `anon_inode:*`          | preserved — eventfd, epoll, **and io_uring** (rings munmap'd separately) |
+| `socket:[…]`            | preserved — worker tags unix sockets `--external unix[ino]`; TCP gets `--tcp-close` |
+| `pipe:[…]`              | preserved                                                  |
+| Everything else         | closed (regular files, Triton `.so` opens, log files, etc.) |
+
+The keep-list lives in `prepare_criu_dump`:
+
+```python
+keep_prefixes = ("/dev/nvidia", "/dev/shm", "anon_inode:",
+                 "socket:", "pipe:")
+```
+
+### What survives into the CRIU image
+
+- The Python interpreter, the main thread, and any threads that aren't
+  the NCCL/TCPStore set torn down above.
+- All Python objects: the `LLM` engine, tokenizer, scheduler, KV cache
+  manager, etc.
+- Model weights and KV cache on the GPU (handled by the CUDA plugin at
+  dump and by `cuCheckpointProcess*` / `cuda-checkpoint` at restore).
+- `/dev/nvidia*` FDs (also recorded as `nvidia_fds` in `meta.json`).
+- `/dev/shm` FDs and their mappings (anon pages now that `sem.*` files
+  are deleted; pinned host buffers remain mapped).
+- `anon_inode:` FDs (eventfd, epoll; io_uring FDs too — see Complication 2).
+- `socket:` FDs marked `--external unix[<ino>]`, plus the worker pipe FD
+  re-inherited via `--inherit-fd`.
+- `pipe:` FDs.
+- Triton JIT `.so` mappings, including ones already `(deleted)` on disk
+  (see Complication 9 — these are intentionally *not* pre-handled and
+  rely on `--link-remap` + the destructive dump to keep ghost-remap
+  collisions rare).
 
 ---
 
@@ -92,12 +149,21 @@ warning, and CRIU handles the remaining thread via `--tcp-close`.
 
 **Problem:** Modern PyTorch/libtorch uses `io_uring` for async I/O.
 CRIU cannot checkpoint `io_uring` instances — the kernel ring buffers
-and submission queues are not serializable.  Both the FDs (`anon_inode:[io_uring]`)
-and the memory mappings show up in `/proc/<pid>/maps`.
+and submission queues are not serializable.  Both the FDs
+(`anon_inode:[io_uring]`) and the memory mappings show up in
+`/proc/<pid>/maps`.
 
-**Fix (dump side):**
-- Close all FDs pointing to `io_uring` (scan `/proc/<pid>/fd/`)
-- Munmap all `io_uring` regions (scan `/proc/<pid>/maps`)
+**Fix (dump side):** Munmap every `io_uring` region found in
+`/proc/<pid>/maps` (scanned line-by-line, `libc.munmap()` via ctypes).
+The `anon_inode:[io_uring]` FDs themselves currently fall under the
+`anon_inode:` keep-prefix and are *not* explicitly closed — in
+practice this has worked because once the rings are unmapped, what
+remains is a bare `anon_inode` that CRIU can dump.
+
+> Caveat: if a future PyTorch/libtorch revision triggers a
+> dump failure on `anon_inode:[io_uring]`, tighten the keep-list in
+> `prepare_criu_dump` to close those FDs explicitly while keeping
+> other `anon_inode:` FDs (eventfd, epoll, …).
 
 ---
 
@@ -202,7 +268,7 @@ that occurred when remapping deleted shared-memory files.
 `save()` writes a `meta.json` file alongside the CRIU image containing:
 
 - **CRIU plumbing**: `child_pid`, `pipe_fd`, `pipe_resource`, `nvidia_fds`, `rank`
-- **Instance metadata**: `vllm_config`, `weight_bytes`, `pinned_bytes`
+- **Instance metadata**: `vllm_config`, `total_gpu_bytes`, `pinned_cpu_bytes`
 
 On `load()`, the instance validates that the image's `vllm_config`
 matches the instance's config.  A mismatch raises `RuntimeError`
@@ -297,7 +363,7 @@ which are `MAP_PRIVATE`, unlike semaphores which are `MAP_SHARED`).
 | Resource           | Problem at dump time               | Dump-side fix                      | Restore-side fix                     |
 |--------------------|-------------------------------------|------------------------------------|--------------------------------------|
 | NCCL/TCPStore      | Background threads, TCP sockets     | `destroy_process_group()` + poll   | `--tcp-close`                        |
-| io_uring           | Non-serializable kernel state       | Close FDs + munmap                 | —                                    |
+| io_uring           | Non-serializable kernel state       | Munmap rings (FDs kept via keep-list) | —                                 |
 | POSIX semaphores   | `(deleted)` files → ghost/link remap| Delete sem files; captured as anon | —                                    |
 | stdout/stderr      | File size changes between dump/load | Redirect to /dev/null              | `--inherit-fd fd[1]/fd[2]`           |
 | Pipe FD            | sudo closes FDs >= 3                | —                                  | SCM_RIGHTS via Unix socket           |

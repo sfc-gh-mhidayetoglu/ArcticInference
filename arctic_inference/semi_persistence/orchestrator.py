@@ -12,18 +12,21 @@ from __future__ import annotations
 
 import collections
 import json
+import math
 import os
 import shutil
 import subprocess
 import threading
 import time
+
+import pynvml
 from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor
 from http.server import HTTPServer
 from typing import Any
 
-from gpu_slot import SlotPool, GpuSlot
 from instance import Instance
+from slots import Slot, Slots
 from state_server import init_t0, start_state_server
 
 import sys as _sys
@@ -43,19 +46,34 @@ def _console(msg: str) -> None:
 
 
 def _discover_gpu_ids() -> list[int]:
-    """Return GPU device indices via nvidia-smi without initializing CUDA."""
-    out = subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-        text=True,
-    )
-    return [int(line.strip()) for line in out.strip().splitlines()]
+    """Return GPU device indices via NVML without initializing CUDA."""
+    pynvml.nvmlInit()
+    return list(range(pynvml.nvmlDeviceGetCount()))
 
 
 _STATES = ["saved", "checkpoint", "sleep", "up"]
 
 
-class _StateRegressed(Exception):
-    """Raised when a concurrent eviction moved a model backward mid-climb."""
+def _pick_level(gpu_memory_utilization: float) -> int:
+    """Pick the smallest slot *level* (largest GPU fraction) that satisfies *util*.
+
+    A level-L slot covers ``1 / 2**(L-1)`` of a GPU.  We pick the largest
+    such fraction that still fits the model's ``gpu_memory_utilization``,
+    which is the smallest L with ``1 / 2**(L-1) >= util``:
+
+        util in (0.5,   1.0] -> L1   (whole GPU)
+        util in (0.25,  0.5] -> L2   (half GPU)
+        util in (0.125, 0.25]-> L3   (quarter GPU)
+        util in (0.0625,0.125]->L4   (eighth GPU)
+        ...
+
+    Boundary points fall into the lower-L (larger-fraction) bucket, e.g.
+    ``util == 0.5`` -> ``L1``.  Degenerate / non-positive ``util`` returns
+    ``L1`` (whole GPU).
+    """
+    if gpu_memory_utilization <= 0.0 or gpu_memory_utilization >= 1.0:
+        return 1
+    return max(1, int(math.ceil(math.log2(1.0 / gpu_memory_utilization))))
 
 
 class Orchestrator:
@@ -64,17 +82,17 @@ class Orchestrator:
     States (ordered ladder):
         saved      -- image on disk, no process, no GPU
         checkpoint -- image on disk + live CRIU process in memory, no GPU
-        sleep      -- CUDA context restored on a GPU (small footprint),
-                      GPU is NOT locked; multiple sleep models can coexist
+        sleep      -- CUDA context restored on a GPU; slot held until
+                      `running -> up` releases it, or `sleep -> checkpoint`
+                      tears the context down
         up         -- image on disk + live process + GPU held + weights on GPU
-        running    -- transient sub-state of 'up' during generate()
+        running    -- transient sub-state of 'up' during generate();
+                      always holds a slot, therefore unevictable
     """
 
     _registry: dict[str, Any] = {}
     _futures: dict[str, Future] = {}
     _gpu_ids: list[int] = []
-    _gpu_pool: SlotPool | None = None
-    _gpus: dict[int, GpuSlot] = {}
     _image_cache: str | None = None
     _pool: ThreadPoolExecutor | None = None
     _state_server: HTTPServer | None = None
@@ -112,8 +130,34 @@ class Orchestrator:
     @staticmethod
     def _set_state(model_id: str, state: str) -> None:
         """Set a model's state and print the system-wide state summary."""
+        now = time.perf_counter()
+        prev_state = Orchestrator._registry[model_id].get("state")
         Orchestrator._registry[model_id]["state"] = state
-        Orchestrator._registry[model_id]["state_since"] = time.perf_counter()
+        # ``wait`` is a transient sub-state of ``checkpoint`` that
+        # publishes only while ``Slots.allocate`` is blocked.  The
+        # ``checkpoint -> wait`` flip resets the timer so the user can
+        # see how long the slot wait has been queued, but the reverse
+        # ``wait -> checkpoint`` leg returns to the same idle CPU tier
+        # we were already in -- preserve the original ``state_since``
+        # there so the CPU row's age keeps climbing instead of bouncing
+        # back to 0 once a slot becomes available.
+        if not (prev_state == "wait" and state == "checkpoint"):
+            Orchestrator._registry[model_id]["state_since"] = now
+        # Mirror this transition into any in-flight request bound to
+        # *model_id* so the dashboard can render a precise per-request
+        # state timeline.  Deduped against the trailing entry.
+        try:
+            with Orchestrator._request_lock:
+                for rec in Orchestrator._request_log:
+                    if (rec.get("model_id") == model_id
+                            and rec.get("t_done") is None):
+                        log = rec.setdefault("state_log", [])
+                        if not log or log[-1][1] != state:
+                            log.append((now, state))
+        except Exception:
+            # State tracking is observational; never let it block a
+            # real state transition.
+            pass
         Orchestrator._print_states()
 
     _timing = threading.local()
@@ -160,8 +204,15 @@ class Orchestrator:
         port.  Set to 0 to disable.
         """
         Orchestrator._gpu_ids = gpus if gpus is not None else _discover_gpu_ids()
-        Orchestrator._gpu_pool = SlotPool(Orchestrator._gpu_ids)
-        Orchestrator._gpus = Orchestrator._gpu_pool.slots
+        if Slots._inited:
+            # Hard-reset: bypass leak assertions (tests may re-init).
+            with Slots._cv:
+                Slots._pools.clear()
+                Slots._live.clear()
+                Slots._last_used.clear()
+                Slots._waiters.clear()
+                Slots._inited = False
+        Slots.init(Orchestrator._gpu_ids)
         Orchestrator._image_cache = image_cache
         os.makedirs(image_cache, exist_ok=True)
 
@@ -201,16 +252,22 @@ class Orchestrator:
                 meta = json.load(f)
             vllm_config = meta.get("vllm_config", {})
             model_id = entry_name
+            run_level = _pick_level(
+                vllm_config.get("gpu_memory_utilization", 0.7))
             Orchestrator._registry[model_id] = {
                 "state": "saved",
                 "instance": None,
                 "gpu": None,
+                "slot": None,
+                "level": run_level,
                 "vllm_config": vllm_config,
                 "image_dir": image_dir,
-                "pinned_bytes": meta.get("pinned_bytes", 0),
+                "pinned_cpu_bytes": meta.get(
+                    "pinned_cpu_bytes", meta.get("pinned_bytes", 0)),
+                "total_gpu_bytes": meta.get("total_gpu_bytes", 0),
                 "_lock": threading.RLock(),
             }
-            pinned = meta.get("pinned_bytes", 0)
+            pinned = Orchestrator._registry[model_id]["pinned_cpu_bytes"]
             print(f"[orchestrator] discovered {model_id}  "
                   f"model={vllm_config.get('model', '?')}  "
                   f"pinned={pinned / 2**30:.1f} GiB  image={image_dir}")
@@ -232,7 +289,10 @@ class Orchestrator:
         _console(f"\nOrchestrator  image_cache={image_cache}  "
                  f"gpus={Orchestrator._gpu_ids}  discovered {n} saved models")
 
-        # t0 is set lazily on the first generate, not here.
+        # Anchor the dashboard's relative-time clock here so per-state
+        # ages render even before the first generate (phases that only
+        # register / move never call generate, but still need timers).
+        init_t0()
 
     # ------------------------------------------------------------------
     # register
@@ -272,30 +332,41 @@ class Orchestrator:
         image_dir = Orchestrator._image_dir_for(model_id)
         inst = Instance(vllm_config)
 
-        gpu, wait_s = Orchestrator._gpu_pool.acquire_exclusive(model_id)
+        # Cold-start always uses a full GPU; the runtime level (used at
+        # `checkpoint -> sleep` later) is computed from the model's
+        # configured `gpu_memory_utilization`.
+        register_slot = Slots.allocate(level=1)
+        gpu = register_slot.gpu_id
         t_acquired = time.perf_counter()
 
+        run_level = _pick_level(
+            vllm_config.get("gpu_memory_utilization", 0.7))
         Orchestrator._registry[model_id] = {
             "state": "init",
             "instance": inst,
             "gpu": gpu,
+            "slot": None,
+            "level": run_level,
             "vllm_config": vllm_config,
             "image_dir": image_dir,
-            "pinned_bytes": 0,
+            "pinned_cpu_bytes": 0,
+            "total_gpu_bytes": 0,
             "state_since": time.perf_counter(),
             "_lock": threading.RLock(),
         }
         Orchestrator._print_states()
 
         with Orchestrator._locks_ordered(model_id):
-            inst.init(gpu).attach().repin().stage().unpin().sleep().checkpoint().wait()
-            inst.save(image_dir).wait()
+            inst.init(gpu).attach().repin().stage().unpin().sleep().checkpoint_cuda().wait()
+            inst.save_image(image_dir).wait()
             print(f"[orchestrator] {model_id}: image saved to {image_dir}")
 
             inst._send("exit")
             inst._reset()
 
-            Orchestrator._gpu_pool.release_exclusive(gpu, lambda: None)
+            # The cold-start slot is local to this function and never
+            # flowed into entry["slot"]; release it inline.
+            Slots.deallocate(register_slot)
             t_done = time.perf_counter()
             t_wait = t_acquired - t0
             t_exec = t_done - t_acquired
@@ -308,12 +379,24 @@ class Orchestrator:
             entry = Orchestrator._registry[model_id]
             entry["instance"] = None
             entry["gpu"] = None
-            entry["pinned_bytes"] = inst.pinned_bytes
+            entry["pinned_cpu_bytes"] = inst.pinned_cpu_bytes
+            entry["total_gpu_bytes"] = inst.total_gpu_bytes
             Orchestrator._set_state(model_id, "saved")
 
     # ------------------------------------------------------------------
     # move  (walk the state ladder)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def move_all(target: str, target_gpu: int | None = None) -> None:
+        """Fan out :meth:`move` to every registered model.
+
+        Mirrors the no-model_id flavours of :meth:`wait` / :meth:`remove`.
+        Each per-model move is submitted to the thread pool independently,
+        so they execute concurrently; call :meth:`wait` to join.
+        """
+        for mid in list(Orchestrator._registry):
+            Orchestrator.move(mid, target, target_gpu=target_gpu)
 
     @staticmethod
     def move(model_id: str, target: str, target_gpu: int | None = None) -> None:
@@ -323,7 +406,13 @@ class Orchestrator:
         Submits the transition to the thread pool (non-blocking).
 
         *target_gpu* (optional) is only valid when *target* is ``"sleep"``
-        and forces the model to restore onto that specific GPU.
+        and pins the model onto that specific GPU.  This is a **slotless
+        sleep** flavour: no slot is allocated and any slot the model
+        currently holds is released.  The model parks on ``target_gpu``
+        without competing for slot resources; on the next ``sleep -> up``
+        it goes through the standard tier-A/B/C acquisition logic (which
+        may stay on ``target_gpu`` or migrate elsewhere depending on what
+        is free).
         """
         if target not in _STATES:
             raise ValueError(f"invalid target state '{target}'; "
@@ -370,6 +459,33 @@ class Orchestrator:
             _console(f"{model_id}: already in '{target}' state")
             return
         if current == target and announce_state is not None:
+            # Sub-state announce (typically up -> running): preserve the
+            # invariant that ``running`` always holds a slot.  A slotless
+            # ``up`` must acquire one first.
+            if (target == "up" and announce_state == "running"
+                    and entry.get("slot") is None):
+                level = entry["level"]
+                home_gpu = entry["gpu"]
+                # Tier A: home GPU is free right now -> claim the slot
+                # in place; weights stay in HBM.
+                slot = Slots.try_allocate(level=level, gpu=home_gpu)
+                if slot is not None:
+                    with Orchestrator._locks_ordered(model_id):
+                        entry["slot"] = slot
+                    _console(f"{model_id}: claimed slot on GPU {home_gpu}")
+                    print(f"[orchestrator] {model_id}: claimed slot "
+                          f"on GPU {home_gpu}")
+                else:
+                    # Need migration / FIFO: retreat to sleep (frees
+                    # HBM) and climb back up via the standard
+                    # ``sleep -> up`` tier-A/B/C path, which handles
+                    # migration and FIFO blocking + Phase-2 eviction.
+                    _console(f"{model_id}: no slot on GPU {home_gpu}, "
+                             f"retreating to sleep")
+                    print(f"[orchestrator] {model_id}: retreating to "
+                          f"sleep to acquire slot")
+                    Orchestrator._step_down(model_id, "up", "sleep")
+                    Orchestrator._step_up(model_id, "sleep", "up")
             with Orchestrator._locks_ordered(model_id):
                 if entry["state"] == target:
                     Orchestrator._set_state(model_id, announce_state)
@@ -381,52 +497,50 @@ class Orchestrator:
 
         t0 = time.perf_counter()
 
-        if target == "sleep" and target_gpu is not None and current == "up":
-            current_gpu = entry.get("gpu")
-            if target_gpu == current_gpu:
-                Orchestrator._step_down(model_id, "up", "sleep")
-            else:
-                chk_idx = _STATES.index("checkpoint")
-                for step in range(cur_idx, chk_idx, -1):
-                    Orchestrator._step_down(model_id, _STATES[step], _STATES[step - 1])
-                Orchestrator._step_up(model_id, "checkpoint", "sleep",
-                                      target_gpu=target_gpu)
-        elif target == "sleep" and target_gpu is not None and current == "sleep":
-            current_gpu = entry.get("gpu")
-            if target_gpu == current_gpu:
-                _console(f"{model_id}: already sleeping on GPU {target_gpu}")
-                return
-            Orchestrator._step_down(model_id, "sleep", "checkpoint")
+        if (target == "sleep" and target_gpu is not None
+                and current in ("up", "sleep")
+                and entry.get("gpu") != target_gpu):
+            # Migrate to a specific GPU: walk down to checkpoint, then
+            # back up to (slotless) sleep with target_gpu pinned.
+            chk_idx = _STATES.index("checkpoint")
+            for step in range(cur_idx, chk_idx, -1):
+                Orchestrator._step_down(
+                    model_id, _STATES[step], _STATES[step - 1])
             Orchestrator._step_up(model_id, "checkpoint", "sleep",
                                   target_gpu=target_gpu)
+        elif (target == "sleep" and target_gpu is not None
+                and current == "sleep" and entry.get("gpu") == target_gpu):
+            # Already on target_gpu in sleep; fall through so the tail
+            # below releases any slot still held.
+            pass
         elif cur_idx < tgt_idx:
-            while True:
-                cur = entry["state"]
-                if cur == "running":
-                    break
-                ci = _STATES.index(cur) if cur in _STATES else -1
-                if ci >= tgt_idx:
-                    break
-                if ci < 0:
-                    time.sleep(0.05)
-                    continue
-                nxt = _STATES[ci + 1]
+            for step in range(cur_idx, tgt_idx):
+                cur = _STATES[step]
+                nxt = _STATES[step + 1]
                 kw = {}
                 if cur == "checkpoint" and nxt == "sleep":
                     kw["target_gpu"] = target_gpu
                 if nxt == "up" and announce_state is not None:
                     kw["announce_state"] = announce_state
-                try:
-                    Orchestrator._step_up(model_id, cur, nxt, **kw)
-                except _StateRegressed:
-                    _console(f"{model_id}: evicted mid-climb, re-planning")
-                    print(f"[orchestrator] {model_id}: evicted mid-climb "
-                          f"(was {cur}->{nxt}), re-planning from "
-                          f"{entry['state']}")
-                    continue
+                Orchestrator._step_up(model_id, cur, nxt, **kw)
         else:
             for step in range(cur_idx, tgt_idx, -1):
                 Orchestrator._step_down(model_id, _STATES[step], _STATES[step - 1])
+
+        # Slotless-sleep flavour tail: when the user designates target_gpu
+        # for a sleep target, ensure the model holds no slot.  Covers the
+        # cases where the ladder walk left a slot in place (e.g. up -> sleep
+        # on the same GPU, or already-sleeping-and-slotted on target_gpu).
+        if target == "sleep" and target_gpu is not None:
+            with Orchestrator._locks_ordered(model_id):
+                if entry.get("slot") is not None:
+                    Slots.deallocate(entry["slot"])
+                    entry["slot"] = None
+                    _console(f"{model_id}: released slot, "
+                             f"slotless on GPU {target_gpu}")
+                    print(f"[orchestrator] {model_id}: released slot "
+                          f"on GPU {target_gpu} (slotless)")
+
         elapsed = time.perf_counter() - t0
 
         print(f"[orchestrator] {model_id}: {current} -> {target}  ({elapsed:.1f}s)")
@@ -441,164 +555,217 @@ class Orchestrator:
         *announce_state* overrides the published state when the step
         completes.  Used by generate to atomically go sleep -> running
         (skipping the observable 'up' window).
-
-        The ``sleep -> up`` branch manages its own lock scope so the
-        migration path can release model_id's lock before acquiring
-        a new slot (which may evict arbitrary models).
         """
         entry = Orchestrator._registry[model_id]
 
-        with Orchestrator._locks_ordered(model_id):
-            if from_state == "saved" and to_state == "checkpoint":
+        if from_state == "saved" and to_state == "checkpoint":
+            with Orchestrator._locks_ordered(model_id):
                 inst = Instance(entry["vllm_config"])
-                inst.load(entry["image_dir"]).wait()
-                inst.pinned_bytes = entry.get("pinned_bytes", 0)
+                # load() reads meta.json and hydrates total_gpu_bytes /
+                # pinned_cpu_bytes on the instance; plan_load_weights
+                # uses those to build the chunk plan in the child once.
+                inst.load_image(entry["image_dir"]).plan_load_weights().wait()
+                # Mirror onto the registry entry to keep registry-as-truth
+                # even though Instance.load_image already set self.* from meta.
+                inst.pinned_cpu_bytes = entry.get("pinned_cpu_bytes", 0)
+                inst.total_gpu_bytes = entry.get("total_gpu_bytes", 0)
                 entry["instance"] = inst
                 Orchestrator._set_state(model_id, "checkpoint")
-                return
+            return
 
-            if from_state == "checkpoint" and to_state == "sleep":
-                inst = entry["instance"]
-                if target_gpu is not None:
-                    slot = Orchestrator._gpus[target_gpu]
-                else:
-                    slots = list(Orchestrator._gpus.values())
-                    slot = GpuSlot.pick_for_sleep_placement(slots)
+        if from_state == "checkpoint" and to_state == "sleep":
+            if target_gpu is None:
+                # Publish a transient "wait" state only if Slots.allocate
+                # actually has to block; otherwise the model races
+                # checkpoint -> sleep without ever observably entering
+                # "wait", which keeps zero-duration ``wait``/``ckpt``
+                # entries out of every request's state_log.
+                published_wait = False
+
+                def _on_block() -> None:
+                    nonlocal published_wait
+                    published_wait = True
+                    Orchestrator._set_state(model_id, "wait")
+
+                t_wait = time.perf_counter()
+                slot = Slots.allocate(level=entry["level"],
+                                      on_block=_on_block)
                 gpu = slot.gpu_id
-                slot.add_sleeper(model_id)
-                _console(f"{model_id}: placed on GPU {gpu}")
-                print(f"[orchestrator] {model_id}: placed on GPU {gpu}")
-                inst.restore(gpu).repin().wait()
-                entry["gpu"] = gpu
-                Orchestrator._set_state(model_id, "sleep")
-                return
-
-        if from_state != "sleep" or to_state != "up":
-            raise AssertionError(
-                f"_step_up unexpected transition {from_state} -> {to_state}")
-
-        # --- sleep -> up  (lock managed per-branch) ---
-        while True:
+                Orchestrator._timing.gpu_wait_s = time.perf_counter() - t_wait
+                if published_wait:
+                    Orchestrator._set_state(model_id, "checkpoint")
+            else:
+                # Slotless-sleep flavour: user pinned a target GPU, so
+                # park the model there without consuming a slot.
+                slot = None
+                gpu = target_gpu
+                Orchestrator._timing.gpu_wait_s = 0.0
             with Orchestrator._locks_ordered(model_id):
-                actual = entry["state"]
-                home_gpu = entry.get("gpu")
-                if actual != "sleep" or home_gpu is None:
-                    raise _StateRegressed(
-                        f"{model_id}: expected sleep with gpu, "
-                        f"got state={actual} gpu={home_gpu}")
-                inst = entry["instance"]
-                slot = Orchestrator._gpus[home_gpu]
+                entry["slot"] = slot
+                entry["gpu"] = gpu
+                tag = "" if slot is not None else " (slotless)"
+                _console(f"{model_id}: placed on GPU {gpu}{tag}")
+                print(f"[orchestrator] {model_id}: placed on GPU {gpu}{tag}")
+                entry["instance"].restore_cuda(gpu).repin().wait()
+                Orchestrator._set_state(model_id, "sleep")
+            return
 
-                already_locked = (slot.locked_by == model_id)
+        if from_state == "sleep" and to_state == "up":
+            inst = entry["instance"]
+            level = entry["level"]
+            home_gpu = entry["gpu"]
 
-                if already_locked or slot.try_lock(model_id):
-                    slot.remove_sleeper(model_id)
-                    _console(f"{model_id}: acquired home GPU {home_gpu}")
-                    print(f"[orchestrator] {model_id}: acquired home GPU {home_gpu}")
-                    inst.wake_up_weights().h2d().scatter().wake_up_kv_cache().wait()
-                    Orchestrator._set_state(model_id, announce_state or "up")
-                    return
+            # Phase 1: ensure we hold a slot.
+            if entry["slot"] is None:
+                # Tier A: home GPU is free right now.
+                slot = Slots.try_allocate(level=level, gpu=home_gpu)
+                if slot is None:
+                    # Tier B: any GPU free right now (possibly elsewhere).
+                    slot = Slots.try_allocate(level=level)
+                if slot is not None:
+                    # Commit ownership before any (potentially slow)
+                    # migration so the dashboard sees the slot held
+                    # throughout instead of a slotless ``sleep``
+                    # interlude on the wrong GPU.
+                    with Orchestrator._locks_ordered(model_id):
+                        entry["slot"] = slot
+                    if slot.gpu_id != home_gpu:
+                        t_mig = time.perf_counter()
+                        _console(f"{model_id}: migrating from GPU {home_gpu} "
+                                 f"to GPU {slot.gpu_id}")
+                        print(f"[orchestrator] {model_id}: migrating "
+                              f"GPU {home_gpu} -> GPU {slot.gpu_id}")
+                        with Orchestrator._locks_ordered(model_id):
+                            # Mirror the brief checkpoint pass-through in
+                            # the published state so dashboards see the
+                            # sleep -> checkpoint -> sleep transition.
+                            inst.unpin().checkpoint_cuda().wait()
+                            entry["gpu"] = None
+                            Orchestrator._set_state(model_id, "checkpoint")
+                            inst.restore_cuda(slot.gpu_id).repin().wait()
+                            entry["gpu"] = slot.gpu_id
+                            Orchestrator._set_state(model_id, "sleep")
+                        Orchestrator._timing.migrate_s = (
+                            time.perf_counter() - t_mig)
+                else:
+                    # Tier C: nothing free -> retreat and FIFO.
+                    _console(f"{model_id}: waiting for slot...")
+                    print(f"[orchestrator] {model_id}: waiting for slot ...")
+                    t_wait = time.perf_counter()
+                    Orchestrator._step_down(model_id, "sleep", "checkpoint")
+                    Orchestrator._step_up(model_id, "checkpoint", "sleep")
+                    Orchestrator._timing.gpu_wait_s = (
+                        time.perf_counter() - t_wait)
+                    slot = entry["slot"]
+                entry["gpu"] = slot.gpu_id
+                home_gpu = slot.gpu_id
 
-                victim_id = slot.locked_by
-                victim_state = Orchestrator._registry[victim_id]["state"]
-                print(f"victim is={victim_id}  victim state is={victim_state}")
-
-                if victim_state == "up":
-                    evict_ok = False
-                    with Orchestrator._locks_ordered(victim_id):
-                        if slot.locked_by == victim_id and Orchestrator._registry[victim_id]["state"] == "up":
-                            victim_inst = Orchestrator._registry[victim_id]["instance"]
-                            victim_inst.sleep().wait()
-                            slot.transfer_lock(victim_id, model_id)
-                            Orchestrator._set_state(victim_id, "sleep")
-                            evict_ok = True
-                    if evict_ok:
-                        if os.environ.get("SP_DEMO_MODE") == "1":
-                            try:
-                                Orchestrator._move_sync(victim_id, "saved")
-                            except Exception as exc:
-                                print(f"[orchestrator] WARNING: demo-mode "
-                                      f"evict {victim_id} -> saved failed: {exc}")
-                                _console(f"WARNING: evict {victim_id} -> saved failed")
-                        inst.wake_up_weights().h2d().scatter().wake_up_kv_cache().wait()
-                        Orchestrator._set_state(model_id, announce_state or "up")
-                        return
-                    _console(f"{model_id}: victim {victim_id} changed, retrying")
+            # Phase 2: free enough HBM on home_gpu for this model's
+            # wake-up by evicting the oldest slotless `up` incumbents,
+            # but no more than necessary.
+            #
+            # HBM accounting (each level-L share == 1 / 2**(L-1) of the
+            # GPU):
+            #
+            #   slotted_others = sum of slot shares for every OTHER
+            #                    slotted model on home_gpu, regardless
+            #                    of state.  We use the slot share, not
+            #                    the live state, because slot allocation
+            #                    is what serialises wake-ups: a slotted
+            #                    `sleep` model whose Phase 3 is already
+            #                    in flight on the worker (queued behind
+            #                    ours) will be HBM-resident by the time
+            #                    our Phase 3 finishes, even though its
+            #                    registry state still reads "sleep".
+            #   new_share      = the slot we just took for this model;
+            #                    it will be resident at end of Phase 3.
+            #   slack          = 1.0 - slotted_others - new_share
+            #                  = HBM the buddy allocator hasn't handed
+            #                    out, available for slotless squatters.
+            #
+            # The buddy allocator already guarantees the sum of all
+            # slot shares on home_gpu is <= 1.0, so slack is >= 0.
+            # Slotless `up` squatters consume HBM but no slot, so they
+            # must fit inside `slack`.  Evict oldest-first until the
+            # remaining slotless share fits.
+            #
+            # Example (the case originally raised): an L2 wakes up on
+            # a GPU with two slotless L3 squatters (each 0.25), one
+            # slotless L2 squatter (0.5), and no other slotted models.
+            # new_share=0.5, slotted_others=0, slack=0.5.  Slotless
+            # total = 1.0; eviction stops as soon as the remaining
+            # slotless share is <= 0.5.  If the two L3s are oldest,
+            # both get evicted (frees 0.5) and the L2 squatter stays.
+            # Use ``slot.gpu_id`` as the source of truth for slotted
+            # residency on ``home_gpu`` -- it matches ``Slots._live``
+            # exactly.  ``entry["gpu"]`` is *not* reliable here: during a
+            # peer's migration its slot flips to the new GPU at line 624
+            # well before ``entry["gpu"]`` is updated (None during the
+            # checkpoint pass-through, then the new GPU after restore).
+            # A scan keyed on ``entry["gpu"] == home_gpu`` would therefore
+            # double-count peers whose slot has already moved away,
+            # driving ``slack`` negative and either tripping the assert
+            # below or starving Phase 3 of room.  Slotless residents
+            # don't migrate their slot (they have none), so falling back
+            # to ``entry["gpu"]`` for them is correct.
+            new_share = 1.0 / (1 << (level - 1))
+            slotted_others = 0.0
+            slotless_cands: list[tuple[float, str, float]] = []
+            for mid, e in Orchestrator._registry.items():
+                if mid == model_id:
                     continue
+                s = e.get("slot")
+                if s is not None:
+                    if s.gpu_id != home_gpu:
+                        continue
+                    slotted_others += 1.0 / (1 << (s.level - 1))
+                elif (e.get("gpu") == home_gpu
+                        and e.get("state") == "up"):
+                    e_share = 1.0 / (1 << (e["level"] - 1))
+                    slotless_cands.append(
+                        (e.get("state_since", 0.0), mid, e_share))
+            slack = 1.0 - slotted_others - new_share
+            assert slack >= -1e-9, (
+                f"HBM over-subscribed on GPU {home_gpu}: "
+                f"slotted_others={slotted_others}, new_share={new_share}")
+            slotless_cands.sort()
+            remaining = sum(share for _, _, share in slotless_cands)
+            for _, incumbent, share in slotless_cands:
+                if remaining <= slack + 1e-9:
+                    break
+                # Re-validate the candidate under its own lock before
+                # touching its instance.  The Phase 2 scan above is
+                # lock-free, so an incumbent we picked may have
+                # self-evacuated in the meantime (its own thread retreated
+                # from `up` to acquire a slot, leaving the child process
+                # CRIU-checkpointed).  Queuing a `sleep` on a checkpointed
+                # child raises "child pipe broken".
+                #
+                # Holding the incumbent's RLock across `_step_down` is
+                # safe because `_step_down` re-enters the same lock.
+                # Either branch decrements `remaining`: if we evicted, we
+                # freed `share`; if the incumbent self-evacuated, it
+                # already freed `share` on its own.
+                inc_entry = Orchestrator._registry[incumbent]
+                with Orchestrator._locks_ordered(incumbent):
+                    if (inc_entry.get("slot") is None
+                            and inc_entry.get("state") == "up"
+                            and inc_entry.get("gpu") == home_gpu):
+                        _console(f"{model_id}: evicting {incumbent} "
+                                 f"from GPU {home_gpu}")
+                        print(f"[orchestrator] {model_id}: evicting "
+                              f"{incumbent} from GPU {home_gpu}")
+                        Orchestrator._step_down(incumbent, "up", "sleep")
+                remaining -= share
 
-                _console(f"{model_id}: home GPU {home_gpu} busy, migrating")
-                print(f"[orchestrator] {model_id}: home GPU {home_gpu} busy, migrating")
-                t_mig = time.perf_counter()
-                slot.remove_sleeper(model_id)
-                inst.unpin().checkpoint().wait()
-                entry["gpu"] = None
-                Orchestrator._timing.migrate_s = time.perf_counter() - t_mig
-                Orchestrator._set_state(model_id, "wait")
-
-            # model_id lock released -- safe to acquire a slot which may
-            # evict arbitrary models (acquiring their locks in any order).
-            pool = Orchestrator._gpu_pool
-            _console(f"{model_id}: waiting for slot...")
-            print(f"[orchestrator] {model_id}: waiting for slot ...")
-            t_wait = time.perf_counter()
-            my_turn = pool.enqueue_waiter()
-            try:
-                while True:
-                    all_slots = list(pool.slots.values())
-
-                    free = GpuSlot.coldest_free_slot(all_slots)
-                    if free is not None and free.try_lock(model_id):
-                        Orchestrator._timing.gpu_wait_s = time.perf_counter() - t_wait
-                        _console(f"{model_id}: locked free GPU {free.gpu_id}")
-                        print(f"[orchestrator] {model_id}: locked free GPU {free.gpu_id}")
-                        gpu = free.gpu_id
-                        break
-
-                    preemptable = [
-                        s for s in all_slots
-                        if s.locked_by is not None
-                        and s.locked_by != model_id
-                        and Orchestrator._registry.get(s.locked_by, {}).get("state") == "up"
-                    ]
-                    if preemptable:
-                        victim_slot = min(preemptable, key=lambda s: s.last_event_ts)
-                        victim_id = victim_slot.locked_by
-                        evict_ok = False
-                        with Orchestrator._locks_ordered(victim_id):
-                            if (victim_slot.locked_by == victim_id
-                                    and Orchestrator._registry.get(victim_id, {}).get("state") == "up"):
-                                victim_inst = Orchestrator._registry[victim_id]["instance"]
-                                victim_inst.sleep().wait()
-                                victim_slot.transfer_lock(victim_id, model_id)
-                                Orchestrator._set_state(victim_id, "sleep")
-                                evict_ok = True
-                        if evict_ok:
-                            if os.environ.get("SP_DEMO_MODE") == "1":
-                                try:
-                                    Orchestrator._move_sync(victim_id, "saved")
-                                except Exception as exc:
-                                    print(f"[orchestrator] WARNING: demo-mode "
-                                          f"evict {victim_id} -> saved failed: {exc}")
-                                    _console(f"WARNING: evict {victim_id} -> saved failed")
-                            Orchestrator._timing.gpu_wait_s = time.perf_counter() - t_wait
-                            _console(f"{model_id}: evicted {victim_id}, locked GPU {victim_slot.gpu_id}")
-                            print(f"[orchestrator] {model_id}: evicted {victim_id}, locked GPU {victim_slot.gpu_id}")
-                            gpu = victim_slot.gpu_id
-                            break
-
-                    my_turn.wait(timeout=0.5)
-                    my_turn.clear()
-            finally:
-                pool.dequeue_waiter(my_turn)
-
+            # Phase 3: weights to HBM, announce up/running.
             with Orchestrator._locks_ordered(model_id):
-                new_slot = Orchestrator._gpus[gpu]
-                new_slot.add_sleeper(model_id)
-                _console(f"{model_id}: placed on GPU {gpu}")
-                print(f"[orchestrator] {model_id}: placed on GPU {gpu}")
-                entry["instance"].restore(gpu).repin().wait()
-                entry["gpu"] = gpu
-                Orchestrator._set_state(model_id, "sleep")
+                inst.wake_up_weights().load_weights().wake_up_kv_cache().wait()
+                Orchestrator._set_state(model_id, announce_state or "up")
+            return
+
+        raise AssertionError(
+            f"_step_up unexpected transition {from_state} -> {to_state}")
 
     @staticmethod
     def _step_down(model_id: str, from_state: str, to_state: str) -> None:
@@ -607,54 +774,43 @@ class Orchestrator:
 
         with Orchestrator._locks_ordered(model_id):
             if from_state == "up" and to_state == "sleep":
-                inst = entry["instance"]
-                inst.sleep().wait()
-                gpu = entry["gpu"]
-                slot = Orchestrator._gpus[gpu]
-                slot.unlock()
-                slot.add_sleeper(model_id)
-                Orchestrator._gpu_pool.notify_acquire_waiters()
+                entry["instance"].sleep().wait()
                 Orchestrator._set_state(model_id, "sleep")
+                return
 
-            elif from_state == "sleep" and to_state == "checkpoint":
-                if entry["state"] != "sleep":
-                    _console(f"{model_id}: eviction skipped (state={entry['state']})")
-                    print(f"[orchestrator] {model_id}: eviction skipped "
-                          f"(state={entry['state']})")
-                    return
-                inst = entry["instance"]
-                gpu = entry["gpu"]
-                slot = Orchestrator._gpus[gpu]
-                slot.remove_sleeper(model_id)
-                inst.unpin().checkpoint().wait()
+            if from_state == "sleep" and to_state == "checkpoint":
+                entry["instance"].unpin().checkpoint_cuda().wait()
+                if entry.get("slot") is not None:
+                    Slots.deallocate(entry["slot"])
+                    entry["slot"] = None
                 entry["gpu"] = None
                 Orchestrator._set_state(model_id, "checkpoint")
+                return
 
-            elif from_state == "checkpoint" and to_state == "saved":
-                inst = entry["instance"]
-                inst.teardown().wait().remove()
+            if from_state == "checkpoint" and to_state == "saved":
+                entry["instance"].teardown().wait().remove()
                 entry["instance"] = None
                 Orchestrator._set_state(model_id, "saved")
+                return
 
-            else:
-                raise AssertionError(
-                    f"_step_down unexpected transition {from_state} -> {to_state}")
+            raise AssertionError(
+                f"_step_down unexpected transition {from_state} -> {to_state}")
 
     # ------------------------------------------------------------------
     # generate
     # ------------------------------------------------------------------
 
     @staticmethod
-    def generate(model_id: str, prompts: list[str] | str,
-                 sampling_params: dict | int | None = None) -> Future:
-        """Submit a non-blocking generate.  Returns a Future[list].
+    def submit_generate(model_id: str, prompts: list[str] | str,
+                        sampling_params: dict | int | None = None
+                        ) -> tuple[int | None, Future | None]:
+        """Submit a non-blocking generate; returns ``(req_id, future)``.
 
-        *sampling_params* can be a dict, or an int shorthand for
-        ``{"max_tokens": N}``.
-
-        Automatically moves the model to **up** if needed, runs inference,
-        and leaves the model in **running** state until a waiter thread
-        detects all in-flight requests are done, then transitions to **up**.
+        Companion to :meth:`generate` for callers that need a stable
+        request id (e.g. the HTTP control plane) without racing on
+        ``_request_counter``.  Returns ``(None, None)`` when the model is
+        not registered, mirroring :meth:`generate`'s warn-and-skip
+        semantics.
         """
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -665,27 +821,30 @@ class Orchestrator:
         entry = Orchestrator._registry.get(model_id)
         if entry is None:
             _console(f"WARNING: model '{model_id}' is not registered, skipping generate")
-            return
+            return None, None
         _console(f"{model_id}: generate received")
         print(f"[orchestrator] generate  model_id={model_id}")
 
         with Orchestrator._request_lock:
-            if Orchestrator._request_counter == 0:
-                init_t0()
             ent = Orchestrator._registry[model_id]
             start_state = ent.get("state")
             req_id = Orchestrator._request_counter
             Orchestrator._request_counter += 1
+            t_submit = time.perf_counter()
             req_record = {
                 "req_id": req_id,
                 "model_id": model_id,
                 "state": "waiting",
                 "start_state": start_state,
-                "t_submit": time.perf_counter(),
+                "t_submit": t_submit,
                 "t_gen_start": None,
                 "t_done": None,
                 "prompt_tokens": None,
                 "completion_tokens": None,
+                # Timeline of (t_perf, model_state) pairs observed
+                # while this request is in flight.  Seeded with the
+                # model's state at submit; _set_state appends more.
+                "state_log": [(t_submit, start_state)] if start_state else [],
             }
             Orchestrator._request_log.append(req_record)
 
@@ -700,7 +859,41 @@ class Orchestrator:
         )
         Orchestrator._generate_futures.append(fut)
         Orchestrator._last_generate_future[model_id] = fut
+        return req_id, fut
+
+    @staticmethod
+    def generate(model_id: str, prompts: list[str] | str,
+                 sampling_params: dict | int | None = None) -> Future:
+        """Submit a non-blocking generate.  Returns a Future[list].
+
+        *sampling_params* can be a dict, or an int shorthand for
+        ``{"max_tokens": N}``.
+
+        Automatically moves the model to **up** if needed, runs inference,
+        and leaves the model in **running** state until a waiter thread
+        detects all in-flight requests are done, then transitions to **up**.
+        """
+        _, fut = Orchestrator.submit_generate(model_id, prompts, sampling_params)
         return fut
+
+    @staticmethod
+    def generate_all(prompts: list[str] | str,
+                     sampling_params: dict | int | None = None
+                     ) -> list[int]:
+        """Fan out :meth:`generate` (same prompts) to every registered model.
+
+        Returns the list of server-assigned ``req_id``s, one per model in
+        registry insertion order, mirroring how :meth:`move_all` fans out.
+        Each per-model submit goes through the standard generate
+        pipeline, so the futures are independent and run concurrently.
+        """
+        req_ids: list[int] = []
+        for mid in list(Orchestrator._registry):
+            req_id, _fut = Orchestrator.submit_generate(
+                mid, prompts, sampling_params)
+            if req_id is not None:
+                req_ids.append(req_id)
+        return req_ids
 
     @staticmethod
     def _generate_sync(model_id: str, prompts: list[str],
@@ -845,8 +1038,17 @@ class Orchestrator:
                     if not inflight and inst._pending_count == 0:
                         Orchestrator._waiter_active[model_id] = False
                         inst._external_waiter = False
-                        Orchestrator._set_state(model_id, "up")
-                        Orchestrator._gpu_pool.notify_acquire_waiters()
+                        # Mutate slot + state under the model's _lock so
+                        # concurrent Phase 2 scans on other models
+                        # cannot observe a torn (slot=None, state=running)
+                        # snapshot that drops this model from HBM
+                        # accounting.  Lock order matches the rest of
+                        # the orchestrator: gen_lock -> _lock.
+                        with Orchestrator._locks_ordered(model_id):
+                            if entry.get("slot") is not None:
+                                Slots.deallocate(entry["slot"])
+                                entry["slot"] = None
+                            Orchestrator._set_state(model_id, "up")
                         return
                 continue
 
@@ -914,8 +1116,15 @@ class Orchestrator:
                 if not inflight and inst._pending_count == 0:
                     Orchestrator._waiter_active[model_id] = False
                     inst._external_waiter = False
-                    Orchestrator._set_state(model_id, "up")
-                    Orchestrator._gpu_pool.notify_acquire_waiters()
+                    # See comment in the timeout branch above: take the
+                    # model's _lock so the slot release + state flip is
+                    # atomic from the perspective of other models'
+                    # Phase 2 scans.
+                    with Orchestrator._locks_ordered(model_id):
+                        if entry.get("slot") is not None:
+                            Slots.deallocate(entry["slot"])
+                            entry["slot"] = None
+                        Orchestrator._set_state(model_id, "up")
                     return
 
     # ------------------------------------------------------------------
@@ -923,18 +1132,24 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def remove(model_id: str | None = None) -> None:
+    def remove_all() -> None:
+        """Fan out :meth:`remove` to every registered model."""
+        for mid in list(Orchestrator._registry):
+            Orchestrator.remove(mid)
+
+    @staticmethod
+    def remove(model_id: str) -> None:
         """Delete a model's image and remove it from the registry.
 
-        Auto-transitions to **saved** if needed.  Pass *None* to remove all.
+        Auto-transitions to **saved** if needed.  Use :meth:`remove_all`
+        to delete every registered model.
         """
-        if model_id is None:
-            for mid in list(Orchestrator._registry):
-                Orchestrator.remove(mid)
-            return
         entry = Orchestrator._registry.get(model_id)
         if entry is None:
-            raise KeyError(f"model '{model_id}' is not registered")
+            msg = f"{model_id}: not registered, skipping remove"
+            _console(msg)
+            print(f"[orchestrator] WARNING: {msg}")
+            return
         _console(f"{model_id}: remove received")
         prev = Orchestrator._futures.get(model_id)
         prev_gen = Orchestrator._last_generate_future.pop(model_id, None)
@@ -969,28 +1184,36 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def wait(model_id: str | None = None) -> None:
-        """Block until futures complete.  None = wait on all."""
-        label = model_id or "all"
-        print(f"[orchestrator] wait  model_id={label}")
+    def wait_all() -> None:
+        """Block until every pending move/generate future completes."""
+        print(f"[orchestrator] wait  model_id=all")
         t0 = time.perf_counter()
-        if model_id is not None:
-            fut = Orchestrator._futures.get(model_id)
-            if fut is not None:
+        for fut in list(Orchestrator._futures.values()):
+            fut.result()
+        gen_futs = list(Orchestrator._generate_futures)
+        Orchestrator._generate_futures = []
+        for fut in gen_futs:
+            try:
                 fut.result()
-            gen_fut = Orchestrator._last_generate_future.get(model_id)
-            if gen_fut is not None:
-                gen_fut.result()
-        else:
-            for fut in list(Orchestrator._futures.values()):
-                fut.result()
-            gen_futs = list(Orchestrator._generate_futures)
-            Orchestrator._generate_futures = []
-            for fut in gen_futs:
-                try:
-                    fut.result()
-                except Exception:
-                    pass
+            except Exception:
+                pass
+        elapsed = time.perf_counter() - t0
+        print(f"[orchestrator] wait done  ({elapsed:.1f}s)")
+
+    @staticmethod
+    def wait(model_id: str) -> None:
+        """Block until pending futures for *model_id* complete.
+
+        Use :meth:`wait_all` to wait on every pending future.
+        """
+        print(f"[orchestrator] wait  model_id={model_id}")
+        t0 = time.perf_counter()
+        fut = Orchestrator._futures.get(model_id)
+        if fut is not None:
+            fut.result()
+        gen_fut = Orchestrator._last_generate_future.get(model_id)
+        if gen_fut is not None:
+            gen_fut.result()
         elapsed = time.perf_counter() - t0
         print(f"[orchestrator] wait done  ({elapsed:.1f}s)")
 
@@ -1008,17 +1231,16 @@ class Orchestrator:
         _console(f"\nOrchestrator  image_cache={Orchestrator._image_cache}")
 
         try:
-            out = subprocess.check_output(
-                ["nvidia-smi",
-                 "--query-gpu=index,name,memory.used,memory.total",
-                 "--format=csv,noheader,nounits"],
-                text=True,
-            )
+            pynvml.nvmlInit()
             _console(f"\nGPUs ({len(Orchestrator._gpu_ids)}):")
-            for line in out.strip().splitlines():
-                idx, name, used_mib, total_mib = (x.strip() for x in line.split(","))
-                used = int(used_mib) / 1024
-                total = int(total_mib) / 1024
+            for idx in range(pynvml.nvmlDeviceGetCount()):
+                h = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                name = pynvml.nvmlDeviceGetName(h)
+                if isinstance(name, bytes):
+                    name = name.decode()
+                m = pynvml.nvmlDeviceGetMemoryInfo(h)
+                used = m.used / (1 << 30)
+                total = m.total / (1 << 30)
                 free = total - used
                 _console(f"  GPU {idx}: {name}  "
                          f"{used:.1f} / {total:.1f} GiB used  "
@@ -1032,21 +1254,24 @@ class Orchestrator:
 
         pid_gpu_mib: dict[int, int] = {}
         try:
-            out = subprocess.check_output(
-                ["nvidia-smi",
-                 "--query-compute-apps=pid,used_gpu_memory",
-                 "--format=csv,noheader,nounits"],
-                text=True,
-            )
-            for line in out.strip().splitlines():
-                parts = line.split(",")
-                if len(parts) == 2:
-                    pid_gpu_mib[int(parts[0].strip())] = int(parts[1].strip())
+            pynvml.nvmlInit()
+            _NVML_NOT_AVAILABLE = 0xFFFFFFFFFFFFFFFF
+            for idx in range(pynvml.nvmlDeviceGetCount()):
+                h = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                try:
+                    procs = pynvml.nvmlDeviceGetComputeRunningProcesses(h)
+                except Exception:
+                    continue
+                for p in procs:
+                    used = getattr(p, "usedGpuMemory", None)
+                    if used is None or used == _NVML_NOT_AVAILABLE:
+                        continue
+                    pid_gpu_mib[p.pid] = pid_gpu_mib.get(p.pid, 0) + int(used // (1 << 20))
         except Exception:
             pass
 
         sorted_models = sorted(Orchestrator._registry.items(),
-                               key=lambda item: item[1].get("pinned_bytes", 0),
+                               key=lambda item: item[1].get("pinned_cpu_bytes", 0),
                                reverse=True)
         max_id = max(len(mid) for mid in Orchestrator._registry)
         _console(f"\nModels ({len(Orchestrator._registry)}):")
@@ -1055,8 +1280,8 @@ class Orchestrator:
             inst = entry["instance"]
             gpu = entry.get("gpu")
             gpu_str = f"  gpu={gpu}" if gpu is not None else ""
-            pinned = entry.get("pinned_bytes", 0)
-            pinned_str = f"  pinned={pinned / 2**30:.1f} GiB" if pinned and state != "saved" else ""
+            pinned = entry.get("pinned_cpu_bytes", 0)
+            pinned_str = f"  pinned_cpu={pinned / 2**30:.1f} GiB" if pinned and state != "saved" else ""
             gpu_mem_str = ""
             if inst is not None and inst.pid and inst.pid in pid_gpu_mib:
                 gpu_mem_str = f"  memory={pid_gpu_mib[inst.pid] / 1024:.1f} GiB"

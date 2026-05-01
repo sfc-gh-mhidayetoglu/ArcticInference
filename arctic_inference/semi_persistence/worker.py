@@ -10,6 +10,7 @@ Result protocol:   (cmd, elapsed, error, info)
 """
 import json, os, subprocess, sys, time, ctypes, threading, queue, struct
 
+import pynvml
 import torch.multiprocessing as mp
 
 # ---------------------------------------------------------------------------
@@ -137,10 +138,15 @@ def _worker_checkpoint(child_pid, unlock=True):
 
 
 def _gpu_uuids():
-    """Return list of GPU UUID strings from nvidia-smi."""
-    return [u.strip() for u in subprocess.check_output(
-        ["nvidia-smi", "--query-gpu=gpu_uuid", "--format=csv,noheader"],
-        text=True).strip().splitlines()]
+    """Return list of GPU UUID strings (e.g. 'GPU-<uuid>') via NVML."""
+    pynvml.nvmlInit()
+    uuids = []
+    for i in range(pynvml.nvmlDeviceGetCount()):
+        u = pynvml.nvmlDeviceGetUUID(pynvml.nvmlDeviceGetHandleByIndex(i))
+        if isinstance(u, bytes):
+            u = u.decode()
+        uuids.append(u)
+    return uuids
 
 
 def _build_full_device_map(old_gpu, new_gpu):
@@ -536,7 +542,7 @@ def _child_thread(rank, child_pid, pipe,
             _tlog("exited")
             break
 
-        if cmd == "checkpoint":
+        if cmd == "checkpoint_cuda":
             _drain_pipe_generates()
             t0 = time.perf_counter()
             error = None
@@ -548,11 +554,11 @@ def _child_thread(rank, child_pid, pipe,
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
             elapsed = time.perf_counter() - t0
-            _tlog(f"<<< checkpoint {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
+            _tlog(f"<<< checkpoint_cuda {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
             _emit_result(cmd, elapsed, error, info)
             continue
 
-        if cmd == "restore":
+        if cmd == "restore_cuda":
             t0 = time.perf_counter()
             error = None
             target_gpu = kwargs["gpu"]
@@ -602,11 +608,11 @@ def _child_thread(rank, child_pid, pipe,
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
             elapsed = time.perf_counter() - t0
-            _tlog(f"<<< restore {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
+            _tlog(f"<<< restore_cuda {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
             _emit_result(cmd, elapsed, error, info)
             continue
 
-        if cmd == "save":
+        if cmd == "save_image":
             _drain_pipe_generates()
             t0 = time.perf_counter()
             error = None
@@ -644,7 +650,7 @@ def _child_thread(rank, child_pid, pipe,
                 import traceback; traceback.print_exc()
                 error = f"{type(e).__name__}: {e}"
             elapsed = time.perf_counter() - t0
-            _tlog(f"<<< save {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
+            _tlog(f"<<< save_image {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
             _emit_result(cmd, elapsed, error, info)
             try:
                 pipe.close()
@@ -750,7 +756,7 @@ def worker_loop(rank, cmd_queue, result_queue, completed_counter):
             child_queue.put((cmd, kwargs))
             continue
 
-        if cmd == "load":
+        if cmd == "load_image":
             t0 = time.perf_counter()
             error = None
             info = {}
@@ -804,8 +810,8 @@ def worker_loop(rank, cmd_queue, result_queue, completed_counter):
                 import traceback; traceback.print_exc()
                 error = f"{type(e).__name__}: {e}"
             elapsed = time.perf_counter() - t0
-            _wlog(f"<<< load {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
-            result_queue.put(("load", elapsed, error, info))
+            _wlog(f"<<< load_image {'OK' if error is None else 'FAILED'} ({elapsed:.3f}s)")
+            result_queue.put(("load_image", elapsed, error, info))
             with completed_counter.get_lock():
                 completed_counter.value += 1
             continue

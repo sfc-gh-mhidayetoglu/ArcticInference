@@ -49,7 +49,7 @@ if __name__ == "__main__":
     Orchestrator.register("qwen3.5-35b-a3b-gptq-int4", vllm_config_14)
     Orchestrator.register("qwen3.5-27b-gptq-int4",     vllm_config_15)
 
-    Orchestrator.wait()
+    Orchestrator.wait_all()
     Orchestrator.print_status()
 
     prompt = "Explain the theory of relativity in one sentence."
@@ -71,7 +71,7 @@ if __name__ == "__main__":
     Orchestrator.generate("qwen3.5-35b-a3b-gptq-int4", [prompt], params)
     Orchestrator.generate("qwen3.5-27b-gptq-int4",     [prompt], params)
 
-    Orchestrator.wait()
+    Orchestrator.wait_all()
     Orchestrator.print_status()
 
     from time import sleep
@@ -105,10 +105,10 @@ if __name__ == "__main__":
     sleep(2)
     Orchestrator.generate("qwen3.5-27b-gptq-int4",     [prompt], params)
 
-    Orchestrator.wait()
+    Orchestrator.wait_all()
     Orchestrator.print_status()
 
-    Orchestrator.remove()
+    Orchestrator.remove_all()
 
-    Orchestrator.wait()
+    Orchestrator.wait_all()
     Orchestrator.print_status()

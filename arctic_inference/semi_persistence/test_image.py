@@ -10,7 +10,7 @@ def main():
 
     if cache_hit:
         print(f"[test] cache HIT — loading from {IMAGE_CACHE}")
-        inst.load(IMAGE_CACHE).wait().print_status()
+        inst.load_image(IMAGE_CACHE).wait().print_status()
     else:
         print(f"[test] cache MISS — cold-starting on gpu=0, saving image")
         inst.init(gpu=2).wait().print_status()
@@ -19,20 +19,19 @@ def main():
         inst.stage().wait().print_status()
         inst.unpin().wait().print_status()
         inst.sleep().wait().print_status()
-        inst.checkpoint().wait().print_status()
-        inst.save(IMAGE_CACHE).wait().print_status()
+        inst.checkpoint_cuda().wait().print_status()
+        inst.save_image(IMAGE_CACHE).wait().print_status()
         print(f"[test] image saved — continuing with same instance")
 
-    inst.restore(gpu=3).wait().print_status()
+    inst.restore_cuda(gpu=3).wait().print_status()
     inst.wake_up_weights().wait().print_status()
     inst.repin().wait().print_status()
-    inst.h2d().wait().print_status()
-    inst.scatter().wait().print_status()
+    inst.load_weights().wait().print_status()
     inst.wake_up_kv_cache().wait().print_status()
     inst.generate(["Hello, world!"],{}).wait().print_status()
     inst.unpin().wait().print_status()
     inst.sleep().wait().print_status()
-    inst.checkpoint().wait().print_status()
+    inst.checkpoint_cuda().wait().print_status()
 
     inst.teardown().wait().remove()
 
