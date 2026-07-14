@@ -20,12 +20,40 @@ import json
 from dataclasses import dataclass, fields
 
 from vllm.config import ParallelConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.utils import is_init_field
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
+from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from arctic_inference.patching import ArcticPatch
 from arctic_inference.vllm.config import ArcticParallelConfig
+
+logger = init_logger(__name__)
+
+
+def _maybe_force_piecewise_for_fca(vllm_config) -> None:
+    """Force cudagraph_mode down to PIECEWISE when Forest Cascade Attention is
+    configured.
+
+    FCA only fires under piecewise cudagraphs -- its per-batch gate requires
+    ``not use_full_cuda_graph`` -- so any full-cudagraph mode would silently
+    disable FCA. With shift parallelism it would also dispatch full graphs the
+    shift model never captured. Downgrading here (base + shift, at engine-config
+    creation) keeps the behavior correct and crash-free. An explicit NONE or
+    PIECEWISE mode is preserved; only full modes are downgraded.
+    """
+    if getattr(vllm_config, "_forest_cascade_attn_config", None) is None:
+        return
+    cc = vllm_config.compilation_config
+    cg = cc.cudagraph_mode
+    if cg is not None and cg.has_full_cudagraphs():
+        logger.warning(
+            "Forest Cascade Attention is configured; forcing cudagraph_mode "
+            "%s -> PIECEWISE so FCA can fire (FCA is disabled under full "
+            "cudagraphs).", cg,
+        )
+        cc.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
 
 @dataclass
@@ -175,6 +203,8 @@ class EngineArgsPatch(ArcticPatch[EngineArgs]):
         else:
             vllm_config._forest_cascade_attn_config = None
 
+        _maybe_force_piecewise_for_fca(vllm_config)
+
         return vllm_config
 
 
@@ -230,5 +260,7 @@ class AsyncEngineArgsPatch(ArcticPatch[AsyncEngineArgs]):
             vllm_config._forest_cascade_attn_config = fca_cfg
         else:
             vllm_config._forest_cascade_attn_config = None
+
+        _maybe_force_piecewise_for_fca(vllm_config)
 
         return vllm_config

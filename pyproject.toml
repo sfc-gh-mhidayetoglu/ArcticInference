@@ -5,10 +5,11 @@ requires = [
     "ninja",
     "cmake>=3.12",
     "nanobind==2.9.2",
-    # uv pip install vllm==0.9.1 --dry-run 2>&1 | grep protobuf | sed 's/^ + //'
-    "protobuf==5.29.5",
+    # uv pip install vllm==0.24.0 --dry-run 2>&1 | grep protobuf | sed 's/^ + //'
+    # vllm 0.24.0 requires protobuf>=5.29.6
+    "protobuf==5.29.6",
     "grpcio-tools",
-    "torch==2.10.0", # need to be same as user env.
+    "torch==2.11.0", # need to be same as user env (vllm 0.24.0 pins torch==2.11.0).
 ]
 build-backend = "setuptools.build_meta"
 
@@ -50,7 +51,7 @@ packages = [
 
 [project.optional-dependencies]
 vllm = [
-    'vllm==0.18.0',
+    'vllm==0.24.0',
 ]
 
 docs = [

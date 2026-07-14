@@ -46,11 +46,17 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
     """Patch AsyncScheduler to:
     1. Respect ``disable_by_batch_size`` when allocating spec token
        placeholders (the worker only drafts for the first N requests).
-    2. Use the previous step's actual draft length for dynamic placeholder
+    2. Respect ``hard_disable_by_batch_size``: when the running batch is at
+       or above the hard cap the worker drafts for nobody, so we allocate
+       zero spec placeholders for every request.  This keeps the verify
+       batch a clean 1-token-per-request uniform decode (no wasted
+       verification on never-accepted placeholder tokens, and a
+       prerequisite for FULL cudagraph dispatch in the hard-off region).
+    3. Use the previous step's actual draft length for dynamic placeholder
        allocation, avoiding wasted verification compute when the real draft
        width (e.g. Arctic n_predict=3) is much smaller than
        num_speculative_tokens (e.g. 12).
-    3. Store ``_scheduled_spec_count`` so that the post-fix in
+    4. Store ``_scheduled_spec_count`` so that the post-fix in
        ``update_from_output`` can compensate for worker-side trimming.
     """
 
@@ -70,6 +76,18 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
         disable_bs = (
             spec_config.disable_by_batch_size if spec_config else None
         )
+        # Hard gate: when the batch is at/above hard_disable_by_batch_size
+        # the worker drafts for nobody (effective_draft_limit == 0).  Mirror
+        # that here by allocating zero spec placeholders for every request so
+        # the next verify step is a uniform 1-token-per-request decode,
+        # matching the worker's hard gate in propose_draft_token_ids.
+        # ``num_scheduled_tokens`` covers the same requests the worker sees
+        # as ``len(input_batch.req_ids)``.
+        batch_size = len(scheduler_output.num_scheduled_tokens)
+        hard_off = (
+            spec_config is not None
+            and spec_config.effective_draft_limit(batch_size) == 0
+        )
         decode_with_spec_count = 0
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
@@ -87,6 +105,12 @@ class AsyncSchedulerPatch(ArcticPatch[AsyncScheduler]):
             request._scheduled_spec_count = cur_num_spec_tokens
 
             request.num_output_placeholders += 1 + cur_num_spec_tokens
+
+            # Hard gate active: allocate no spec placeholders so this
+            # request contributes exactly 1 token to the verify batch.
+            if hard_off:
+                request.spec_token_ids = []
+                continue
 
             decode_with_spec_count += 1
             if disable_bs and decode_with_spec_count > disable_bs:

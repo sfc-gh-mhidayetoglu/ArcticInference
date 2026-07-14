@@ -1,14 +1,14 @@
---- /home/yak/myenv_v14/lib/python3.12/site-packages/vllm/sampling_params.py	2026-01-31 22:11:45.180329435 +0000
-+++ sampling_params.py	2026-01-31 22:16:23.000000000 +0000
-@@ -124,6 +124,7 @@
+--- a/vllm/sampling_params.py
++++ b/vllm/sampling_params.py
+@@ -211,6 +211,7 @@
      """
  
      n: int = 1
 +    max_tokens_n: list[int] | None = None
      """Number of outputs to return for the given prompt request.
  
-     NOTE:
-@@ -250,6 +251,7 @@
+     The maximum allowed value is controlled by the ``VLLM_MAX_N_SEQUENCES``
+@@ -355,6 +356,7 @@
      @staticmethod
      def from_optional(
          n: int | None = 1,
@@ -16,7 +16,7 @@
          presence_penalty: float | None = 0.0,
          frequency_penalty: float | None = 0.0,
          repetition_penalty: float | None = 1.0,
-@@ -289,6 +291,7 @@
+@@ -394,6 +396,7 @@
  
          return SamplingParams(
              n=1 if n is None else n,

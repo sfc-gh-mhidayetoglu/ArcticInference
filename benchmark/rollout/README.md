@@ -1,8 +1,11 @@
-## Rollout Replay Patch for v0.14.1
+## Rollout Replay Patch for v0.24.0
 
-This patch extencds SamplingParams to specify the length of each sequence when n > 1.
+This patch extends SamplingParams to specify the length of each sequence when n > 1.
 
 The patch is applied as `source patch_sampling.sh`.
+
+> Requests that do not set `max_tokens_n` are unaffected (normal `max_tokens`
+> behavior and child-param caching are preserved).
 
 As a result, you can specify `max_tokens_n` as a list in sampling params and set `ignore_eos` so that each sequence generates exactly specified number of tokens.
 

@@ -462,7 +462,7 @@ class UlyssesCudagraphDispatcher(ArcticPatch[CudagraphDispatcher]):
     _orig_initialize_cudagraph_keys = CudagraphDispatcher.initialize_cudagraph_keys
 
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode,
-                                  uniform_decode_query_len: int):
+                                  uniform_decode_query_len: int = 1):
         self._orig_initialize_cudagraph_keys(cudagraph_mode, uniform_decode_query_len)
 
         # sp_group = getattr(parallel_state, "_SP", None)

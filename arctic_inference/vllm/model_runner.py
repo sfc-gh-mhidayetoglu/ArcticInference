@@ -17,6 +17,7 @@ import contextlib
 import copy
 import gc
 import time
+from dataclasses import replace
 from typing import Any, Optional, TYPE_CHECKING, Union
 
 import numpy as np
@@ -36,6 +37,7 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.model_executor.model_loader import get_model
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up, cdiv
+from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput,
                               SamplerOutput, AsyncModelRunnerOutput)
@@ -159,7 +161,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     (self.max_num_reqs, self.num_spec_tokens),
                     dtype=torch.int64,
                     device="cpu",
-                    pin_memory=self.pin_memory,
+                    pin_memory=PIN_MEMORY,
                 )
 
             if (self.use_async_scheduling
@@ -171,7 +173,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                         self.max_num_reqs,
                         dtype=torch.int64,
                         device="cpu",
-                        pin_memory=self.pin_memory,
+                        pin_memory=PIN_MEMORY,
                     )
 
             if get_pp_group().is_last_rank:
@@ -209,7 +211,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 (self.max_num_reqs, max_gen_len),
                 dtype=torch.int64,
                 device="cpu",
-                pin_memory=self.pin_memory,
+                pin_memory=PIN_MEMORY,
             )
             # Pinned buffer for suffix merge results.  Using pinned memory
             # for H2C copies avoids the implicit default-stream
@@ -221,7 +223,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 (self.max_num_reqs, self.num_spec_tokens),
                 dtype=torch.int64,
                 device="cpu",
-                pin_memory=self.pin_memory,
+                pin_memory=PIN_MEMORY,
             )
 
         # Pre-allocated GPU buffer for the merged draft tensor.
@@ -243,7 +245,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         if self._suffix_cache is not None and self.use_async_scheduling:
             self._suffix_index_pinned = torch.empty(
                 self.max_num_reqs, dtype=torch.long,
-                device="cpu", pin_memory=self.pin_memory,
+                device="cpu", pin_memory=PIN_MEMORY,
             )
 
         # Per-request response tokens for suffix pattern building in async
@@ -499,16 +501,28 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
             if create_mixed_batch:
-                seq_lens_list = [1] * num_decode_tokens + [num_prefill_tokens + 1]
+                seq_lens = torch.tensor(
+                    [1] * num_decode_tokens + [num_prefill_tokens + 1],
+                    dtype=torch.int,
+                )
             else:
-                seq_lens_list = [max_query_len] * num_reqs  # simplified
+                seq_lens = max_query_len
 
-            self.seq_lens.np[:num_reqs] = seq_lens_list
-            self.seq_lens.np[num_reqs:] = 0
-            self.seq_lens.copy_to_gpu()
+            # v0.24: self.seq_lens is now a plain GPU tensor staged through
+            # self.optimistic_seq_lens_cpu (the .np/.copy_to_gpu buffer wrapper
+            # was removed for seq_lens).
+            self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
+            self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+            self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
 
-            cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+            # v0.24: _get_cumsum_and_arange now requires an arange_out buffer
+            # (writes the batched arange into it) and returns only the cumsum
+            # (previously a (cumsum, arange) tuple).
+            cum_num_tokens = self._get_cumsum_and_arange(
+                num_scheduled_tokens, self.query_pos.np)
             self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
+            self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1].fill(
+                cum_num_tokens[-1])
             self.query_start_loc.copy_to_gpu()
 
             pad_attn = (cudagraph_runtime_mode == CUDAGraphMode.FULL)
@@ -546,7 +560,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
 
-            positions = self.positions.gpu[:num_tokens_padded]
+            positions = self.positions[:num_tokens_padded]  # v0.24: plain tensor
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
 
@@ -555,7 +569,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 if self.intermediate_tensors is None:
                     self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
                         batch_size=self.max_num_tokens, dtype=self.model_config.dtype, device=self.device)
-                intermediate_tensors = self.sync_and_slice_intermediate_tensors(num_tokens_padded, None, False)
+                intermediate_tensors = self.sync_and_gather_intermediate_tensors(num_tokens_padded, None, False)
 
             target_num_tokens = num_tokens_padded
             if ubatch_slices_padded is not None:
@@ -639,6 +653,15 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             and num_scheduled_tokens <= int(getattr(self, "shift_parallel_threshold", 0))
         )
 
+        # Remember which model ran this step so sample_tokens -- where the final
+        # ModelRunnerOutput / CUDAGraphStat is actually built -- can tag it.
+        # (execute_model only returns an ExecuteModelState here.)
+        self._arctic_shift_enabled = (
+            getattr(self, "use_ulysses", False)
+            and getattr(self, "shift_model", None) is not None
+        )
+        self._arctic_used_shift_model = use_shift_model
+
         if not use_shift_model:
             return self._orig_execute_model(scheduler_output, intermediate_tensors)
 
@@ -660,6 +683,28 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self._fix_shift_logits_ordering()
 
         return result
+
+    def _tag_cudagraph_stat_model(self, cudagraph_stats):
+        """Return a copy of ``cudagraph_stats`` whose ``runtime_mode`` is
+        annotated with which model (``base`` / ``shift``) executed this step,
+        so per-step cudagraph metrics show it (e.g. ``PIECEWISE shift``).
+
+        No-op (returns the input unchanged) when shift parallelism is disabled,
+        no stat was produced (cudagraph metrics off), or the per-step flag was
+        never stashed. ``CUDAGraphStat`` is frozen, hence the replaced copy.
+        """
+        if cudagraph_stats is None or not getattr(
+                self, "_arctic_shift_enabled", False):
+            return cudagraph_stats
+        tag = "shift" if getattr(self, "_arctic_used_shift_model",
+                                 False) else "base"
+        try:
+            return replace(
+                cudagraph_stats,
+                runtime_mode=f"{cudagraph_stats.runtime_mode} {tag}",
+            )
+        except Exception:
+            return cudagraph_stats
 
     def _compute_shift_logits_perm(self):
         """Compute permutation to fix logits after all-gather for the shift model.
@@ -797,7 +842,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         logits: torch.Tensor | None,
         hidden_states: torch.Tensor,
         num_scheduled_tokens: int,
-        spec_decode_metadata: SpecDecodeMetadata | None,
     ):
         """Wrap base _bookkeeping_sync to handle arctic async spec decode.
 
@@ -813,7 +857,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
              assertion is skipped.  The real value will be written by
              _copy_valid_sampled_token_count inside propose_draft_token_ids
              (fits case) or sample_tokens (not-fits case).
+
+        v0.24: ``spec_decode_metadata`` is no longer passed as an argument
+        (the base signature dropped it and the return became a 7-tuple).
+        We read it from the value stashed by our ``sample_tokens`` override.
         """
+        spec_decode_metadata = getattr(
+            self, "_arctic_spec_decode_metadata", None)
         sampled_token_ids = sampler_output.sampled_token_ids
         if (self.use_async_scheduling
                 and self.speculative_config is not None
@@ -834,7 +884,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         return self._orig_bookkeeping_sync(
             scheduler_output, sampler_output, logits, hidden_states,
-            num_scheduled_tokens, spec_decode_metadata)
+            num_scheduled_tokens)
 
     def propose_draft_token_ids(
         self,
@@ -1286,6 +1336,16 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        # Tag the step's cudagraph stat with base/shift (set in execute_model)
+        # so the per-step metrics line shows which model ran.
+        cudagraph_stats = self._tag_cudagraph_stat_model(cudagraph_stats)
+
+        # v0.24: the base ``_bookkeeping_sync`` no longer accepts
+        # ``spec_decode_metadata`` as an argument.  Stash it on ``self`` so
+        # our ``_bookkeeping_sync`` override can still gate the arctic async
+        # spec-decode path on it.
+        self._arctic_spec_decode_metadata = spec_decode_metadata
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(
@@ -1609,7 +1669,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
-                spec_decode_metadata,
             )
 
         # (C) Non-async drafting: run after bookkeeping.
@@ -1755,8 +1814,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             logger.info("Reloading drafter (spec model) weights...")
             drafter.load_model(self.model)
 
-    def initialize_kv_cache(self, kv_cache_config) -> None:
-        self._orig_initialize_kv_cache(kv_cache_config)
+    def initialize_kv_cache(
+        self, kv_cache_config, is_profiling: bool = False
+    ) -> None:
+        self._orig_initialize_kv_cache(kv_cache_config, is_profiling)
         shift_ctx = getattr(self, 'shift_forward_context', None)
         if shift_ctx is None:
             return
@@ -1862,6 +1923,79 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             cc.max_cudagraph_capture_size = saved_max
             disp._bs_to_padded_graph_size = saved_table
 
+    def _shift_capture_descriptors(self, cudagraph_runtime_mode):
+        """Build the shift model's cudagraph batch descriptors for a given
+        runtime mode, matching exactly what runtime ``dispatch()`` and key
+        registration produce.
+
+        Must be called inside ``_use_shift_cudagraph_tables()`` so that
+        ``_create_padded_batch_descriptor`` pads using the shift (unscaled)
+        size table.  Descriptors are returned largest-first for capture memory
+        efficiency (large shapes reuse the memory pool for smaller ones).
+
+        - PIECEWISE: relaxed keys (``num_reqs=None, uniform=False``) over all
+          shift capture sizes, mirroring the mixed-mode branch of base
+          ``CudagraphDispatcher.initialize_cudagraph_keys``.
+        - FULL: exact uniform-decode keys, restricted to the decode-eligible
+          size subset (``uniform_decode_query_len <= bs <=
+          uniform_decode_query_len * max_num_seqs``), mirroring base's
+          ``cudagraph_capture_sizes_for_decode``.
+        """
+        disp = getattr(self, 'cudagraph_dispatcher', None)
+        if disp is None or cudagraph_runtime_mode not in (
+                CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL):
+            return []
+
+        shift_sizes = self.vllm_config._shift_cudagraph_capture_sizes or []
+        sizes = sorted({int(bs) for bs in shift_sizes}, reverse=True)
+
+        if cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            max_decode_tokens = (self.uniform_decode_query_len
+                                 * self.scheduler_config.max_num_seqs)
+            sizes = [bs for bs in sizes
+                     if self.uniform_decode_query_len <= bs <= max_decode_tokens]
+
+        lora_cases = disp._get_lora_cases()
+        descriptors = []
+        for bs in sizes:
+            for num_active_loras in lora_cases:
+                if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+                    desc = disp._create_padded_batch_descriptor(
+                        bs, False, num_active_loras > 0, num_active_loras
+                    )
+                    desc = replace(desc, num_reqs=None, uniform=False)
+                else:  # FULL (uniform decode) — exact match required.
+                    desc = disp._create_padded_batch_descriptor(
+                        bs, True, num_active_loras > 0, num_active_loras
+                    )
+                descriptors.append(desc)
+        return descriptors
+
+    def _register_shift_cudagraph_keys(self, batch_descriptors,
+                                       cudagraph_runtime_mode):
+        """Register cudagraph dispatch keys for the shift model so runtime
+        dispatch finds the graphs captured for the shift model.
+
+        Base vLLM only registers keys for the base (scaled) capture sizes in
+        ``CudagraphDispatcher.initialize_cudagraph_keys``. The shift model
+        captures a separate, unscaled size table, so those keys must be added
+        explicitly.
+
+        ``batch_descriptors`` must be the final descriptors produced by
+        ``_shift_capture_descriptors`` (the same list passed to
+        ``_orig_capture_cudagraphs``), so capture-key == registered-key ==
+        runtime-dispatch-key.  Must run inside ``_use_shift_cudagraph_tables()``
+        so the dispatcher's padded-size lookup matches what ``dispatch()``
+        computes for shift batches at runtime.
+        """
+        disp = getattr(self, 'cudagraph_dispatcher', None)
+        # add_cudagraph_key only accepts PIECEWISE / FULL.
+        if disp is None or cudagraph_runtime_mode not in (
+                CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL):
+            return
+        for desc in batch_descriptors:
+            disp.add_cudagraph_key(cudagraph_runtime_mode, desc)
+
     def _capture_cudagraphs(
         self,
         batch_descriptors: list[BatchDescriptor],
@@ -1908,59 +2042,129 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             )
 
         # --- Shift model (SP*TP fused as TP-only): uses the unscaled lookup table ---
-        # The incoming batch_descriptors contain *scaled* base sizes (e.g.
-        # [4, 8, ..., 2048] with sp_size=4).  The shift model needs the
-        # *unscaled* sizes from its own capture list (e.g. [1, 2, ..., 512]).
-        # We rebuild the descriptors from _shift_cudagraph_capture_sizes, copying
-        # the non-bs fields (like has_lora) from the first matching base case.
+        # The shift model captures its own *unscaled* sizes (e.g. [1, 2, ...,
+        # 512]) from _shift_cudagraph_capture_sizes.  Descriptors are built via
+        # _shift_capture_descriptors under _use_shift_cudagraph_tables() so the
+        # padded sizes/keys exactly match what dispatch() computes for shift
+        # batches at runtime.  The shift model is captured with the *same*
+        # runtime mode as this pass (no downgrade): PIECEWISE in the piecewise
+        # pass and FULL (decode-eligible sizes only) in the full pass.  FCA
+        # never reaches the full pass because it forces cudagraph_mode to
+        # PIECEWISE at engine-config creation (see args.py).
         if has_shift:
             torch.distributed.barrier()
-            shift_sizes = self.vllm_config._shift_cudagraph_capture_sizes
-            # Use the first base case as a template for non-bs fields
-            template = batch_descriptors[0] if batch_descriptors else None
-            batch_descriptors_shift = [
-                self._with_bs(template, bs) if template is not None else bs
-                for bs in reversed(shift_sizes)
-            ]
-
-            if is_global_first_rank():
-                logger.info(
-                    "shift model (SPxTP=%s) shapes %s",
-                    sp_size * tp_size,
-                    [self._case_bs(c) for c in batch_descriptors_shift],
-                )
-
-            if batch_descriptors_shift:
-                orig_model, self.model = self.model, self.shift_model
-                cc = self.vllm_config.compilation_config
-                base_ctx = cc.static_forward_context
-                shift_ctx = getattr(self, 'shift_forward_context', None)
-                try:
-                    if shift_ctx is not None:
-                        cc.static_forward_context = shift_ctx
-                    torch._dynamo.reset()
-                    with set_shift_parallel_mode(True), \
-                         self._use_shift_cudagraph_tables():
+            orig_model, self.model = self.model, self.shift_model
+            cc = self.vllm_config.compilation_config
+            base_ctx = cc.static_forward_context
+            shift_ctx = getattr(self, 'shift_forward_context', None)
+            batch_descriptors_shift = []
+            try:
+                if shift_ctx is not None:
+                    cc.static_forward_context = shift_ctx
+                torch._dynamo.reset()
+                with set_shift_parallel_mode(True), \
+                     self._use_shift_cudagraph_tables():
+                    batch_descriptors_shift = self._shift_capture_descriptors(
+                        cudagraph_runtime_mode
+                    )
+                    if is_global_first_rank():
+                        logger.info(
+                            "shift model (SPxTP=%s) cudagraph mode %s shapes %s",
+                            sp_size * tp_size, cudagraph_runtime_mode,
+                            [self._case_bs(c) for c in batch_descriptors_shift],
+                        )
+                    if batch_descriptors_shift:
                         max_shift = max(self._case_bs(c)
                                         for c in batch_descriptors_shift)
                         self._dummy_run(max_shift, is_profile=True)
                         torch.distributed.barrier()
-                    shift_runtime_mode = (
-                        CUDAGraphMode.PIECEWISE
-                        if cudagraph_runtime_mode == CUDAGraphMode.FULL
-                        else cudagraph_runtime_mode
-                    )
+                if batch_descriptors_shift:
                     with set_shift_parallel_mode(True), \
                          self._use_shift_cudagraph_tables(), \
                          self._shift_graph_capture_context():
                         self._register_shift_cudagraph_keys(
-                            compilation_cases_shift,
+                            batch_descriptors_shift,
                             cudagraph_runtime_mode,
                         )
                         self._orig_capture_cudagraphs(
                             batch_descriptors_shift,
-                            shift_runtime_mode,
+                            cudagraph_runtime_mode,
                         )
-                finally:
-                    self.model = orig_model
-                    cc.static_forward_context = base_ctx
+            finally:
+                self.model = orig_model
+                cc.static_forward_context = base_ctx
+
+        # Front-load the Arctic speculator's own CUDA graph cache (separate
+        # from the base/shift graphs above) so it does not capture lazily
+        # mid-run.  Runs after base+shift capture, with self.model restored
+        # to the base model and outside shift-parallel mode.
+        self._capture_arctic_speculator_cudagraphs()
+
+    def _capture_arctic_speculator_cudagraphs(self) -> None:
+        """
+        Pre-capture the Arctic speculator's CUDA graphs over all request-count
+        buckets during startup.
+
+        The speculator keeps its own ``torch.cuda.CUDAGraph`` cache, separate
+        from vLLM's base/shift graphs and captured lazily on first use of each
+        padded request-count bucket inside ``generate_proposals``.  Left lazy,
+        that capture happens mid-run whenever the running batch size steps into
+        a not-yet-seen bucket, causing a one-step latency blip each time.
+        Driving one dummy ``generate_proposals`` per bucket here front-loads
+        every capture so runtime only ever replays.
+        """
+        drafter = getattr(self, "drafter", None)
+        model = getattr(drafter, "model", None)
+        # Skips SuffixProposer (no .model) and enforce_eager (cuda_graph_mode
+        # is False).
+        if model is None or not getattr(model, "cuda_graph_mode", False):
+            return
+        if (self.speculative_config is None
+                or self.speculative_config.method
+                not in ("arctic", "mlp_speculator")):
+            return
+
+        from arctic_inference.vllm.spec_dec.arctic_speculator import (
+            padding_size)
+
+        max_bs = int(getattr(model, "cuda_graph_max_batch_size", 0))
+        if max_bs <= 0:
+            return
+
+        # Distinct padded request-count buckets, ascending.  padding_size is
+        # idempotent on its own outputs, so these match the runtime cg_keys.
+        buckets = sorted({padding_size(bs) for bs in range(1, max_bs + 1)})
+
+        # Derive dummy-input width/dtype/device from the drafter's own static
+        # buffer so this stays correct across the MLP and LSTM speculator
+        # variants (they differ in hidden width and dtype).
+        hidden = model.static_cuda_buffers["previous_hidden_states"]
+        hidden_dim = hidden.shape[-1]
+        device = hidden.device
+        dtype = hidden.dtype
+        n_predict = model.n_predict
+
+        try:
+            with torch.inference_mode():
+                for bs in buckets:
+                    input_ids = torch.zeros(bs, dtype=torch.long,
+                                            device=device)
+                    previous_hidden_states = torch.zeros(
+                        bs, hidden_dim, dtype=dtype, device=device)
+                    model.generate_proposals(
+                        input_ids=input_ids,
+                        previous_hidden_states=previous_hidden_states,
+                        num_predict_tokens=n_predict,
+                    )
+            if is_global_first_rank():
+                logger.info(
+                    "arctic speculator pre-captured %d cudagraph buckets %s",
+                    len(buckets), buckets,
+                )
+        except Exception as e:
+            # A warmup failure must never crash engine init; fall back to the
+            # existing lazy capture path.
+            logger.warning(
+                "arctic speculator cudagraph pre-capture skipped due to "
+                "error: %s", e,
+            )

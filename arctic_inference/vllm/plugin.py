@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import sys
 
 import vllm
@@ -25,6 +26,9 @@ from arctic_inference.utils import get_compatible_vllm_version
 def arctic_inference_plugin():
     if not envs.ARCTIC_INFERENCE_ENABLED:
         return
+
+    # TODO: port ArcticInference patches to the V2 model runner and drop this.
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
     if not envs.ARCTIC_INFERENCE_SKIP_VERSION_CHECK:
         compatible_version = get_compatible_vllm_version()
