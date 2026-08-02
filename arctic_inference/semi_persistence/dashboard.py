@@ -39,6 +39,8 @@ C_STATUS_ERR = 9
 C_BORDER = 10
 C_SECTION = 11
 C_SLEEP = 12
+C_AGE_OLD = 13
+C_ERROR = 14
 
 def _init_colours():
     curses.start_color()
@@ -55,6 +57,18 @@ def _init_colours():
     curses.init_pair(C_BORDER, curses.COLOR_WHITE, -1)
     curses.init_pair(C_SECTION, curses.COLOR_WHITE, -1)
     curses.init_pair(C_SLEEP, curses.COLOR_MAGENTA, -1)
+    # Maroon for stale ages: prefer xterm-256 maroon (88), fall back to red+dim.
+    if curses.COLORS >= 256:
+        curses.init_pair(C_AGE_OLD, 88, -1)
+    else:
+        curses.init_pair(C_AGE_OLD, curses.COLOR_RED, -1)
+    # Maroon (same xterm-256 88 hue) for errored requests so they stand
+    # out from completed-OK (dim white) and waiting/generating
+    # (yellow/green).  Fallback to plain red on 8-colour terminals.
+    if curses.COLORS >= 256:
+        curses.init_pair(C_ERROR, 88, -1)
+    else:
+        curses.init_pair(C_ERROR, curses.COLOR_RED, -1)
 
 # ---------------------------------------------------------------------------
 # Local memory queries (CPU /proc/meminfo + NVML for GPU)
@@ -609,16 +623,36 @@ def _stars_for_level(level: int | None, max_level: int) -> str:
     return "*" * (1 << depth)
 
 
-def _pinned_stars_str(pinned_cpu_bytes: int, level: int | None,
-                      max_level: int) -> str:
-    """Like :func:`_pinned_str` but uses :func:`_stars_for_level` instead
-    of an ``L<n>`` suffix.  Used by the image-cache tier."""
+def _pinned_stars_chunks(info: dict, primary_attr: int, max_level: int
+                         ) -> list[tuple[str, int]]:
+    """Build ``[(text, attr), ...]`` chunks rendering ``" (X.XG, ****)"``
+    for the image-cache tier.
+
+    *primary_attr* styles the size text and the surrounding ``( )`` /
+    ``,`` punctuation.  The stars themselves render dim (matching free
+    cells in the slot bar) since the image-cache tier shows the
+    model's intrinsic level rather than a live slot allocation.  The
+    slot's GPU id is *not* shown here -- the image cache is a
+    location-agnostic catalogue of resident weights, so cluttering
+    each row with a per-slot locator would muddy that view; the GPU
+    and CPU tiers above already display the locator on the rows where
+    it's actionable.
+
+    Returns ``[]`` when there's nothing to render (no pinned bytes).
+    """
+    pinned_cpu_bytes = info.get("pinned_cpu_bytes", 0) or 0
     if pinned_cpu_bytes <= 0:
-        return ""
+        return []
     gib = pinned_cpu_bytes / (1 << 30)
-    stars = _stars_for_level(level, max_level)
-    suffix = f", {stars}" if stars else ""
-    return f" ({gib:.1f}G{suffix})"
+    stars = _stars_for_level(info.get("level"), max_level)
+    dim_gray = curses.color_pair(C_TITLE) | curses.A_DIM
+    if not stars:
+        return [(f" ({gib:.1f}G)", primary_attr)]
+    return [
+        (f" ({gib:.1f}G, ", primary_attr),
+        (stars, dim_gray),
+        (")", primary_attr),
+    ]
 
 
 def _gpu_mem_str(info: dict) -> str:
@@ -634,7 +668,8 @@ def _gpu_mem_str(info: dict) -> str:
 
 
 def _mem_chunks(info: dict, primary_attr: int, max_level: int,
-                *, prefer_gpu_mem: bool = False
+                *, prefer_gpu_mem: bool = False,
+                slot_gpu: int | None = None
                 ) -> list[tuple[str, int]]:
     """Build ``" (X.XG, **)"`` suffix chunks where the stars are sized
     by the model's intrinsic ``level`` (scaled against *max_level*) and
@@ -652,6 +687,15 @@ def _mem_chunks(info: dict, primary_attr: int, max_level: int,
     into the much-larger pinned-bytes value.  The CPU tier should
     leave the flag at the default to mirror :func:`_pinned_str`.
 
+    *slot_gpu* is the id of the GPU whose buddy-allocator currently
+    holds this model's slot (resolved by the caller from the
+    authoritative ``slots`` snapshot rather than ``info["gpu"]``,
+    which is the model's *current* GPU assignment and can diverge
+    mid-transition).  When provided, it's appended directly after the
+    stars (e.g. ``****2``) in dim gray so the suffix reads as a
+    single ``stars+gpu`` token while remaining distinguishable from
+    the allocation glyph.
+
     Returns ``[]`` when there's nothing to show (no GPU, no pinned
     bytes), matching :func:`_gpu_mem_str` / :func:`_pinned_str`.
     """
@@ -667,19 +711,30 @@ def _mem_chunks(info: dict, primary_attr: int, max_level: int,
         return []
 
     stars = _stars_for_level(info.get("level"), max_level)
+    is_alloc = info.get("slot_level") is not None
+    gpu_str = str(slot_gpu) if slot_gpu is not None else ""
+    dim_gray = curses.color_pair(C_TITLE) | curses.A_DIM
     if not stars:
+        if gpu_str:
+            return [
+                (f" ({size_str}, ", primary_attr),
+                (gpu_str, dim_gray),
+                (")", primary_attr),
+            ]
         return [(f" ({size_str})", primary_attr)]
 
-    is_alloc = info.get("slot_level") is not None
     if is_alloc:
         star_attr = curses.color_pair(C_RUNNING) | curses.A_BOLD
     else:
-        star_attr = curses.color_pair(C_TITLE) | curses.A_DIM
-    return [
+        star_attr = dim_gray
+    chunks: list[tuple[str, int]] = [
         (f" ({size_str}, ", primary_attr),
         (stars, star_attr),
-        (")", primary_attr),
     ]
+    if gpu_str:
+        chunks.append((gpu_str, dim_gray))
+    chunks.append((")", primary_attr))
+    return chunks
 
 
 def _fmt_duration_compact(seconds: float) -> str:
@@ -698,15 +753,48 @@ def _fmt_duration_compact(seconds: float) -> str:
     return f"{h}h{m:02d}m"
 
 
-def _state_age_str(info: dict, elapsed_s: float | None) -> str:
-    """Return `` (3m24s)`` showing how long the model has been in its current state."""
+def _state_age_chunk(info: dict, elapsed_s: float | None,
+                     default_attr: int,
+                     is_waiting_target: bool = False,
+                     waiter_submit_rel_s: float | None = None,
+                     ) -> tuple[str, int]:
+    """Return ``(text, attr)`` for the age suffix; maroon when age > 10 s.
+
+    Only shown for "active" models -- ``wait``, ``running``, any
+    ``paused`` model, or any model that is currently the target of a
+    request in ``waiting`` state (``is_waiting_target=True``).  All
+    other states (``up``, ``init``, ``checkpoint``, ``sleep``,
+    ``saved``, ...) suppress the age string entirely.
+
+    When *is_waiting_target* is True and *waiter_submit_rel_s* is
+    provided, the anchor used for the age is
+    ``max(state_since_rel_s, waiter_submit_rel_s)`` -- i.e. whichever
+    happened more recently.  This keeps the chip aligned with the
+    request timeline: when a generate lands on a model that has been
+    parked in (e.g.) ``sleep`` for 30 minutes, the chip resets to ~0
+    instead of continuing to show the model's pre-existing tenure.
+    Once the model transitions, ``state_since`` overtakes the waiter
+    anchor and the chip tracks the new state's age normally.
+    """
+    state = info.get("state")
+    if (state not in ("wait", "running")
+            and not info.get("paused")
+            and not is_waiting_target):
+        return ("", default_attr)
+    if elapsed_s is None:
+        return ("", default_attr)
     since = info.get("state_since_rel_s")
-    if since is None or elapsed_s is None:
-        return ""
+    if is_waiting_target and waiter_submit_rel_s is not None:
+        since = max(since or 0.0, float(waiter_submit_rel_s))
+    if since is None:
+        return ("", default_attr)
     age = elapsed_s - since
     if age < 1:
-        return ""
-    return f" {_fmt_duration_compact(age)}"
+        return ("", default_attr)
+    text = f" {_fmt_duration_compact(age)}"
+    if age > 10:
+        return (text, curses.color_pair(C_AGE_OLD))
+    return (text, default_attr)
 
 
 def _fmt_rel_t0_hms(seconds: float) -> str:
@@ -814,7 +902,9 @@ def _build_state_timeline(req: dict,
 
 
 def _build_state_durations(req: dict,
-                           now_rel_s: float | None
+                           now_rel_s: float | None,
+                           *,
+                           paused_since_rel_s: float | None = None,
                            ) -> list[tuple[str, bool]]:
     """Return ``[(segment_text, is_active), ...]`` for the right-aligned
     durations tail.
@@ -838,20 +928,43 @@ def _build_state_durations(req: dict,
     e.g. the long CRIU-load phase of a cold start appears as the
     ``saved Xs`` segment on the left of the bracket.
 
-    For *piggy-back* requests -- those that submitted while another
-    earlier-submitted request for the same model was still climbing
-    toward ``running`` -- the climb work was done by the lead request,
-    not this one.  The bracket becomes a dim ``[wait #N]`` where
-    ``#N`` is the lead request; the ``wait X.Ys`` metric on the left
-    already shows how long this request sat waiting, and the dim
-    styling makes clear no real work is happening here.
+    For *piggy-back* requests the bracket collapses to a dim
+    ``[wait #N]`` where ``#N`` is the lead request.  Two flavours
+    are merged into the same field by ``state_server``, both
+    classified once and persisted for R's lifetime so the bracket
+    keeps reading ``wait #L+1`` even after the lead has started /
+    finished:
+
+    * climb-piggyback -- submitted while an earlier-submitted request
+      for the same model was still climbing toward ``running``, so
+      the climb work was done by the lead.
+
+    * pause-piggyback -- submitted while the model was already paused
+      (orchestrator's one-shot ``paused_at_submit`` marker on the
+      request record) with an earlier earlier-submit request L on
+      the same model that was alive at R's submit time.  R cannot
+      make progress on its own until the next ``resume`` re-prefills
+      L and unfreezes the engine (which also drives R), and the
+      classification persists past resume since both inputs
+      (``paused_at_submit``, L's submit/done timestamps) are
+      immutable.
+
+    In both cases the ``wait X.Ys`` / ``paused X.Ys`` metric on the
+    left already shows how long this request sat waiting, and the
+    dim styling makes clear no real work is happening here.
     ``req["piggyback"]`` is ``None`` when the request drove its own
-    climb, otherwise the lead ``req_id``.
+    climb (and was not parked behind a pause at submit), otherwise
+    the lead ``req_id``.
     """
     log = list(req.get("state_log") or [])
     done_rel = req.get("done_rel_s")
     is_in_flight = done_rel is None
-    is_climbing = is_in_flight and (not log or log[-1][1] != "running")
+    # ``up`` and ``running`` are both settled states (model is loaded,
+    # generation either active or paused) -- neither counts as "still
+    # climbing", so the trailing visible segment shouldn't be
+    # highlighted bright once the model has reached either.
+    is_climbing = (is_in_flight
+                   and (not log or log[-1][1] not in ("running", "up")))
 
     lead = req.get("piggyback")
     if lead is not None:
@@ -874,20 +987,21 @@ def _build_state_durations(req: dict,
     else:
         end_t = float(log[-1][0])
 
-    raw: list[tuple[str, float]] = []
+    raw: list[tuple[str, float, float]] = []
     n = len(log)
     for i, entry in enumerate(log):
         t = float(entry[0])
         s = entry[1]
         next_t = float(log[i + 1][0]) if i + 1 < n else end_t
-        raw.append((s, max(0.0, next_t - t)))
+        raw.append((s, max(0.0, next_t - t), t))
 
     # ``running`` is redundant with the ``gen N.Ns`` column on the left,
     # and ``up`` is the brief sub-state between ``sleep -> running``
     # (typically renders as a noisy ``up 0.0s`` segment immediately
     # before the running flip, or as a tail entry after running ends);
     # it carries no useful timing signal so we drop it entirely.
-    visible = [(s, dur) for (s, dur) in raw if s not in ("running", "up")]
+    visible = [(s, dur, t) for (s, dur, t) in raw
+               if s not in ("running", "up")]
     if not visible:
         return []
 
@@ -902,22 +1016,33 @@ def _build_state_durations(req: dict,
     # If anyone ever adds a second ``_set_state(model_id, "wait")`` call
     # site preceded by a genuinely-occupied ``checkpoint``, this rule
     # would silently swallow that interval -- revisit then.
-    filtered: list[tuple[str, float]] = []
+    filtered: list[tuple[str, float, float]] = []
     n_vis = len(visible)
-    for i, (s, dur) in enumerate(visible):
+    for i, (s, dur, t) in enumerate(visible):
         if s == "checkpoint" and i + 1 < n_vis and visible[i + 1][0] == "wait":
             continue
-        filtered.append((s, dur))
+        filtered.append((s, dur, t))
     visible = filtered
     if not visible:
         return []
 
     last_idx = len(visible) - 1
     segments: list[tuple[str, bool]] = []
-    for i, (s, dur) in enumerate(visible):
+    for i, (s, dur, t) in enumerate(visible):
         label = _START_STATE_SHORT.get(s, s)
         is_active = is_climbing and (i == last_idx)
-        segments.append((f"{label} {dur:.1f}s", is_active))
+        # Segments that started at or after the model's pause time
+        # would otherwise tick a meaningless ``end_t -> now`` duration
+        # (waiting requests stuck behind a paused model) -- render
+        # the label without the duration so the bracket freezes
+        # visibly at pause time.  Segments that started before pause
+        # are settled and still show their durations.
+        suppress = (paused_since_rel_s is not None
+                    and t >= paused_since_rel_s)
+        if suppress:
+            segments.append((label, is_active))
+        else:
+            segments.append((f"{label} {dur:.1f}s", is_active))
     return segments
 
 
@@ -1337,12 +1462,31 @@ def _render(win, state: dict | None, connected: bool, tick: int,
         win.noutrefresh()
         return 0, 0, 0
 
-    gpu_ids: list[int] = state.get("gpu_ids", [])
+    # Sort by id so columns render left-to-right in ascending GPU order;
+    # the orchestrator may report ids in arrival order (e.g. after
+    # ``add``/``sub``), but the dashboard layout should be stable.
+    gpu_ids: list[int] = sorted(state.get("gpu_ids", []))
     gpu_mem: dict = state.get("gpu_mem", {})
     models: dict = state.get("models", {})
     # Buddy-allocator slot tree, keyed by gpu id.  JSON keys are strings
     # over the wire, so accept either form when looking up a GPU.
     slots_by_gpu: dict = state.get("slots", {}) or {}
+
+    # Reverse map ``mid -> gpu_id`` over the slot tree, so renderers can
+    # show the GPU that *owns* the slot rather than the model's current
+    # ``gpu`` field.  Those two normally agree, but during transitions
+    # (move, drain, mid-restore) the model's ``gpu`` may briefly differ
+    # from where its buddy-allocator slot lives.  The slot snapshot is
+    # the authoritative source for "which GPU has the allocation".
+    mid_to_slot_gpu: dict[str, int] = {}
+    for gpu_key, leaves in slots_by_gpu.items():
+        try:
+            gpu_id_int = int(gpu_key)
+        except (TypeError, ValueError):
+            continue
+        for leaf in (leaves or []):
+            if leaf.get("alloc") and leaf.get("mid") is not None:
+                mid_to_slot_gpu[leaf["mid"]] = gpu_id_int
 
     # Deepest level designated anywhere in the image cache: the smallest
     # allocation any model would take.  Used to size the per-GPU slot
@@ -1382,6 +1526,33 @@ def _render(win, state: dict | None, connected: bool, tick: int,
         for r in (state.get("requests") or [])
         if r.get("state") == "waiting" and r.get("model_id") is not None
     }
+
+    # Set of model_ids whose orchestrator entry currently has the
+    # ``paused`` flag set.  Requests against these models are
+    # highlighted cyan in the request panel since the model is not
+    # actively progressing them (they're suspended at the engine).
+    paused_mids: set[str] = {
+        mid for mid, info in models.items() if info.get("paused")
+    }
+
+    # For each model with at least one waiting request, the
+    # *earliest* ``submit_rel_s`` among those waiters.  ``_state_age_chunk``
+    # uses this as a secondary anchor so the per-model age chip resets
+    # to ~0 the moment a generate lands on a long-tenure state (e.g.
+    # ``sleep`` for 30 min), keeping the chip aligned with the
+    # request-row timeline rather than reporting the model's
+    # pre-existing tenure.
+    waiting_submit_by_mid: dict[str, float] = {}
+    for r in (state.get("requests") or []):
+        if r.get("state") != "waiting":
+            continue
+        mid = r.get("model_id")
+        sub = r.get("submit_rel_s")
+        if mid is None or sub is None:
+            continue
+        prev = waiting_submit_by_mid.get(mid)
+        if prev is None or sub < prev:
+            waiting_submit_by_mid[mid] = float(sub)
 
     n_gpus = max(len(gpu_ids), 1)
     inner_w = w - 2
@@ -1474,13 +1645,18 @@ def _render(win, state: dict | None, connected: bool, tick: int,
                 colour = curses.color_pair(C_UP)
             if mid in waiting_mids and s != "running":
                 colour |= curses.A_BOLD
-            head_label = indicator + mid
+            paused_mark = "*" if info.get("paused") else ""
+            head_label = indicator + paused_mark + mid
             mem_chunks = _mem_chunks(info, colour, ic_max_level,
-                                     prefer_gpu_mem=True)
-            age_str = _state_age_str(info, elapsed_s)
+                                     prefer_gpu_mem=True,
+                                     slot_gpu=mid_to_slot_gpu.get(mid))
+            age_chunk = _state_age_chunk(
+                info, elapsed_s, gray_attr,
+                is_waiting_target=mid in waiting_mids,
+                waiter_submit_rel_s=waiting_submit_by_mid.get(mid))
             chunks: list[tuple[str, int]] = [(head_label, colour)]
             chunks.extend(mem_chunks)
-            chunks.append((age_str, gray_attr))
+            chunks.append(age_chunk)
             _write_chunks(win, gpu_tier_start + j, cx + 1, chunks,
                           max_x=max_col)
         if not mlist:
@@ -1509,13 +1685,18 @@ def _render(win, state: dict | None, connected: bool, tick: int,
                 row_attr = curses.color_pair(C_UP)
                 if mid in waiting_mids:
                     row_attr |= curses.A_BOLD
-                head_label = "○ " + mid
+                paused_mark = "*" if info.get("paused") else ""
+                head_label = "○ " + paused_mark + mid
                 mem_chunks = _mem_chunks(info, row_attr, ic_max_level,
-                                         prefer_gpu_mem=True)
-                age_str = _state_age_str(info, elapsed_s)
+                                         prefer_gpu_mem=True,
+                                         slot_gpu=mid_to_slot_gpu.get(mid))
+                age_chunk = _state_age_chunk(
+                    info, elapsed_s, gray_attr,
+                    is_waiting_target=mid in waiting_mids,
+                    waiter_submit_rel_s=waiting_submit_by_mid.get(mid))
                 chunks = [(head_label, row_attr)]
                 chunks.extend(mem_chunks)
-                chunks.append((age_str, gray_attr))
+                chunks.append(age_chunk)
                 _write_chunks(win, sleep_start + j, cx + 1, chunks,
                               max_x=max_col)
 
@@ -1587,13 +1768,9 @@ def _render(win, state: dict | None, connected: bool, tick: int,
             else float("inf")
         )
 
-    def _cpu_sort_key_newest_first(item):
-        v = item[1].get("state_since_rel_s")
-        return -(v if v is not None else float("-inf"))
-
     cpu_idle = sorted(
         (mi for mi in checkpoint_models if mi[1].get("state") != "wait"),
-        key=_cpu_sort_key_newest_first,
+        key=_cpu_sort_key,
     )
     cpu_waiting = sorted(
         (mi for mi in checkpoint_models if mi[1].get("state") == "wait"),
@@ -1642,23 +1819,28 @@ def _render(win, state: dict | None, connected: bool, tick: int,
     # -- CPU data (fills from current row to just above requests separator) --
     def _draw_cpu_row(y: int, mid: str, info: dict) -> None:
         s = info.get("state", "checkpoint")
+        paused_mark = "*" if info.get("paused") else ""
         if s == "wait":
             spin = _SPINNER[tick % len(_SPINNER)]
-            head_label = f"{spin} {mid}"
+            head_label = f"{spin} {paused_mark}{mid}"
             colour = curses.color_pair(C_WAIT)
         elif s in ("checkpoint",):
-            head_label = mid
+            head_label = paused_mark + mid
             colour = curses.color_pair(C_CHECKPOINT)
         else:
-            head_label = mid
+            head_label = paused_mark + mid
             colour = curses.color_pair(C_CHECKPOINT) | curses.A_DIM
         if mid in waiting_mids and s != "wait":
             colour |= curses.A_BOLD
-        mem_chunks = _mem_chunks(info, colour, ic_max_level)
-        age_str = _state_age_str(info, elapsed_s)
+        mem_chunks = _mem_chunks(info, colour, ic_max_level,
+                                 slot_gpu=mid_to_slot_gpu.get(mid))
+        age_chunk = _state_age_chunk(
+            info, elapsed_s, gray_attr,
+            is_waiting_target=mid in waiting_mids,
+            waiter_submit_rel_s=waiting_submit_by_mid.get(mid))
         chunks: list[tuple[str, int]] = [(head_label, colour)]
         chunks.extend(mem_chunks)
-        chunks.append((age_str, gray_attr))
+        chunks.append(age_chunk)
         _write_chunks(win, y, 2, chunks, max_x=w)
 
     if cpu_idle or cpu_waiting:
@@ -1668,7 +1850,7 @@ def _render(win, state: dict | None, connected: bool, tick: int,
             _draw_cpu_row(row, mid, info)
             row += 1
         if has_waiting and row < req_header_y:
-            queue_label = f" Allocation Queue ({waiting_count} waiting) "
+            queue_label = f" ({waiting_count} waiting) "
             _safe_addstr(win, row, 1, queue_label,
                          curses.color_pair(C_SECTION) | curses.A_DIM)
             sep_x = 1 + len(queue_label)
@@ -1756,9 +1938,10 @@ def _render(win, state: dict | None, connected: bool, tick: int,
                 # Image cache shows the model's *intrinsic* level (a
                 # property derived from gpu_memory_utilization), since
                 # saved/cached models do not currently hold a slot.
-                label = (f"{mid}"
-                         f"{_pinned_stars_str(info.get('pinned_cpu_bytes', 0), info.get('level'), ic_max_level)}"
-                         f"  {model_path}")
+                # When the model *does* hold a slot, the GPU id is
+                # appended after the stars (e.g. ``****2``) in dim
+                # gray so the reader can locate it without
+                # cross-referencing the per-GPU column.
                 if is_saved:
                     colour = curses.color_pair(C_SAVED)
                 else:
@@ -1774,7 +1957,11 @@ def _render(win, state: dict | None, connected: bool, tick: int,
                 else:
                     x = right_x
                     max_x = inner_w + 1
-                _safe_addstr(win, srow, x, label, colour, max_x=max_x)
+                chunks: list[tuple[str, int]] = [(mid, colour)]
+                chunks.extend(_pinned_stars_chunks(
+                    info, colour, ic_max_level))
+                chunks.append((f"  {model_path}", colour))
+                _write_chunks(win, srow, x, chunks, max_x=max_x)
             srow += 1
     else:
         _safe_addstr(win, srow, 2, "—", curses.A_DIM)
@@ -1793,6 +1980,18 @@ def _render(win, state: dict | None, connected: bool, tick: int,
         else:
             eff_scroll = min(req_scroll, max(0, total_requests - avail_rows))
         visible = requests[eff_scroll:eff_scroll + avail_rows]
+        # Pre-compute column widths so middle_text aligns after model_id
+        # across every visible row.  Each component (``#N``, ``tlog``,
+        # ``model_id``) is padded to its max observed width.
+        _id_w = max(
+            (len(f"#{r.get('req_id', 0) + 1}") for r in visible),
+            default=0)
+        _tlog_w = max(
+            (len(_fmt_request_time_log(r)) for r in visible),
+            default=0)
+        _mid_w = max(
+            (len(r.get("model_id", "?")) for r in visible),
+            default=0)
         for req in visible:
             if row >= saved_start:
                 break
@@ -1801,8 +2000,11 @@ def _render(win, state: dict | None, connected: bool, tick: int,
             rstate = req.get("state", "?")
             wait_s = req.get("wait_s")
             gen_s = req.get("gen_s")
+            paused_s = req.get("paused_s") or 0.0
             ptok = req.get("prompt_tokens")
             ctok = req.get("completion_tokens")
+            ttft_s = req.get("ttft_s")
+            tpot_ms = req.get("tpot_ms")
 
             tlog = _fmt_request_time_log(req)
 
@@ -1811,8 +2013,21 @@ def _render(win, state: dict | None, connected: bool, tick: int,
                 primary = curses.color_pair(C_WAIT)
             elif rstate == "generating":
                 primary = curses.color_pair(C_RUNNING)
+            elif rstate == "error":
+                # Maroon for errored generates (e.g.
+                # ``_fail_all_inflight`` after a worker cmd OOM).
+                # Distinct from the dim-white ``done`` treatment so
+                # failures don't visually blend with successes.
+                primary = curses.color_pair(C_ERROR)
             else:
                 primary = curses.color_pair(C_SAVED) | curses.A_DIM
+            # In-flight requests against a paused model recolor cyan
+            # (matching the C_UP hue used elsewhere for paused/up
+            # models) so it's visually obvious why they're not making
+            # progress.  Done / errored requests keep their own
+            # styling (dim-white / maroon respectively).
+            if mid in paused_mids and rstate in ("waiting", "generating"):
+                primary = curses.color_pair(C_UP)
 
             # -- Middle portion (wait/gen/tokens), flows left --
             middle_parts: list[str] = []
@@ -1826,9 +2041,21 @@ def _render(win, state: dict | None, connected: bool, tick: int,
                     f"wait {wait_s:.1f}s"
                     if wait_s is not None else "wait")
                 spin = _SPINNER[tick % len(_SPINNER)]
+                # Spinner sits next to the segment that's actively
+                # advancing: ``gen`` when running, ``paused`` when the
+                # model is currently paused (``gen`` is frozen then).
+                # ``paused N.Ns`` stays visible after resume too -- a
+                # sticky record of accumulated pause time, just
+                # without the spinner.
+                is_paused_now = mid in paused_mids
+                gen_spin = "" if is_paused_now else f"{spin} "
                 middle_parts.append(
-                    f"{spin} gen {gen_s:.1f}s"
-                    if gen_s is not None else f"{spin} gen")
+                    f"{gen_spin}gen {gen_s:.1f}s"
+                    if gen_s is not None else f"{gen_spin}gen")
+                if paused_s > 0:
+                    paused_spin = f"{spin} " if is_paused_now else ""
+                    middle_parts.append(
+                        f"{paused_spin}paused {paused_s:.1f}s")
             else:
                 wait_str = f"wait {wait_s:.1f}s" if wait_s is not None else ""
                 gen_str = f"gen {gen_s:.1f}s" if gen_s is not None else ""
@@ -1836,18 +2063,31 @@ def _render(win, state: dict | None, connected: bool, tick: int,
                     middle_parts.append(wait_str)
                 if gen_str:
                     middle_parts.append(gen_str)
+                if paused_s > 0:
+                    middle_parts.append(f"paused {paused_s:.1f}s")
                 if ptok is not None or ctok is not None:
-                    tok_parts = []
+                    # Match ``cl.requests()`` table format: ``out/in``
+                    # (completion / prompt), with ``ctok or 0`` coercing
+                    # a missing completion count to ``0`` when only the
+                    # prompt total is known.  Bare slash form keeps the
+                    # row compact -- consistent with the client's
+                    # dedicated ``tokens`` column header.
                     if ptok is not None:
-                        tok_parts.append(f"{ptok} in")
-                    if ctok is not None:
-                        tok_parts.append(f"{ctok} out")
-                    middle_parts.append(", ".join(tok_parts))
+                        middle_parts.append(f"{ctok or 0}/{ptok} tok")
+                    else:
+                        middle_parts.append(f"{ctok} tok")
+                if ttft_s is not None:
+                    if ttft_s >= 1.0:
+                        middle_parts.append(f"ttft {ttft_s:.2f}s")
+                    else:
+                        middle_parts.append(f"ttft {ttft_s * 1000:.0f}ms")
+                if tpot_ms is not None:
+                    middle_parts.append(f"tpot {tpot_ms:.1f}ms")
 
-            prefix_parts = [f"#{rid + 1}"]
-            if tlog:
-                prefix_parts.append(tlog)
-            prefix_parts.append(mid)
+            prefix_parts = [f"#{rid + 1}".ljust(_id_w)]
+            if _tlog_w:
+                prefix_parts.append(tlog.ljust(_tlog_w))
+            prefix_parts.append(mid.ljust(_mid_w))
             prefix = " ".join(prefix_parts)
             middle_text = " ".join(p for p in middle_parts if p)
             left_text = prefix if not middle_text else f"{prefix}  {middle_text}"
@@ -1856,30 +2096,66 @@ def _render(win, state: dict | None, connected: bool, tick: int,
             # Active (current) segment is bright white; finished ones are
             # dim.  Populated incrementally on every row, even while the
             # request is still in flight.
-            durs_segs = _build_state_durations(req, elapsed_s)
-            durs_chunks: list[tuple[str, int]] = []
-            if durs_segs:
+            # When the model is paused, the model's ``state_since_rel_s``
+            # is the pause-start time (``pause()`` forces a
+            # ``_set_state(.., "up")`` which updates ``state_since``,
+            # and no further transitions happen while paused).  We
+            # forward that as the cutoff so segments that started
+            # after pause render without their ticking duration.
+            paused_since_rel_s = None
+            if mid in paused_mids:
+                paused_since_rel_s = models.get(mid, {}).get(
+                    "state_since_rel_s")
+            durs_segs = _build_state_durations(
+                req, elapsed_s,
+                paused_since_rel_s=paused_since_rel_s)
+
+            def _build_durs(start_idx: int) -> tuple[list[tuple[str, int]], int]:
+                """Build bracket chunks showing ``durs_segs[start_idx:]``.
+                A ``..., `` head segment is inserted whenever
+                *start_idx* > 0 so the dropped (oldest) entries are
+                visibly indicated.
+                """
+                if not durs_segs:
+                    return [], 0
                 dim_attr = curses.color_pair(C_TITLE) | curses.A_DIM
                 active_attr = curses.color_pair(C_TITLE) | curses.A_BOLD
-                durs_chunks.append(("[", dim_attr))
-                for i, (text, is_active) in enumerate(durs_segs):
-                    if i > 0:
-                        durs_chunks.append((", ", dim_attr))
-                    durs_chunks.append(
+                chunks: list[tuple[str, int]] = [("[", dim_attr)]
+                if start_idx > 0:
+                    chunks.append(("..., ", dim_attr))
+                for i in range(start_idx, len(durs_segs)):
+                    if i > start_idx:
+                        chunks.append((", ", dim_attr))
+                    text, is_active = durs_segs[i]
+                    chunks.append(
                         (text, active_attr if is_active else dim_attr))
-                durs_chunks.append(("]", dim_attr))
-            tail_len = sum(len(t) for t, _ in durs_chunks)
+                chunks.append(("]", dim_attr))
+                return chunks, sum(len(t) for t, _ in chunks)
 
-            # -- Render: left_text flows from col 2; bracket hugs the
-            # right border.  Left text is clipped so it cannot overrun
-            # the right tail (keep at least a one-column gap).
+            durs_chunks, tail_len = _build_durs(0)
+
+            # -- Render: left_text takes priority, flowing from col 2
+            # up to the right border.  The bracket right-aligns when
+            # there's room; otherwise it drops oldest segments from
+            # its left (replaced with a leading ``..., ``) until it
+            # fits in the slack past the left text.  At least the
+            # most recent segment is kept whenever any bracket
+            # renders -- that's the bit users actually need to see.
             left_start = 2
             if durs_chunks:
-                right_x = max(left_start, w - 1 - tail_len)
-                left_cap = max(left_start, right_x - 1)
                 _safe_addstr(win, row, left_start, left_text, primary,
-                             max_x=left_cap)
-                x = right_x
+                             max_x=w - 1)
+                left_end = left_start + len(left_text)
+                right_border = w - 1
+                GAP = 2  # min spaces between left text and bracket
+                avail = max(0, right_border - left_end - GAP)
+                if tail_len > avail:
+                    for start_idx in range(1, len(durs_segs)):
+                        durs_chunks, tail_len = _build_durs(start_idx)
+                        if tail_len <= avail:
+                            break
+                bracket_x = max(left_end + GAP, right_border - tail_len)
+                x = bracket_x
                 for text, attr in durs_chunks:
                     if x >= w - 1:
                         break

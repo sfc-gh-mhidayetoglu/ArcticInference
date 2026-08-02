@@ -517,12 +517,13 @@ def _render(win, state: dict | None, connected: bool, tick: int,
                 parts.append(wait_str)
                 parts.append(gen_str)
                 if ptok is not None or ctok is not None:
-                    tok_parts = []
+                    # Match ``cl.requests()`` and the live dashboard's
+                    # ``out/in`` format so a recording replays with the
+                    # same token presentation as the live view.
                     if ptok is not None:
-                        tok_parts.append(f"{ptok} in")
-                    if ctok is not None:
-                        tok_parts.append(f"{ctok} out")
-                    parts.append(", ".join(tok_parts))
+                        parts.append(f"{ctok or 0}/{ptok} tok")
+                    else:
+                        parts.append(f"{ctok} tok")
                 if gpu_suffix:
                     parts.append(gpu_suffix)
                 colour = curses.color_pair(C_SAVED) | curses.A_DIM

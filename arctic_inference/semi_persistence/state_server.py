@@ -94,6 +94,19 @@ def snapshot_state() -> dict:
             if t0_valid and raw_since
             else None
         )
+        # ``paused_since`` is set by ``_pause_sync`` and cleared by
+        # ``_resume_sync`` (both branches), so it is a strict per-model
+        # "time of the original pause" timestamp -- unaffected by
+        # subsequent ``move()`` walks while the model stays paused
+        # (which do bump ``state_since`` per step).  Exposed alongside
+        # ``state_since_rel_s`` so consumers can pick the semantic
+        # they want.
+        raw_paused_since = entry.get("paused_since")
+        paused_since_rel = (
+            round(raw_paused_since - _t0, 3)
+            if t0_valid and raw_paused_since
+            else None
+        )
         slot = entry.get("slot")
         models[mid] = {
             "state": entry.get("state"),
@@ -102,11 +115,14 @@ def snapshot_state() -> dict:
             "pinned_cpu_bytes": entry.get("pinned_cpu_bytes", 0),
             "total_gpu_bytes": entry.get("total_gpu_bytes", 0),
             "vllm_config": entry.get("vllm_config", {}),
+            "image_path": entry.get("image_dir"),
             "state_since": entry.get("state_since", 0),
             "state_since_rel_s": state_since_rel,
             "level": entry.get("level"),
             "slot_level": slot.level if slot is not None else None,
             "slot_index": slot.index if slot is not None else None,
+            "paused": bool(entry.get("paused", False)),
+            "paused_since_rel_s": paused_since_rel,
         }
     busy = {
         e.get("gpu") for e in Orchestrator._registry.values()
@@ -114,38 +130,84 @@ def snapshot_state() -> dict:
         and e.get("state") in ("init", "sleep", "up", "running")
     }
     free_gpus = sorted(g for g in Orchestrator._gpu_ids if g not in busy)
+    from slots import Slots as _Slots
+    with _Slots._cv:
+        draining = sorted(_Slots._draining)
 
     requests = []
     with Orchestrator._request_lock:
         # Index earlier-submitted records per-model for piggy-back
-        # detection: request R piggy-backs another if some earlier
-        # submit for the same model hadn't yet reached t_gen_start
-        # when R submitted, meaning R caught a ride on that request's
-        # up-cycle rather than driving its own climb.  ``piggyback``
-        # is ``None`` when R drove its own climb, otherwise the
-        # ``req_id`` of the *lead* request -- the earliest in-flight
-        # submit that R hitched onto.
-        per_model_subs: dict[str, list[tuple[int, float, float | None]]] = {}
+        # detection.  Two flavours collapse into the same
+        # ``piggyback`` field (the ``req_id`` of the *lead* request --
+        # the earliest in-flight submit that R hitched onto):
+        #
+        #   * climb-piggyback: an earlier submit on the same model
+        #     hadn't reached t_gen_start when R submitted, meaning R
+        #     caught a ride on that request's up-cycle rather than
+        #     driving its own climb.  Persists for R's lifetime
+        #     because the condition (``L.t_gen_start > R.t_submit``)
+        #     is immutable once L starts.
+        #
+        #   * pause-piggyback: R was submitted while its model was
+        #     paused (orchestrator's one-shot ``paused_at_submit``
+        #     marker) and an earlier-submit L on the same model was
+        #     still alive at R's submit time (``L.t_done is None`` or
+        #     ``L.t_done > R.t_submit``).  R cannot make progress on
+        #     its own until the next ``resume`` re-prefills L's saved
+        #     sub-requests and unfreezes the engine; that same
+        #     ``resume`` is what drives R, so the bracket collapses
+        #     to ``wait #L+1`` instead of replaying R's (mostly empty)
+        #     state timeline.  Both inputs are immutable, so this
+        #     classification persists past resume and even past L's
+        #     completion -- matching how climb-piggyback persists past
+        #     the lead's ``t_gen_start``.
+        #
+        # ``piggyback`` is ``None`` when neither flavour applies.
+        per_model_subs: dict[
+            str, list[tuple[int, float, float | None, float | None]]
+        ] = {}
         for other in Orchestrator._request_log:
             per_model_subs.setdefault(other["model_id"], []).append(
-                (other["req_id"], other["t_submit"], other["t_gen_start"]))
+                (other["req_id"], other["t_submit"],
+                 other["t_gen_start"], other.get("t_done")))
 
         for rec in Orchestrator._request_log:
             state = rec["state"]
             t_submit = rec["t_submit"]
             t_gen_start = rec["t_gen_start"]
             t_done = rec["t_done"]
+            rec_paused_at_submit = bool(rec.get("paused_at_submit"))
 
             piggyback: int | None = None
             earliest_sub = float("inf")
-            for other_id, other_sub, other_gen in per_model_subs.get(
-                    rec["model_id"], []):
+            for other_id, other_sub, other_gen, other_done in (
+                    per_model_subs.get(rec["model_id"], [])):
                 if other_sub >= t_submit:
                     continue
-                if other_gen is None or other_gen > t_submit:
+                is_climb_lead = (other_gen is None or other_gen > t_submit)
+                # L was alive when R was submitted iff L hadn't yet
+                # finished by then.  ``other_done is None`` covers
+                # "still in flight"; the strict bound covers leads
+                # that completed after R's pause-submit but whose
+                # follower-relationship we want to keep displaying.
+                other_alive_at_submit = (
+                    other_done is None or other_done > t_submit)
+                is_pause_lead = (rec_paused_at_submit
+                                 and other_alive_at_submit)
+                if is_climb_lead or is_pause_lead:
                     if other_sub < earliest_sub:
                         earliest_sub = other_sub
                         piggyback = other_id
+
+            # Total time this request has spent suspended because its
+            # model was paused.  ``paused_s`` is the closed-out
+            # accumulator (updated on resume); ``t_pause_started`` is
+            # set while we're currently inside a pause window and
+            # contributes the live ``now - t_pause_started`` slice.
+            paused_s_total = float(rec.get("paused_s") or 0.0)
+            t_pause_started = rec.get("t_pause_started")
+            if t_pause_started is not None:
+                paused_s_total += max(0.0, now - t_pause_started)
 
             if state == "waiting":
                 wait_s = now - t_submit
@@ -153,13 +215,14 @@ def snapshot_state() -> dict:
             elif state == "generating":
                 if t_gen_start is not None:
                     wait_s = t_gen_start - t_submit
-                    gen_s = now - t_gen_start
+                    gen_s = max(0.0, now - t_gen_start - paused_s_total)
                 else:
                     wait_s = now - t_submit
                     gen_s = None
             else:
                 wait_s = (t_gen_start - t_submit) if t_gen_start else None
-                gen_s = (t_done - t_gen_start) if (t_done and t_gen_start) else None
+                gen_s = (max(0.0, t_done - t_gen_start - paused_s_total)
+                         if (t_done and t_gen_start) else None)
 
             if _t0 and _t0 > 0.0:
                 submit_rel_s = round(t_submit - _t0, 3)
@@ -191,8 +254,15 @@ def snapshot_state() -> dict:
                 "start_state": rec.get("start_state"),
                 "wait_s": round(wait_s, 2) if wait_s is not None else None,
                 "gen_s": round(gen_s, 2) if gen_s is not None else None,
+                # Total paused time so far on this request (closed-out
+                # ``paused_s`` plus the live ``now - t_pause_started``
+                # window when currently paused).  Lets the dashboard
+                # surface a ``paused N.Ns`` counter alongside ``gen``.
+                "paused_s": round(paused_s_total, 2),
                 "prompt_tokens": rec.get("prompt_tokens"),
                 "completion_tokens": rec.get("completion_tokens"),
+                "ttft_s": rec.get("ttft_s"),
+                "tpot_ms": rec.get("tpot_ms"),
                 "gpu_wait_s": round(rec["gpu_wait_s"], 2) if rec.get("gpu_wait_s") is not None else None,
                 "migrate_s": round(rec["migrate_s"], 2) if rec.get("migrate_s") is not None else None,
                 "up_s": round(rec["up_s"], 2) if rec.get("up_s") is not None else None,
@@ -207,6 +277,7 @@ def snapshot_state() -> dict:
     return {
         "gpu_ids": list(Orchestrator._gpu_ids),
         "gpu_pool": free_gpus,
+        "draining": draining,
         "image_cache": Orchestrator._image_cache,
         "models": models,
         "requests": requests,
@@ -222,13 +293,19 @@ class StateHandler(BaseHTTPRequestHandler):
     GET  /state              -- JSON snapshot of registry, slots, requests
     POST /register           -- Orchestrator.register(model_id, vllm_config)
     POST /move               -- Orchestrator.move(model_id, target, target_gpu)
-    POST /move_all           -- Orchestrator.move_all(target, target_gpu)
     POST /generate           -- Orchestrator.submit_generate(...); returns req_id
-    POST /generate_all       -- Orchestrator.generate_all(...); returns req_ids
     POST /wait               -- Orchestrator.wait(model_id) (blocks)
-    POST /wait_all           -- Orchestrator.wait_all() (blocks)
     POST /remove             -- Orchestrator.remove(model_id)
-    POST /remove_all         -- Orchestrator.remove_all()
+    POST /pause              -- Orchestrator.pause(model_id)  (running -> up)
+    POST /resume             -- Orchestrator.resume(model_id) (up -> running)
+    POST /add                -- Orchestrator.add(gpu)
+    POST /sub                -- Orchestrator.sub(gpu) (non-blocking)
+    POST /wait_gpu           -- Orchestrator.wait_gpu(gpu) (blocks)
+
+    Multi-model fan-out (``move_all``, ``generate_all``, ``wait_all``,
+    ``remove_all``) is not exposed here on purpose -- clients implement
+    it as a loop over ``GET /state`` -> per-model calls.  See
+    :class:`client.OrchestratorClient` for the canonical implementation.
     """
 
     def do_GET(self):
@@ -250,37 +327,38 @@ class StateHandler(BaseHTTPRequestHandler):
                     body["model_id"], body["target"],
                     target_gpu=body.get("target_gpu"))
                 self._json(200, {"ok": True})
-            elif self.path == "/move_all":
-                Orchestrator.move_all(
-                    body["target"], target_gpu=body.get("target_gpu"))
-                self._json(200, {"ok": True})
             elif self.path == "/generate":
                 req_id, _fut = Orchestrator.submit_generate(
                     body["model_id"], body["prompts"],
                     body.get("sampling_params"))
                 self._json(200, {"req_id": req_id})
-            elif self.path == "/generate_all":
-                req_ids = Orchestrator.generate_all(
-                    body["prompts"], body.get("sampling_params"))
-                self._json(200, {"req_ids": req_ids})
             elif self.path == "/wait":
                 Orchestrator.wait(body["model_id"])
-                self._json(200, {"ok": True})
-            elif self.path == "/wait_all":
-                Orchestrator.wait_all()
                 self._json(200, {"ok": True})
             elif self.path == "/remove":
                 Orchestrator.remove(body["model_id"])
                 self._json(200, {"ok": True})
-            elif self.path == "/remove_all":
-                Orchestrator.remove_all()
+            elif self.path == "/pause":
+                Orchestrator.pause(body["model_id"])
+                self._json(200, {"ok": True})
+            elif self.path == "/resume":
+                Orchestrator.resume(body["model_id"])
+                self._json(200, {"ok": True})
+            elif self.path == "/add":
+                Orchestrator.add(body["gpu"])
+                self._json(200, {"ok": True})
+            elif self.path == "/sub":
+                Orchestrator.sub(body["gpu"])
+                self._json(200, {"ok": True})
+            elif self.path == "/wait_gpu":
+                Orchestrator.wait_gpu(body["gpu"])
                 self._json(200, {"ok": True})
             else:
                 self.send_error(404)
         except (BrokenPipeError, ConnectionResetError):
             # Client disconnected before we could send the response
-            # (common when a long-running call like /wait_all outlasts
-            # the client process).  No socket to report on, just drop.
+            # (common when a long-running call like /wait outlasts the
+            # client process).  No socket to report on, just drop.
             pass
         except Exception as exc:
             import traceback

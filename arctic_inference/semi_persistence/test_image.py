@@ -26,7 +26,7 @@ def main():
     inst.restore_cuda(gpu=3).wait().print_status()
     inst.wake_up_weights().wait().print_status()
     inst.repin().wait().print_status()
-    inst.load_weights().wait().print_status()
+    inst.restore_weights().wait().print_status()
     inst.wake_up_kv_cache().wait().print_status()
     inst.generate(["Hello, world!"],{}).wait().print_status()
     inst.unpin().wait().print_status()

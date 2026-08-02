@@ -19,6 +19,11 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
+import semip_logging
+from abstract import SlotsBase
+
+log = semip_logging.slots()
+
 
 @dataclass(frozen=True)
 class Slot:
@@ -46,7 +51,7 @@ def _parent(s: Slot) -> Slot:
     return Slot(s.gpu_id, s.level - 1, s.index // 2)
 
 
-class Slots:
+class Slots(SlotsBase):
     """Singleton buddy-allocator.  All methods are class-level."""
 
     _lock: threading.Lock = threading.Lock()
@@ -55,6 +60,7 @@ class Slots:
     _live: set[Slot] = set()
     _last_used: dict[int, float] = {}
     _waiters: "deque[_Waiter]" = deque()
+    _draining: set[int] = set()
     _inited: bool = False
 
     # ------------------------------------------------------------------
@@ -69,6 +75,7 @@ class Slots:
             cls._live.clear()
             cls._last_used.clear()
             cls._waiters.clear()
+            cls._draining.clear()
             for g in gpu_ids:
                 cls._pools[(g, 1)] = deque([Slot(g, 1, 0)])
                 cls._last_used[g] = 0.0
@@ -90,7 +97,55 @@ class Slots:
             cls._live.clear()
             cls._last_used.clear()
             cls._waiters.clear()
+            cls._draining.clear()
             cls._inited = False
+
+    @classmethod
+    def add(cls, gpu: int) -> bool:
+        """Add *gpu* to the pool with a single whole-GPU root slot.
+
+        Returns True if the GPU was added, False if it was already in
+        the pool (idempotent).  Wakes FIFO waiters that may now be
+        satisfiable on the new GPU.
+        """
+        with cls._cv:
+            assert cls._inited, "Slots not initialised"
+            if gpu in cls._last_used:
+                return False
+            cls._pools[(gpu, 1)] = deque([Slot(gpu, 1, 0)])
+            cls._last_used[gpu] = 0.0
+            cls._draining.discard(gpu)
+            cls._cv.notify_all()
+            log.info("add GPU %d", gpu)
+            return True
+
+    @classmethod
+    def pop(cls, gpu: int) -> None:
+        """Remove a fully-idle *gpu* from the pool.
+
+        Asserts no live slot or non-root-free pool entry references the
+        GPU.  Caller (e.g. ``Orchestrator._sub_sync``) is
+        responsible for marking the GPU draining and ensuring residents
+        have moved off before invoking this.
+        """
+        with cls._cv:
+            assert cls._inited, "Slots not initialised"
+            assert not any(s.gpu_id == gpu for s in cls._live), (
+                f"GPU {gpu} still has live slots: "
+                f"{sorted(s for s in cls._live if s.gpu_id == gpu)}")
+            root = cls._pools.get((gpu, 1))
+            assert root and len(root) == 1, (
+                f"GPU {gpu} root pool not whole: {list(root or [])}")
+            for key in [k for k in cls._pools if k[0] == gpu]:
+                pool = cls._pools[key]
+                if key[1] != 1:
+                    assert not pool, (
+                        f"non-empty pool {key}: {list(pool)}")
+                cls._pools.pop(key)
+            cls._last_used.pop(gpu, None)
+            cls._draining.discard(gpu)
+            cls._cv.notify_all()
+            log.info("pop GPU %d", gpu)
 
     # ------------------------------------------------------------------
     # Allocation core (private, lock held)
@@ -112,9 +167,13 @@ class Slots:
     @classmethod
     def _try_allocate(cls, level: int, gpu: int | None) -> Slot | None:
         if gpu is not None:
+            if gpu in cls._draining:
+                return None
             return cls._pop_free_in_subtree(gpu, level)
         for g in sorted(cls._last_used,
                         key=lambda g: (cls._last_used[g], g)):
+            if g in cls._draining:
+                continue
             s = cls._pop_free_in_subtree(g, level)
             if s is not None:
                 return s
@@ -144,6 +203,8 @@ class Slots:
         assert level >= 1
         with cls._cv:
             assert cls._inited, "Slots not initialised"
+            log.info("allocate L%d gpu=%s (waiters=%d)",
+                     level, gpu, len(cls._waiters))
             me = _Waiter(level, gpu)
             cls._waiters.append(me)
             blocked_announced = False
@@ -154,9 +215,11 @@ class Slots:
                         cls._waiters.popleft()
                         cls._live.add(s)
                         cls._cv.notify_all()
+                        log.info("allocate L%d gpu=%s -> %s", level, gpu, s)
                         return s
                 if on_block is not None and not blocked_announced:
                     blocked_announced = True
+                    log.info("allocate L%d gpu=%s blocked", level, gpu)
                     on_block()
                 cls._cv.wait()
 
@@ -176,6 +239,9 @@ class Slots:
             if s is not None:
                 cls._live.add(s)
                 cls._cv.notify_all()
+                log.info("try_allocate L%d gpu=%s -> %s", level, gpu, s)
+            else:
+                log.debug("try_allocate L%d gpu=%s -> None", level, gpu)
             return s
 
     @classmethod
@@ -197,6 +263,7 @@ class Slots:
                 pool.remove(buddy)
                 s = _parent(s)
             cls._pools.setdefault((s.gpu_id, s.level), deque()).append(s)
+            log.info("deallocate %s -> coalesced %s", slot, s)
             if s.level == 1:
                 cls._last_used[s.gpu_id] = time.perf_counter()
             cls._cv.notify_all()

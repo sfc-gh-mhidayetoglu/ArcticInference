@@ -20,34 +20,12 @@ This document describes the complications we hit and how each is handled.
 
 ---
 
-## Installation (Ubuntu 24.04)
+## Installation
 
-CRIU is not in the default Ubuntu repos at a recent-enough version.
-Install from the official CRIU PPA:
-
-```bash
-# 1. Add the CRIU PPA
-sudo apt-get install -y software-properties-common
-sudo add-apt-repository -y ppa:criu/ppa
-sudo apt-get update
-
-# 2. Install CRIU (brings in crit, protobuf, etc.)
-sudo apt-get install -y criu
-
-# 3. Verify
-criu --version          # should print 4.x
-which crit              # /usr/sbin/crit  (CRIU image tool)
-```
-
-After installing, create the empty plugin directory that the dump
-command references via `--libdir`:
-
-```bash
-sudo mkdir -p /usr/lib/criu/empty
-```
-
-Without this directory the dump aborts at plugin initialization
-(see Complication 7 below).
+CRIU install instructions (PPA path on Ubuntu 24.04, plus a
+build-from-source fallback) have moved to [`INSTALL.md`](./INSTALL.md).
+The plugin directory caveat referenced from *Complication 7* below is
+covered there.
 
 ---
 
@@ -268,11 +246,21 @@ that occurred when remapping deleted shared-memory files.
 `save()` writes a `meta.json` file alongside the CRIU image containing:
 
 - **CRIU plumbing**: `child_pid`, `pipe_fd`, `pipe_resource`, `nvidia_fds`, `rank`
-- **Instance metadata**: `vllm_config`, `total_gpu_bytes`, `pinned_cpu_bytes`
+- **Instance metadata**: `vllm_config` (which may include the reserved
+  `_env` mapping of per-model env vars), `total_gpu_bytes`,
+  `pinned_cpu_bytes`
 
 On `load()`, the instance validates that the image's `vllm_config`
 matches the instance's config.  A mismatch raises `RuntimeError`
 immediately, before any worker is spawned or CRIU restore attempted.
+
+The child's `os.environ` is itself captured inside the CRIU dump and
+restored verbatim by `load()`, so env vars set during cold start
+(both the hard-coded trio in `vllm_child_loop` and any
+`vllm_config["_env"]` applied before `from vllm import LLM`) survive
+restore without further work.  `_env` in `meta.json` is consulted only
+on cold-start paths (orchestrator-side `register`) and by
+client-side dedup; it is *not* re-applied on `load()`.
 
 ---
 

@@ -9,14 +9,14 @@ restored (possibly on a different GPU):
 
     inst.unpin().sleep().checkpoint_cuda().save_image(filename="/data-fast/ckpt/m").wait()
     inst.restore_cuda(gpu=2).wake_up_weights().repin() \
-        .plan_load_weights().load_weights().wake_up_kv_cache().wait()
+        .plan_restore_weights().restore_weights().wake_up_kv_cache().wait()
 
 On a later run, load_image() restores from the on-disk image:
 
     inst = Instance(vllm_config)
-    inst.load_image("/data-fast/ckpt/m").plan_load_weights().wait()
+    inst.load_image("/data-fast/ckpt/m").plan_restore_weights().wait()
     inst.restore_cuda(gpu=0).wake_up_weights().repin() \
-        .load_weights().wake_up_kv_cache().wait()
+        .restore_weights().wake_up_kv_cache().wait()
 """
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ import weakref
 import pynvml
 import torch.multiprocessing as mp
 
+import semip_logging
+from demuxer import Demuxer
 from worker import worker_loop
 
 _spawn_ctx = mp.get_context("spawn")
@@ -44,6 +46,20 @@ def _alloc_instance_id():
         return _next_instance_id - 1
 
 
+def _truncate_for_display(value, limit=200):
+    """Truncate strings (or strings inside a list/tuple) to ``limit`` chars,
+    appending ``...(<n> chars)`` when the original exceeds ``limit``.
+    """
+    if isinstance(value, str):
+        if len(value) > limit:
+            return f"{value[:limit]}...({len(value)} chars)"
+        return value
+    if isinstance(value, (list, tuple)):
+        out = [_truncate_for_display(v, limit) for v in value]
+        return out if isinstance(value, list) else tuple(out)
+    return value
+
+
 class Instance:
 
     _all: weakref.WeakValueDictionary[int, "Instance"] = weakref.WeakValueDictionary()
@@ -53,15 +69,28 @@ class Instance:
         self.vllm_config = vllm_config
         self.instance_id = _alloc_instance_id()
         Instance._all[self.instance_id] = self
+        self.log = semip_logging.instance(self.instance_id, self.gpu)
+        # Per-instance file gets a fresh start at construction time so
+        # any later instance.N / worker.N / child.N records land in a
+        # clean file.  Worker subprocesses do NOT re-truncate (they'd
+        # erase parent-side records that arrived before they spawned).
+        _log_path = semip_logging.truncate_instance_file(self.instance_id)
+        semip_logging.attach_instance_file(self.instance_id)
+        # Breadcrumb on the terminal (via the orch logger so it isn't
+        # swallowed by the per-instance file route) so users know where
+        # to tail.
+        semip_logging.orch().info(
+            "instance %d created  model=%s  log=%s",
+            self.instance_id,
+            vllm_config.get("model", "?"),
+            _log_path,
+        )
 
         self.pid = None
         self.state = "created"
         self.pinned_cpu_bytes = 0
         self.total_gpu_bytes = 0
         self._image_dir = None
-        self._pending_count = 0
-        self._pending_cmds = []
-        self._total_sent = 0
 
         self._cmd_queue = None
         self._result_queue = None
@@ -71,8 +100,16 @@ class Instance:
         self.last_generate_result = None
         self.last_prompt_tokens = None
         self.last_completion_tokens = None
-        self.generate_results = {}  # req_id -> {outputs, prompt_tokens, completion_tokens}
-        self._external_waiter = False  # set True when orchestrator waiter owns the queue
+        self.generate_results = {}  # req_id -> {prompts, outputs, prompt_tokens, completion_tokens, ttft_s, tpot_ms}
+        self._pending_prompts = {}  # req_id -> prompts (popped on completion)
+
+        # The demuxer is the sole consumer of ``_result_queue``; it is
+        # (re)created whenever queues are (re)created via _ensure_queues.
+        # Listeners registered before the demuxer exists are buffered and
+        # installed at ``_ensure_queues`` time so the orchestrator can
+        # call ``add_cmd_listener`` regardless of init ordering.
+        self._demuxer: Demuxer | None = None
+        self._deferred_listeners: list[tuple[str | None, object]] = []
 
     def _ensure_queues(self):
         """Create mp queues/counter on demand, right before spawning a worker."""
@@ -80,9 +117,16 @@ class Instance:
             self._cmd_queue = _spawn_ctx.Queue()
             self._result_queue = _spawn_ctx.Queue()
             self._completed_counter = _spawn_ctx.Value('i', 0)
-            self._pending_count = 0
-            self._pending_cmds = []
-            self._total_sent = 0
+            self._demuxer = Demuxer(
+                instance_id=self.instance_id,
+                result_queue=self._result_queue,
+                log=self.log,
+                apply_result_cb=self._demuxer_apply_result,
+                summarise_cb=self._summarise_for_log,
+            )
+            for cmd, cb in self._deferred_listeners:
+                self._demuxer.add_listener(cmd, cb)
+            self._demuxer.start()
 
     def __repr__(self):
         parts = [f"id={self.instance_id}", f"gpu={self.gpu}",
@@ -93,7 +137,17 @@ class Instance:
     # -- Internal helpers -------------------------------------------------------
 
     def _close_queues(self):
-        """Deterministically close mp queues so semaphores are released now."""
+        """Stop the demuxer and deterministically close mp queues.
+
+        Stopping the demuxer first lets the consumer thread exit before
+        we close the queue under it.  ``Demuxer.stop`` is a no-op when
+        invoked from the demuxer thread itself (e.g. when teardown's
+        ``_apply_result`` calls into ``_reset``), so this is safe from
+        every caller.
+        """
+        if self._demuxer is not None:
+            self._demuxer.stop()
+            self._demuxer = None
         for q in (self._cmd_queue, self._result_queue):
             if q is not None:
                 try:
@@ -110,7 +164,7 @@ class Instance:
         if self._worker is not None:
             self._worker.join(timeout=10)
             if self._worker.is_alive():
-                self._print(f"[inst{self.instance_id}] worker still alive after join, force-killing")
+                self.log.warning("worker still alive after join, force-killing")
                 try:
                     import signal
                     os.kill(self._worker.pid, signal.SIGKILL)
@@ -121,20 +175,65 @@ class Instance:
         self._close_queues()
         self.state = "created"
         self.gpu = None
+        self.log.set_gpu(None)
         self.pid = None
         self.pinned_cpu_bytes = 0
 
     def _send(self, cmd, **kwargs):
         self._cmd_queue.put((cmd, kwargs))
-        self._pending_count += 1
-        self._pending_cmds.append(cmd)
-        self._total_sent += 1
+        self._demuxer.notify_send(cmd)
+        return self
+
+    @property
+    def _pending_count(self) -> int:
+        """Number of cmds in flight; readers include the dashboard.
+
+        Returns 0 when the demuxer hasn't been created yet (e.g. before
+        ``init`` or after ``teardown``); callers use this for display
+        only and don't expect transient counts to persist across
+        worker lifecycle.
+        """
+        if self._demuxer is None:
+            return 0
+        return self._demuxer.pending_count
+
+    @property
+    def _pending_cmds(self) -> list[str]:
+        """FIFO snapshot of currently-pending cmds.  Used by the dashboard."""
+        if self._demuxer is None:
+            return []
+        return self._demuxer.pending_cmds
+
+    def add_cmd_listener(self, cmd: str | None, callback) -> "Instance":
+        """Register *callback* to fire when the demuxer processes *cmd*.
+
+        ``cmd=None`` registers a catch-all that fires for every cmd.
+        Listeners persist across the current worker lifecycle; if the
+        demuxer hasn't been created yet (Instance fresh from
+        ``__init__``), the registration is buffered and applied when
+        ``_ensure_queues`` brings the demuxer up.
+        """
+        if self._demuxer is not None:
+            self._demuxer.add_listener(cmd, callback)
+        else:
+            self._deferred_listeners.append((cmd, callback))
+        return self
+
+    def remove_cmd_listener(self, cmd: str | None, callback) -> "Instance":
+        if self._demuxer is not None:
+            self._demuxer.remove_listener(cmd, callback)
+        else:
+            try:
+                self._deferred_listeners.remove((cmd, callback))
+            except ValueError:
+                pass
         return self
 
     # -- Primitives (non-blocking, return self) --------------------------------
 
     def init(self, gpu: int):
         self.gpu = gpu
+        self.log.set_gpu(gpu)
         # Snapshot the GPU's physical capacity once per instance lifetime.
         # Safe under the orchestrator contract that init always takes a
         # full L1 slot (no shared tenants), so .total matches what vLLM
@@ -146,7 +245,7 @@ class Instance:
         self._ensure_queues()
         self._worker = _spawn_ctx.Process(
             target=worker_loop,
-            args=(gpu, self._cmd_queue, self._result_queue,
+            args=(self.instance_id, gpu, self._cmd_queue, self._result_queue,
                   self._completed_counter),
         )
         self._worker.start()
@@ -155,6 +254,10 @@ class Instance:
     def attach(self):
         self._log("attach")
         return self._send("attach")
+
+    def attach_pinned(self):
+        self._log("attach_pinned")
+        return self._send("attach_pinned")
 
     def detach(self):
         self._log("detach")
@@ -171,6 +274,41 @@ class Instance:
     def sleep(self):
         self._log("sleep")
         return self._send("sleep")
+
+    def pause(self):
+        """Freeze the engine and snapshot in-flight requests.
+
+        Sets the child's ``_paused`` flag and, in the same step,
+        captures every active sub-request's
+        ``(prompt_token_ids, output_token_ids_so_far,
+        sampling_params, t0, first_token_ts)`` into a child-local
+        list, then ``engine.abort_request(eids)`` so subsequent
+        ``unpin()`` / ``sleep()`` / ``checkpoint_cuda()`` are safe.
+        Pending ``generate_done`` messages are deferred until
+        ``resume()`` re-adds the requests via prefill and drives them
+        to completion.
+
+        Idempotent (can be called when no requests are active).
+        """
+        self._log("pause")
+        return self._send("pause")
+
+    def resume(self):
+        """Re-add saved requests via prefill and unfreeze the engine.
+
+        Pairs with ``pause()``.  Each saved sub-request is re-added
+        with ``prompt = original_prompt + output_so_far`` and
+        ``max_tokens`` reduced by the number of pre-pause output
+        tokens, so the original ``req_id`` continues seamlessly.
+        Then clears ``_paused`` so the child's main loop resumes
+        calling ``engine.step()``.
+
+        Re-prefill is bit-exact for greedy (``temperature=0``) only;
+        stochastic decode trajectories will diverge across the pause
+        because per-request RNG state is not captured.
+        """
+        self._log("resume")
+        return self._send("resume")
 
     def checkpoint_cuda(self):
         self._log("checkpoint_cuda")
@@ -216,7 +354,7 @@ class Instance:
             # Hydrate budget inputs from meta.json; the child holds the
             # real pinned buffer that survived CRIU.  Old images without
             # ``total_gpu_bytes`` degrade to single-chunk behavior in
-            # plan_load_weights().  Fall back to the legacy
+            # plan_restore_weights().  Fall back to the legacy
             # ``pinned_bytes`` key for one release.
             self.total_gpu_bytes = int(meta.get("total_gpu_bytes", 0))
             self.pinned_cpu_bytes = int(meta.get(
@@ -227,7 +365,7 @@ class Instance:
         self._ensure_queues()
         self._worker = _spawn_ctx.Process(
             target=worker_loop,
-            args=(0, self._cmd_queue, self._result_queue,
+            args=(self.instance_id, 0, self._cmd_queue, self._result_queue,
                   self._completed_counter),
         )
         self._worker.start()
@@ -249,8 +387,8 @@ class Instance:
         self._log("wake_up_kv_cache")
         return self._send("wake_up_kv_cache")
 
-    def plan_load_weights(self):
-        """Precompute the chunk plan that the next load_weights() will consume.
+    def plan_restore_weights(self):
+        """Precompute the chunk plan that the next restore_weights() will consume.
 
         Self-computes the staging budget from instance state populated by
         ``init`` (cold start) or by ``load`` reading meta.json (restore):
@@ -271,36 +409,37 @@ class Instance:
         if self.total_gpu_bytes <= 0 or self.pinned_cpu_bytes <= 0:
             mb = None
         else:
-            util = self.vllm_config.get("gpu_memory_utilization", 0.7)
+            util = self.vllm_config["gpu_memory_utilization"]
             allotment = int(self.total_gpu_bytes * util)
-            mb = min(self.pinned_cpu_bytes,
-                     allotment - self.pinned_cpu_bytes)
-        self._log(f"plan_load_weights(max_buffer_bytes={mb})")
-        return self._send("plan_load_weights", max_buffer_bytes=mb)
+            mb = int(0.9 * min(self.pinned_cpu_bytes,
+                               allotment - self.pinned_cpu_bytes))
+        self._log(f"plan_restore_weights(max_buffer_bytes={mb})")
+        return self._send("plan_restore_weights", max_buffer_bytes=mb)
 
-    def load_weights(self):
+    def restore_weights(self):
         """Copy staged weights from pinned CPU into model parameters.
 
         Pure execution against the chunk plan cached by a prior
-        ``plan_load_weights()``.  For each chunk, the worker copies a
-        slice of the pinned buffer to a single reused GPU staging buffer
-        (PCIe H2D) and then scatters into ``model.named_parameters()``
-        in place.  If no plan is cached (paths that skip
-        ``plan_load_weights``), falls back to a single-chunk path
-        identical to the prior unbounded behavior.
+        ``plan_restore_weights()``.  For each chunk, the worker copies
+        a slice of the pinned buffer to a single reused GPU staging
+        buffer (PCIe H2D) and then scatters into
+        ``model.named_parameters()`` in place.  If no plan is cached
+        (paths that skip ``plan_restore_weights``), falls back to a
+        single-chunk path identical to the prior unbounded behavior.
 
         Requires a prior ``attach() -> ... -> stage()`` to have populated
         the pinned buffer, and ``wake_up_weights()`` to have allocated
         the destination parameter tensors.
         """
-        self._log("load_weights")
-        return self._send("load_weights")
+        self._log("restore_weights")
+        return self._send("restore_weights")
 
     def generate(self, prompts, sampling_params):
         self._log(f"generate({len(prompts)} prompts)")
         req_id = f"inst{self.instance_id}-{self._next_req_id}"
         self._next_req_id += 1
         self.last_req_id = req_id
+        self._pending_prompts[req_id] = prompts
         return self._send("generate", req_id=req_id, prompts=prompts,
                            sampling_params=sampling_params)
 
@@ -309,9 +448,16 @@ class Instance:
         return self._send("teardown")
 
     def remove(self):
-        """Remove from the instance registry."""
+        """Deregister this instance from the class-level registry.
+
+        Non-blocking and non-destructive: does not touch the worker
+        process or pending commands.  Returns the ``Instance`` class so
+        a subsequent chained ``status()`` resolves to the classmethod
+        view (the deregistered instance no longer appears there).
+        """
         self._log("remove")
         Instance._all.pop(self.instance_id, None)
+        return Instance
 
     # -- Synchronization -------------------------------------------------------
 
@@ -327,6 +473,7 @@ class Instance:
             self.pinned_cpu_bytes = 0
         elif cmd == "checkpoint_cuda":
             self.gpu = None
+            self.log.set_gpu(None)
             self.state = "checkpointed"
         elif cmd == "save_image":
             self._image_dir = info.get("image_dir", self._image_dir)
@@ -334,9 +481,11 @@ class Instance:
         elif cmd == "load_image":
             self.pid = info.get("pid")
             self.gpu = None
+            self.log.set_gpu(None)
             self.state = "checkpointed"
         elif cmd == "restore_cuda":
             self.gpu = info.get("gpu", self.gpu)
+            self.log.set_gpu(self.gpu)
             self.state = "alive"
         elif cmd == "generate":
             self.last_generate_result = info.get("outputs")
@@ -345,69 +494,153 @@ class Instance:
             req_id = info.get("req_id")
             if req_id is not None:
                 self.generate_results[req_id] = {
+                    "prompts": info.get("prompts"),
                     "outputs": info.get("outputs"),
                     "prompt_tokens": info.get("prompt_tokens"),
                     "completion_tokens": info.get("completion_tokens"),
+                    "ttft_s": info.get("ttft_s"),
+                    "tpot_ms": info.get("tpot_ms"),
                 }
         elif cmd == "teardown":
             self._reset()
 
+    def _demuxer_apply_result(self, cmd: str, info: dict) -> None:
+        """Demuxer apply-result callback.
+
+        Pops the matching ``_pending_prompts`` entry for generate cmds
+        (so ``_apply_result`` can read ``info["prompts"]``) and then
+        delegates to ``_apply_result``.  Runs on the demuxer thread.
+        """
+        if cmd == "generate":
+            rid = info.get("req_id")
+            info["prompts"] = self._pending_prompts.pop(rid, None)
+        self._apply_result(cmd, info)
+
+    @staticmethod
+    def _summarise_for_log(cmd: str, info: dict):
+        """Demuxer log-summary callback.
+
+        Compacts the noisy generate ``info`` dict into a token summary
+        (prompt/output text is already logged by ``vllm_child.py`` at
+        generate completion; we keep the instance log to a token
+        summary so it isn't duplicated).
+        """
+        if cmd == "generate":
+            return {
+                "req_id": info.get("req_id"),
+                "prompt_tokens": info.get("prompt_tokens"),
+                "completion_tokens": info.get("completion_tokens"),
+            }
+        return info
+
     def wait(self):
         """Block until all pending commands complete for this instance.
 
-        Raises RuntimeError on the first command that failed.
+        Re-raises ``RuntimeError`` (and clears the latch) on the first
+        command that failed in this batch.  Implemented as a thin
+        condvar wait on the demuxer's ``_pending_count`` -- safe under
+        any number of concurrent ``wait()`` callers because the
+        demuxer is the sole consumer of ``_result_queue``.
         """
+        if self._demuxer is None:
+            return self
         self._log(f"wait ({self._pending_count} pending)")
-
-        while self._pending_count > 0:
-            result = self._result_queue.get()
-            cmd, elapsed, error, info = result
-
-            self._pending_count -= 1
-            if self._pending_cmds:
-                self._pending_cmds.pop(0)
-
-            status = "OK" if error is None else "FAILED"
-            display_info = {k: v for k, v in info.items() if k != "outputs"} if cmd == "generate" else info
-            self._print(f"[gpu{self.gpu}] [{time.strftime('%H:%M:%S')}] "
-                         f"{cmd} {status} ({elapsed:.3f}s) {display_info}")
-
-            if error is None:
-                self._apply_result(cmd, info)
-
-            if error is not None:
-                raise RuntimeError(f"GPU {self.gpu} command '{cmd}' failed: {error}")
-
+        self._demuxer.wait_idle()
         return self
 
-    def _sync_state(self):
-        """Drain completed results from the worker without blocking.
+    # -- Status ----------------------------------------------------------------
 
-        Updates local state to reflect what the worker has actually finished,
-        using _completed_counter to know how many results are available.
-        Skipped when an external waiter (orchestrator) owns the queue.
+    def status(self=None):
+        """Print all instances grouped by GPU, with CPU/GPU memory footprints.
+
+        Non-blocking: per-instance state is kept fresh in real time by
+        each instance's demuxer (which always drains
+        ``_result_queue``), so no explicit sync step is needed before
+        rendering.  GPU memory is read via NVML so no CUDA context is
+        initialized in the caller.
+
+        Returns ``self`` when called on an instance (so it can be chained
+        with other primitives), and the ``Instance`` class when called as
+        ``Instance.status()``.
         """
-        if self._external_waiter:
-            return
-        completed = self._completed_counter.value
-        available = completed - (self._total_sent - self._pending_count)
-        for _ in range(available):
-            try:
-                result = self._result_queue.get_nowait()
-            except Exception:
-                break
-            cmd, elapsed, error, info = result
-            self._pending_count -= 1
-            if self._pending_cmds:
-                self._pending_cmds.pop(0)
-            if error is None:
-                self._apply_result(cmd, info)
+        from collections import defaultdict
+
+        cls = Instance
+        instances = list(cls._all.values())
+
+        by_gpu: dict[int, list["Instance"]] = defaultdict(list)
+        unassigned: list["Instance"] = []
+        for inst in instances:
+            if inst.gpu is None:
+                unassigned.append(inst)
+            else:
+                by_gpu[inst.gpu].append(inst)
+
+        gpu_mem: dict[int, tuple[int, int]] = {}
+        pid_gpu_bytes: dict[int, int] = {}
+        num_gpus = 0
+        try:
+            pynvml.nvmlInit()
+            num_gpus = pynvml.nvmlDeviceGetCount()
+            _NVML_NA = 0xFFFFFFFFFFFFFFFF
+            for g in range(num_gpus):
+                h = pynvml.nvmlDeviceGetHandleByIndex(g)
+                m = pynvml.nvmlDeviceGetMemoryInfo(h)
+                gpu_mem[g] = (int(m.used), int(m.total))
+                try:
+                    procs = pynvml.nvmlDeviceGetComputeRunningProcesses(h)
+                except Exception:
+                    procs = []
+                for p in procs:
+                    used = getattr(p, "usedGpuMemory", None)
+                    if used is None or used == _NVML_NA:
+                        continue
+                    pid_gpu_bytes[p.pid] = pid_gpu_bytes.get(p.pid, 0) + int(used)
+        except Exception:
+            pass
+
+        bar = "=" * 80
+        print(f"\n{bar}", flush=True)
+        print(f"  Instance Status  [{time.strftime('%H:%M:%S')}]"
+              f"  ({len(instances)} instance(s))", flush=True)
+        print(bar, flush=True)
+
+        for gpu in sorted({*by_gpu.keys(), *range(num_gpus)}):
+            if gpu in gpu_mem:
+                used, total = gpu_mem[gpu]
+                free = total - used
+                print(f"  GPU {gpu}:  {used / 2**30:.2f} / {total / 2**30:.2f} GiB used  "
+                      f"({free / 2**30:.2f} GiB free)", flush=True)
+            else:
+                print(f"  GPU {gpu}:", flush=True)
+            for inst in by_gpu.get(gpu, []):
+                cls._print_instance(inst, pid_gpu_bytes)
+
+        if unassigned:
+            print(f"  Unassigned:", flush=True)
+            for inst in unassigned:
+                cls._print_instance(inst, pid_gpu_bytes)
+
+        print(f"{bar}\n", flush=True)
+        return self if self is not None else cls
+
+    @staticmethod
+    def _print_instance(inst, pid_gpu_bytes):
+        model = inst.vllm_config.get("model", "?")
+        if isinstance(model, str):
+            model = model.split("/")[-1]
+        pinned_gib = inst.pinned_cpu_bytes / 2**30
+        gpu_gib = pid_gpu_bytes.get(inst.pid, 0) / 2**30 if inst.pid else 0.0
+        pending = inst._pending_cmds or []
+        marker = "*" if inst.state == "alive" else " "
+        print(f"    [{marker}] inst{inst.instance_id:<3} "
+              f"{inst.state:<14} {model:<40} "
+              f"pinned_cpu={pinned_gib:5.2f} GiB  "
+              f"gpu_mem={gpu_gib:5.2f} GiB  "
+              f"pid={inst.pid}  "
+              f"pending={pending}", flush=True)
 
     # -- Logging ---------------------------------------------------------------
 
-    def _print(self, msg):
-        print(msg, flush=True)
-
     def _log(self, cmd):
-        self._print(f"[inst{self.instance_id}] [{time.strftime('%H:%M:%S')}] (pid={os.getpid()}) "
-                     f"{cmd} -> gpu{self.gpu} (pending={self._pending_cmds})")
+        self.log.info("enqueue %s pending=%s", cmd, self._pending_cmds)

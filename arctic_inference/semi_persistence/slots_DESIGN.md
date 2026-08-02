@@ -86,6 +86,9 @@ We do **not** store the buddy tree as a node graph. The entire state is:
 - `_last_used: dict[gpu_id, float]` — `perf_counter` of when each GPU was last
   fully released back to a single level-1 root. Drives coldest-first auto-pick.
 - `_waiters: deque[Waiter]` — FIFO queue of blocked `allocate` calls.
+- `_draining: set[int]` — GPUs being removed from the pool by
+  `Orchestrator.sub`. `_try_allocate` skips them so no new placements
+  land on a draining GPU; `pop` clears the entry once the GPU is reaped.
 - `_lock` / `_cv` — single mutex (`Lock`) wrapped in a `Condition`, guarding
   all of the above and waking waiters.
 
@@ -106,6 +109,10 @@ class Slots:
     def allocate(cls, level: int, gpu: int | None = None) -> Slot: ...  # blocks
     @classmethod
     def deallocate(cls, slot: Slot) -> None: ...
+    @classmethod
+    def add(cls, gpu: int) -> bool: ...                # join pool
+    @classmethod
+    def pop(cls, gpu: int) -> None:  ...               # leave pool (must be idle)
     @classmethod
     def status(cls) -> None: ...
     @classmethod
@@ -133,11 +140,12 @@ Seeds `_pools[(g, 1)] = [Slot(g, 1, 0)]` for every `g` and zeros
 
 ### `_try_allocate(level, gpu)` — coldest-first auto-pick (private, lock held)
 
-If `gpu is not None`: just call `_pop_free_in_subtree(gpu, level)`.
+If `gpu is not None`: return `None` if `gpu in _draining`, else just call
+`_pop_free_in_subtree(gpu, level)`.
 
-If `gpu is None`: iterate GPUs sorted by `(_last_used[g], g)` ascending and
-try `_pop_free_in_subtree(g, level)` on each. Return the first success or
-`None`.
+If `gpu is None`: iterate GPUs sorted by `(_last_used[g], g)` ascending,
+**skipping any GPU in `_draining`**, and try `_pop_free_in_subtree(g,
+level)` on each. Return the first success or `None`.
 
 Once auto-pick has chosen a GPU `g`, recursion stays on `g` — we never
 mid-flight switch GPUs and fragment a second one.
@@ -201,6 +209,35 @@ Walks the implicit tree from each GPU's root. For every visited node:
 
 Printed with `tree(1)`-style ASCII (`├──`, `└──`, `│   `, `    `).
 Footer prints the waiter queue.
+
+### `add(gpu)` — grow the pool at runtime
+
+Seeds `_pools[(gpu, 1)] = [Slot(gpu, 1, 0)]`, zeros `_last_used[gpu]`,
+and clears `gpu` from `_draining` (in case a prior `sub` was racing).
+Then `notify_all()` so any FIFO waiter blocked on a head request that's
+now satisfiable can retry.
+
+Returns `True` if the GPU was added, `False` if it was already in the
+pool. Asserts `_inited` (no implicit init from `add`).
+
+### `pop(gpu)` — shrink the pool at runtime
+
+Inverse of `add`. Removes `gpu` entirely from the bookkeeping after
+asserting the GPU is fully idle:
+
+- No live slot references `gpu` (`_live` is clean for `gpu`).
+- The level-1 pool for `gpu` has exactly its root.
+- All higher-level pools for `gpu` are empty.
+
+These asserts are invariants the *caller* must establish — `Slots.pop`
+itself never blocks waiting for residents to clear. The orchestrator
+(`Orchestrator._sub_sync`) is the canonical caller: it sets
+`_draining` first (so `_try_allocate` stops handing out slots on `gpu`),
+walks every resident model down to `checkpoint`, and only then calls
+`pop`. Calling `pop` on a non-drained GPU would `AssertionError`.
+
+Removes the per-GPU pools, drops `_last_used[gpu]`, discards `gpu` from
+`_draining`, and `notify_all()`.
 
 ### `remove()`
 
@@ -318,6 +355,11 @@ These hold whenever no method is mid-execution:
   go. They get `deallocate`d (with side effects), and the head retries.
 - **Migration** — `allocate(new) ; copy_state ; deallocate(old)`. The
   allocator itself is unchanged.
+- **Runtime pool resize** — `add(gpu)` / `pop(gpu)` plus the `_draining`
+  flag let the orchestrator grow or shrink the pool while the system is
+  live. Drain semantics (move residents off, then `pop`) live in
+  `Orchestrator.sub`; the allocator only enforces the "no new placements
+  on draining GPUs" rule and the "fully-idle on `pop`" assertion.
 - **Asymmetric per-GPU root capacities** — if a GPU is "half-size", seed
   `_pools[(g, 2)]` instead of `_pools[(g, 1)]` at init. The buddy math is
   identical; level 1 on that GPU is simply never available.

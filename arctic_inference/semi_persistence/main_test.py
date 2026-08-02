@@ -54,14 +54,14 @@ def main():
     instance_1.restore_cuda(gpu=0)
     instance_1.wake_up(["weights"])
     instance_1.stage("/data-fast/Qwen/Qwen3-1.7B")
-    instance_1.load_weights()
+    instance_1.restore_weights()
     instance_1.detach()
     instance_1.wake_up(["kv_cache"])
 
     instance_2.restore_cuda(gpu=1)
     instance_2.wake_up(["weights"])
     instance_2.stage("/data-fast/nvidia/Llama-3.1-70B-Instruct-FP8")
-    instance_2.load_weights()
+    instance_2.restore_weights()
     instance_2.detach()
     instance_2.wake_up(["kv_cache"])
 
@@ -80,7 +80,7 @@ def main():
     instance_3.restore_cuda(gpu=0)
     instance_3.wake_up(["weights"])
     instance_3.stage("/data-fast/Qwen/Qwen3-32B")
-    instance_3.load_weights()
+    instance_3.restore_weights()
     instance_3.detach()
     instance_3.wake_up(["kv_cache"])
     instance_3.wait()
@@ -107,8 +107,8 @@ def main():
     instance_5.wait()
 
     # Restore instance 4 and 5 on the same GPU
-    instance_4.restore_cuda(gpu=1).wake_up(["weights"]).stage("/data-fast/Qwen/Qwen2.5-7B").load_weights().detach().wake_up(["kv_cache"])
-    instance_5.restore_cuda(gpu=1).wake_up(["weights"]).stage("/data-fast/Qwen/Qwen3-1.7B").load_weights().detach().wake_up(["kv_cache"])
+    instance_4.restore_cuda(gpu=1).wake_up(["weights"]).stage("/data-fast/Qwen/Qwen2.5-7B").restore_weights().detach().wake_up(["kv_cache"])
+    instance_5.restore_cuda(gpu=1).wake_up(["weights"]).stage("/data-fast/Qwen/Qwen3-1.7B").restore_weights().detach().wake_up(["kv_cache"])
 
     instance_4.wait()
     instance_5.wait()

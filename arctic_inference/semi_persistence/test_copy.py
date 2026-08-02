@@ -61,7 +61,7 @@ def main():
         inst.restore_cuda(gpu=slot.gpu_id)
         inst.wake_up_weights()
         inst.repin()
-        inst.load_weights()
+        inst.restore_weights()
         inst.wake_up_kv_cache()
         inst.generate(["Hello, world!"], {})
         inst.sleep()
