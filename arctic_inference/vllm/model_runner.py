@@ -2000,6 +2000,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self,
         batch_descriptors: list[BatchDescriptor],
         cudagraph_runtime_mode: CUDAGraphMode,
+        profiler: Optional[contextlib.AbstractContextManager] = None,
     ):
         """
         Capture CUDA graphs for both base (Ulysses SP) and shift (TP-fused)
@@ -2038,7 +2039,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         if batch_descriptors_base:
             self._orig_capture_cudagraphs(
-                batch_descriptors_base, cudagraph_runtime_mode
+                batch_descriptors_base, cudagraph_runtime_mode, profiler=profiler
             )
 
         # --- Shift model (SP*TP fused as TP-only): uses the unscaled lookup table ---
@@ -2089,6 +2090,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                         self._orig_capture_cudagraphs(
                             batch_descriptors_shift,
                             cudagraph_runtime_mode,
+                            profiler=profiler,
                         )
             finally:
                 self.model = orig_model

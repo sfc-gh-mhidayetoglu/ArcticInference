@@ -1,15 +1,17 @@
 [build-system]
+# Targets the newest/accelerated stack only (vllm 0.26.0 / torch 2.11.0); the vllm-18
+# extra installs an older vllm so its Arctic custom ops are ABI-mismatched (no accel).
 requires = [
     "setuptools>=61.0",
     "wheel",
     "ninja",
     "cmake>=3.12",
     "nanobind==2.9.2",
-    # uv pip install vllm==0.24.0 --dry-run 2>&1 | grep protobuf | sed 's/^ + //'
-    # vllm 0.24.0 requires protobuf>=5.29.6
+    # uv pip install vllm==0.26.0 --dry-run 2>&1 | grep protobuf | sed 's/^ + //'
+    # vllm 0.26.0 requires protobuf>=5.29.6
     "protobuf==5.29.6",
     "grpcio-tools",
-    "torch==2.11.0", # need to be same as user env (vllm 0.24.0 pins torch==2.11.0).
+    "torch==2.11.0", # need to be same as user env (vllm 0.26.0 pins torch==2.11.0).
 ]
 build-backend = "setuptools.build_meta"
 
@@ -50,8 +52,23 @@ packages = [
 "arctic_inference.embedding" = ["arctic_inference/embedding/proto/*.proto"]
 
 [project.optional-dependencies]
+# Canonical supported/accelerated pin for this branch (read by the version check).
 vllm = [
-    'vllm==0.24.0',
+    'vllm==0.26.0',
+]
+
+# Explicit-version install shortcuts. The user picks the pin to match their torch;
+# only vllm==0.26.0 matches the supported pin, so ONLY it gets Arctic patches (any
+# other version -> plugin skips, no acceleration).
+vllm-26 = [
+    'vllm==0.26.0',
+]
+# vllm-18 pulls torch 2.10.0 at runtime, but csrc/compiled ops still build against
+# torch 2.11.0 (build-system, above), so the Arctic ops are ABI-mismatched under
+# 2.10.0 and may not import -> server/BYO only. For native 2.10.0 ops, preinstall
+# torch 2.10.0 and run `pip install -e .[vllm-18] --no-build-isolation`.
+vllm-18 = [
+    'vllm==0.18.0',
 ]
 
 docs = [

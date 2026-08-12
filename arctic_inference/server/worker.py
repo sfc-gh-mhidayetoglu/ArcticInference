@@ -138,14 +138,25 @@ class InferenceWorker:
         import vllm.plugins
         vllm.plugins.load_general_plugins()
 
-        if not arctic_inference_effective_enabled():
-            engine_kwargs.pop("forest_cascade_attn_configs", None)
-
-        # from vllm.v1.engine.async_llm import AsyncLLM
-        # from vllm.engine.arg_utils import AsyncEngineArgs
-
         from vllm.v1.engine.async_llm import AsyncLLM
-        from arctic_inference.vllm.args import ArcticAsyncEngineArgs
+        from arctic_inference.utils import plugin_version_compatible
+
+        # Use Arctic engine args only when the plugin is actually applied
+        # (enabled AND installed vLLM matches the supported pin). Otherwise fall
+        # back to vanilla AsyncEngineArgs and drop Arctic-only kwargs that vanilla
+        # vLLM would reject. Source of the kwarg list: ArcticArgs in
+        # arctic_inference/vllm/args.py.
+        use_arctic = (arctic_inference_effective_enabled()
+                      and plugin_version_compatible())
+        if use_arctic:
+            from arctic_inference.vllm.args import \
+                ArcticAsyncEngineArgs as _EngineArgs
+        else:
+            from vllm.engine.arg_utils import AsyncEngineArgs as _EngineArgs
+            for _k in ("ulysses_sequence_parallel_size", "enable_shift_parallel",
+                       "shift_parallel_threshold", "forest_cascade_attn_configs",
+                       "fp32_lm_head"):
+                engine_kwargs.pop(_k, None)
 
         # invariance setup
         #print(f"{os.environ.get('VLLM_BATCH_INVARIANT')=}")
@@ -162,7 +173,7 @@ class InferenceWorker:
             "arctic_inference.server.weight_sync.WeightSyncExtension",
         )
 
-        engine_args = ArcticAsyncEngineArgs(**engine_kwargs)
+        engine_args = _EngineArgs(**engine_kwargs)
         logger.info("Worker %d engine_args.enable_sleep_mode=%s",
                      os.getpid(), getattr(engine_args, 'enable_sleep_mode', 'N/A'))
         vllm_config = engine_args.create_engine_config()

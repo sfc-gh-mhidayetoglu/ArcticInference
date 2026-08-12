@@ -66,6 +66,27 @@ class ArcticArgs:
     fp32_lm_head: bool = False
 
 
+def _ensure_arctic_fields(engine_args) -> None:
+    """Backfill ArcticArgs defaults onto a plain ``EngineArgs`` instance.
+
+    v0.26 plugin-load timing (runtime-only drift): both 0.24 and 0.26 load
+    general plugins from ``EngineArgs.__post_init__`` -> the *first*
+    ``EngineArgs(...)`` (e.g. ``LLM.__init__`` building it directly) is
+    constructed *before* Arctic's patches are applied, so ``EngineArgsPatch.
+    __new__`` never upgrades it to ``ArcticEngineArgs`` and it lacks the
+    ArcticArgs fields. By the time the (now-patched) ``create_engine_config``
+    runs on that instance, reading ``self.ulysses_sequence_parallel_size``
+    raises ``AttributeError``. On this path the Arctic args can only ever be
+    their defaults (a base ``EngineArgs.__init__`` would reject them as unknown
+    kwargs), so backfilling the dataclass defaults is exact, not a papering-over
+    shim. The CLI path (``from_cli_args`` -> ``ArcticEngineArgs``) already has
+    them and is unaffected.
+    """
+    for f in fields(ArcticArgs):
+        if not hasattr(engine_args, f.name):
+            setattr(engine_args, f.name, f.default)
+
+
 @dataclass
 class ArcticEngineArgs(EngineArgs, ArcticArgs):
     pass
@@ -167,6 +188,7 @@ class EngineArgsPatch(ArcticPatch[EngineArgs]):
         return EngineArgsPatch._orig_from_cli_args.__func__(cls, args)
 
     def create_engine_config(self, *args, **kwargs):
+        _ensure_arctic_fields(self)
         if (self.ulysses_sequence_parallel_size > 1 and
                 self.distributed_executor_backend is None):
             self.distributed_executor_backend = "mp"
@@ -226,6 +248,7 @@ class AsyncEngineArgsPatch(ArcticPatch[AsyncEngineArgs]):
         self._orig_post_init()
 
     def create_engine_config(self, *args, **kwargs):
+        _ensure_arctic_fields(self)
         if (self.ulysses_sequence_parallel_size > 1 and
                 self.distributed_executor_backend is None):
             self.distributed_executor_backend = "mp"

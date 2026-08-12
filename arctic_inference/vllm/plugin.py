@@ -17,30 +17,40 @@ import os
 import sys
 
 import vllm
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 import arctic_inference.envs as envs
-from arctic_inference.utils import get_compatible_vllm_version
+from arctic_inference.utils import (get_compatible_vllm_version,
+                                    plugin_version_compatible)
+
+logger = init_logger(__name__)
 
 
 def arctic_inference_plugin():
     if not envs.ARCTIC_INFERENCE_ENABLED:
         return
 
-    # TODO: port ArcticInference patches to the V2 model runner and drop this.
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-
-    if not envs.ARCTIC_INFERENCE_SKIP_VERSION_CHECK:
-        compatible_version = get_compatible_vllm_version()
-        if vllm.__version__ != compatible_version:
-            raise RuntimeError(
-                f"Arctic Inference plugin requires vllm=={compatible_version} "
-                f"but found vllm=={vllm.__version__}!")
-    
     if not envs.ARCTIC_INFERENCE_SKIP_PLATFORM_CHECK:
         if not current_platform.is_cuda():
             raise RuntimeError(
                 "Arctic Inference plugin requires the cuda platform!")
+
+    # The patches below are version-specific. Only apply them when the installed
+    # vLLM matches the supported pin; otherwise skip (warn) so vLLM runs
+    # unmodified and the server / other vLLM users keep working.
+    # ARCTIC_INFERENCE_SKIP_VERSION_CHECK forces patching regardless.
+    if (not envs.ARCTIC_INFERENCE_SKIP_VERSION_CHECK
+            and not plugin_version_compatible()):
+        logger.warning(
+            "Arctic Inference plugin is pinned to vllm==%s but found "
+            "vllm==%s; skipping Arctic patches.",
+            get_compatible_vllm_version(), vllm.__version__)
+        return
+
+    # Applying the (version-dependent) plugin from here on.
+    # TODO: port ArcticInference patches to the V2 model runner and drop this.
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
     print("\x1b[36;1mArctic Inference plugin is enabled!\x1b[0m",
           file=sys.stderr)

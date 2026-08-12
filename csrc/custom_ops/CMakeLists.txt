@@ -5,7 +5,9 @@ project(CustomOps CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(TORCH_CUDA_ARCH_LIST "7.0 7.5 8.0 8.6 8.9 9.0+PTX")
+# CUDA 13 (required by torch cu130 / vllm 0.26) dropped sm_70 (Volta); the
+# lowest gencode nvcc 13 still accepts is compute_75. Keep 7.5+ for portability.
+set(TORCH_CUDA_ARCH_LIST "7.5 8.0 8.6 8.9 9.0+PTX")
 
 message(STATUS "TORCH_CMAKE_PREFIX_PATH: ${TORCH_CMAKE_PREFIX_PATH}")
 

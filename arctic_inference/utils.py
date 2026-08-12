@@ -18,12 +18,22 @@ from importlib.metadata import requires
 
 
 def get_compatible_vllm_version():
+    # The `vllm` extra is the single canonical *supported* pin (the version the
+    # plugin's patches target). Version-named shortcuts (vllm-18/vllm-26) are
+    # intentionally NOT matched here, so this stays unambiguous.
     reqs = requires("arctic_inference")
     for req in reqs:
         match = re.match("vllm==(.*); extra == \"vllm\"", req)
         if match is not None:
             return match.groups()[0]
-        
+
+
+def plugin_version_compatible() -> bool:
+    """True iff the installed vLLM exactly matches the plugin's supported pin."""
+    import vllm
+    want = get_compatible_vllm_version()
+    return want is not None and vllm.__version__ == want
+
 
 # For debugging
 def print0(*args, **kwargs):

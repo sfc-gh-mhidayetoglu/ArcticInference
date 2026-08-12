@@ -44,6 +44,7 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader,
                                               maybe_prefix)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 
 # Add FlashInfer backend detection
 try:
@@ -396,7 +397,12 @@ class LlamaSwiftKVModel(nn.Module):
                                              config.hidden_size, device="cuda"),
                 "residual": torch.empty(self.cuda_graph_max_batch_size,
                                         config.hidden_size, device="cuda"),
-                "positions": torch.empty(self.cuda_graph_max_batch_size,
+                # zeros (not empty): vLLM 0.26's new profile_cudagraph_memory()
+                # runs this decode forward while attn_metadata is None, so
+                # swiftkv_select returns this buffer unfilled. Uninitialized
+                # int64 positions would index the rotary cache out of bounds
+                # (device-side assert). 0 is always valid; real runs overwrite.
+                "positions": torch.zeros(self.cuda_graph_max_batch_size,
                                          dtype=torch.long, device="cuda"),
                 "k_states": torch.empty(self.cuda_graph_max_batch_size,
                                         kv_size, device="cuda"),
@@ -573,7 +579,6 @@ class LlamaSwiftKVModel(nn.Module):
         v_states: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor]:
-        forward_context: ForwardContext = get_forward_context()
         attn_metadata = get_attn_metadata_for_swiftkv()
         if attn_metadata is None:
             # Graph capture or profiling mode.
@@ -600,7 +605,9 @@ class LlamaSwiftKVModel(nn.Module):
             for idx, layer in enumerate(
                     self.layers[self.config.num_key_value_layers:]):
                 attn = layer.self_attn.attn
-                kv_cache = attn.kv_cache[forward_context.virtual_engine]
+                # v0.26: attn.kv_cache is a single tensor per layer;
+                # ForwardContext.virtual_engine was removed (drift #1/#7).
+                kv_cache = attn.kv_cache
                 if kv_cache.numel():
                     # different cache layouts
                     if FLASHINFER_AVAILABLE and isinstance(attn_metadata, FlashInferMetadata):
@@ -608,9 +615,17 @@ class LlamaSwiftKVModel(nn.Module):
                         key_caches.append(kv_cache[:, 0])
                         value_caches.append(kv_cache[:, 1])
                     else:
-                        # FlashAttention: [2, num_blocks, block_size, num_kv_heads, head_size]
-                        key_caches.append(kv_cache[0])
-                        value_caches.append(kv_cache[1])
+                        # v0.26 FlashAttention: KV packed as
+                        # (num_blocks, num_kv_heads, block_size, 2*head_size);
+                        # split out key/value as logical
+                        # (num_blocks, block_size, num_kv_heads, head_size)
+                        # views (drift #8, same port as the FCA fork).
+                        key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                            head_size, dim=-1)
+                        key_caches.append(
+                            canonicalize_singleton_dim_strides(key_cache))
+                        value_caches.append(
+                            canonicalize_singleton_dim_strides(value_cache))
                     k_scales.append(attn._k_scale)
                     v_scales.append(attn._v_scale)
 
@@ -629,14 +644,23 @@ class LlamaSwiftKVModel(nn.Module):
             for idx, layer in enumerate(
                     self.layers[self.config.num_key_value_layers:]):
                 attn = layer.self_attn.attn
-                kv_cache = attn.kv_cache[forward_context.virtual_engine]
+                # v0.26: attn.kv_cache is a single tensor per layer;
+                # ForwardContext.virtual_engine was removed (drift #1/#7).
+                kv_cache = attn.kv_cache
                 if kv_cache.numel():
                     if FLASHINFER_AVAILABLE and isinstance(attn_metadata, FlashInferMetadata):
                         # FlashInfer: [num_blocks, 2, block_size, num_kv_heads, head_size]
                         k_cache, v_cache = kv_cache.unbind(1)
                     else:
-                        # FlashAttention: [2, num_blocks, block_size, num_kv_heads, head_size]
-                        k_cache, v_cache = kv_cache.unbind(0)
+                        # v0.26 FlashAttention: KV packed as
+                        # (num_blocks, num_kv_heads, block_size, 2*head_size);
+                        # split out key/value as logical
+                        # (num_blocks, block_size, num_kv_heads, head_size)
+                        # views (drift #8, same port as the FCA fork).
+                        k_cache, v_cache = kv_cache.transpose(1, 2).split(
+                            attn.head_size, dim=-1)
+                        k_cache = canonicalize_singleton_dim_strides(k_cache)
+                        v_cache = canonicalize_singleton_dim_strides(v_cache)
 
                     torch.ops._C_cache_ops.reshape_and_cache_flash(
                         k_split[idx].view(-1, attn.num_kv_heads, attn.head_size),
