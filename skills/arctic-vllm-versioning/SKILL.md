@@ -14,14 +14,15 @@ disable-model-invocation: true
 
 # ArcticInference vLLM versioning
 
-ArcticInference is a vLLM plugin whose patches target an **exact** vLLM version.
-That target version is a constant (`VLLM_PATCH_VERSION`), decoupled from the
-install extras: the `vllm` extra is left **unpinned** so vLLM resolves against the
-user's torch, and Arctic patches apply only when the *installed* vLLM matches the
-target (otherwise vLLM runs unmodified). This skill describes the current
-targeting/enforcement mechanism. For rebasing the plugin to a new vLLM release,
-use the `rebase-arctic-inference` skill; for the multi-pin future design, see
-`projects/multi_version_pins/DESIGN.md` in the repo.
+ArcticInference is more than a vLLM plugin — it also ships a server, an embedding
+stack, and other components — but this skill is about its **vLLM plugin**, whose
+patches target an **exact** vLLM version. That target version is a constant
+(`VLLM_PATCH_VERSION`), decoupled from the install extras: the `vllm` extra is left
+**unpinned** so vLLM resolves against the user's torch, and Arctic patches apply
+only when the *installed* vLLM matches the target (otherwise vLLM runs unmodified).
+This skill describes the current targeting/enforcement mechanism. For rebasing the
+plugin to a new vLLM release, use the `rebase-arctic-inference` skill; for the
+multi-pin future design, see `projects/multi_version_pins/DESIGN.md` in the repo.
 
 Deeper detail (enforcement code, install matrix, build behavior, version tables)
 is in [reference.md](reference.md).
