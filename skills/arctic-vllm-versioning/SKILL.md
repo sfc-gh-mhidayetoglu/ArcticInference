@@ -85,6 +85,45 @@ runtime, in the plugin entrypoint `arctic_inference/vllm/plugin.py`:
 metadata), changing it does **not** require a reinstall to take effect, and the
 unpinned `vllm` extra can never desync the check.
 
+## `ARCTIC_INFERENCE_ENABLED` vs the version check
+
+These are **two sequential gates**, and the enabled flag is the master switch that
+runs *before* any version logic. vLLM invokes the plugin entry point in every
+process that loads general plugins, so `ARCTIC_INFERENCE_ENABLED` (default `0`) is
+what makes Arctic opt-in. The version check (`plugin_version_compatible()`, which
+reads `VLLM_PATCH_VERSION`) is **downstream** — it is never evaluated unless the
+flag is on.
+
+The whole gate collapses to one boolean rule:
+
+```
+patch  iff  ENABLED and (version_match or SKIP_VERSION_CHECK)
+```
+
+Evaluated as a short-circuit: (1) if `ENABLED` is off (default), nothing else is
+even checked → vanilla vLLM; (2) once enabled, patch if the installed vLLM equals
+`VLLM_PATCH_VERSION` **or** `SKIP_VERSION_CHECK` overrides a mismatch; (3) enabled
+but wrong version with no override → warn + graceful skip (still working vanilla
+vLLM). The skip flag only matters when the versions *don't* match.
+
+| `ENABLED` | `version_match` | `SKIP_VERSION_CHECK` | Patch? |
+|---|---|---|---|
+| `0` (default) | — (not checked) | — (not checked) | No — vanilla vLLM |
+| `1` | T | — (irrelevant) | **Yes** |
+| `1` | F | T | **Yes** (forced; dev/rebase escape hatch) |
+| `1` | F | F | No — warn + graceful skip |
+
+The BYO server re-checks both conditions together rather than assuming the plugin
+ran: `worker.py` uses `use_arctic = arctic_inference_effective_enabled() and
+plugin_version_compatible()`; if either is false it falls back to vanilla
+`AsyncEngineArgs` and strips Arctic-only kwargs.
+`arctic_inference_effective_enabled()` also consults `extra_env` (e.g.
+`ModelConfig.extra_env`), not just `os.environ`, so the driver can predict whether
+*workers* will enable the plugin and omit Arctic engine kwargs accordingly. Note
+`server/config.py` gates its Arctic kwargs on `arctic_inference_effective_enabled()`
+**only** (not the version); `worker.py` is the single place that additionally
+applies the version gate.
+
 ## Scope: what the pin actually governs
 
 | Part | Pinned? | How |
