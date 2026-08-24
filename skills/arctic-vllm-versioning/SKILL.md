@@ -1,8 +1,9 @@
 ---
 name: arctic-vllm-versioning
 description: >-
-  Explains how ArcticInference pins and enforces its vLLM version. Covers the
-  exact-pin declaration (pyproject `vllm` extra), the runtime plugin gate
+  Explains how ArcticInference targets and enforces its vLLM version. Covers the
+  target-version declaration (`VLLM_PATCH_VERSION` in `arctic_inference/utils.py`),
+  the unpinned `vllm` install extra, the runtime plugin gate
   (`arctic_inference.vllm.plugin` + `get_compatible_vllm_version`), the
   (vLLM, torch, protobuf) stack coupling, install/build behavior, and which parts
   of the package are pinned vs pin-agnostic. Use when asked how ArcticInference
@@ -13,10 +14,14 @@ disable-model-invocation: true
 
 # ArcticInference vLLM versioning
 
-ArcticInference is a vLLM plugin pinned to an **exact** vLLM version. This skill
-describes the current pinning/enforcement mechanism. For rebasing the plugin to a
-new vLLM release, use the `rebase-arctic-inference` skill; for the multi-pin
-future design, see `projects/multi_version_pins/DESIGN.md` in the repo.
+ArcticInference is a vLLM plugin whose patches target an **exact** vLLM version.
+That target version is a constant (`VLLM_PATCH_VERSION`), decoupled from the
+install extras: the `vllm` extra is left **unpinned** so vLLM resolves against the
+user's torch, and Arctic patches apply only when the *installed* vLLM matches the
+target (otherwise vLLM runs unmodified). This skill describes the current
+targeting/enforcement mechanism. For rebasing the plugin to a new vLLM release,
+use the `rebase-arctic-inference` skill; for the multi-pin future design, see
+`projects/multi_version_pins/DESIGN.md` in the repo.
 
 Deeper detail (enforcement code, install matrix, build behavior, version tables)
 is in [reference.md](reference.md).
@@ -33,25 +38,32 @@ is in [reference.md](reference.md).
   vLLM (there is no such logic; PEP 508 markers cannot branch on torch).
 
 ```
-vLLM pin ──┬── torch    (exact:  0.26.0 -> torch==2.11.0)
-           └── protobuf (floor:  0.26.0 -> protobuf>=5.29.6)
-build-system torch/protobuf = slaves chosen to match the pin (one ABI per build)
+vLLM target ──┬── torch    (vLLM 0.26.0 itself pins torch==2.11.0)
+              └── protobuf (vLLM 0.26.0 requires protobuf>=5.29.6)
+build-system: torch is a floor (torch>=2.10.0) + protobuf pin, chosen to match
+the target stack (build isolation resolves the newest torch >= the floor)
 ```
 
-## Where the pin is declared
+## Where the target version is declared
 
-`pyproject.toml`:
-- `[project.optional-dependencies] vllm = ['vllm==X']` — the plugin's canonical
-  *supported* exact pin (the one the version check reads).
+The **target version** lives in code, not in the extras:
+- `arctic_inference/utils.py`: `VLLM_PATCH_VERSION = "0.26.0"` — the single source
+  of truth the runtime version check reads. `get_compatible_vllm_version()` just
+  returns this constant.
+
+`pyproject.toml` (install shape only):
+- `[project.optional-dependencies] vllm = ['vllm']` — **unpinned**; vLLM resolves
+  against the user's torch. It no longer encodes the target version.
 - `vllm-26 = ['vllm==0.26.0']`, `vllm-18 = ['vllm==0.18.0']` — explicit-version
   install shortcuts. The user picks one to match their torch; only the one equal to
-  the supported pin gets Arctic patches (others -> plugin skips, no acceleration).
+  `VLLM_PATCH_VERSION` gets Arctic patches (others -> plugin skips, no acceleration).
 - `embedding = ['vllm==0.9.2', ...]` — a **separate** stack with its own pin.
-- `[build-system].requires` — `torch==...`, `protobuf==...` (build-time slaves).
+- `[build-system].requires` — `torch>=2.10.0` (floor), `protobuf==...` (build-time).
 - `[project.entry-points."vllm.general_plugins"]` — registers the plugin entry.
 
 Base `[project]` has **no `dependencies`**, so `pip install arctic-inference`
-installs nothing vLLM-related; `pip install arctic-inference[vllm]` pulls the pin.
+installs nothing vLLM-related; `pip install arctic-inference[vllm]` pulls vLLM
+(unpinned), and the plugin accelerates only if that resolves to `VLLM_PATCH_VERSION`.
 
 ## How the pin is enforced (runtime only)
 
@@ -67,11 +79,11 @@ runtime, in the plugin entrypoint `arctic_inference/vllm/plugin.py`:
 4. Only when compatible: force `VLLM_USE_V2_MODEL_RUNNER=0` and apply the
    version-specific monkeypatches via `apply_arctic_patches()`.
 
-`get_compatible_vllm_version()` / `plugin_version_compatible()` in
-`arctic_inference/utils.py` read installed package metadata
-(`importlib.metadata.requires("arctic_inference")`) for the requirement tagged
-`; extra == "vllm"` (the canonical supported pin) and compare it to
-`vllm.__version__`.
+`get_compatible_vllm_version()` in `arctic_inference/utils.py` returns the
+`VLLM_PATCH_VERSION` constant; `plugin_version_compatible()` is `True` iff
+`vllm.__version__` equals it. Because the target lives in code (not package
+metadata), changing it does **not** require a reinstall to take effect, and the
+unpinned `vllm` extra can never desync the check.
 
 ## Scope: what the pin actually governs
 
@@ -94,12 +106,19 @@ surface map are in [reference.md](reference.md).
 - Multi-pin / multiple plugin implementations design: repo `projects/multi_version_pins/DESIGN.md`.
 
 ## Recently landed (on `rebase/vllm_v26`)
+- **Target version decoupled from extras:** the supported version is now the
+  `VLLM_PATCH_VERSION` constant in `utils.py`, and the `vllm` extra is unpinned
+  (`'vllm'`). Previously the check parsed the exact pin out of the `vllm` extra's
+  metadata, so unpinning that extra would have silently disabled patching on every
+  version; the constant makes unpinning safe.
+- **Build torch is a floor:** `[build-system].requires` uses `torch>=2.10.0`
+  instead of an exact pin, so the build no longer hard-fails on nearby torch.
 - **Graceful skip:** the version gate warns + skips instead of raising, so the
   server and other vLLM users keep working on a non-supported vLLM.
 - **BYO server:** `server/worker.py` falls back to vanilla `AsyncEngineArgs`
   (stripping Arctic-only kwargs) when the plugin isn't applied.
 - **Version-named shortcuts:** `vllm-26` / `vllm-18` extras (torch matching is the
-  user's responsibility; only the supported pin is accelerated).
+  user's responsibility; only the target version is accelerated).
 
 ## Planned evolution (expand here)
 

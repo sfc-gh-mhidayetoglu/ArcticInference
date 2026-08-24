@@ -17,13 +17,16 @@ Detail behind [SKILL.md](SKILL.md). Paths are relative to the ArcticInference re
   `from .patches import apply_arctic_patches; apply_arctic_patches()`.
 
 `arctic_inference/utils.py`:
-- `get_compatible_vllm_version()` — `re.match('vllm==(.*); extra == "vllm"', req)`
-  over `importlib.metadata.requires("arctic_inference")` → the canonical supported
-  pin. Matches **only** the `vllm` extra (not the `vllm-18`/`vllm-26` shortcuts).
-- `plugin_version_compatible()` — `True` iff `vllm.__version__` equals that pin;
-  used by both `plugin.py` and `server/worker.py`.
-- Reads *installed* metadata, so editing `pyproject.toml` requires a reinstall
-  (`pip install -e .`) to refresh `*.egg-info` before the check sees changes.
+- `VLLM_PATCH_VERSION = "0.26.0"` — the single source of truth for the target
+  version, decoupled from the install extras.
+- `get_compatible_vllm_version()` — returns `VLLM_PATCH_VERSION` (no metadata
+  parsing; the previous `re.match('vllm==(.*); extra == "vllm"', ...)` over
+  `importlib.metadata.requires(...)` was removed).
+- `plugin_version_compatible()` — `True` iff `vllm.__version__` equals that
+  constant; used by both `plugin.py` and `server/worker.py`.
+- Because the target is a code constant (not installed metadata), changing it
+  takes effect without a reinstall, and unpinning the `vllm` extra cannot desync
+  the check.
 
 Relevant env flags (`arctic_inference/envs.py`, all default `0`):
 `ARCTIC_INFERENCE_ENABLED`, `ARCTIC_INFERENCE_SKIP_VERSION_CHECK`,
@@ -35,8 +38,8 @@ Relevant env flags (`arctic_inference/envs.py`, all default `0`):
 | Command | Pulls in | vLLM pin? |
 |---------|----------|-----------|
 | `pip install -e .` | nothing (base has no `dependencies`) | — |
-| `pip install -e .[vllm]` | the plugin's canonical supported `vllm==X` | yes |
-| `pip install -e .[vllm-26]` | `vllm==0.26.0` (= supported pin -> accelerated) | yes |
+| `pip install -e .[vllm]` | `vllm` **unpinned** (accelerated only if it resolves to `VLLM_PATCH_VERSION`) | no |
+| `pip install -e .[vllm-26]` | `vllm==0.26.0` (= `VLLM_PATCH_VERSION` -> accelerated) | yes |
 | `pip install -e .[vllm-18]` | `vllm==0.18.0` (plugin skips; server/BYO, no accel) | yes |
 | `pip install -e .[server]` | `ray`, `fastapi`, `uvicorn`, `pydantic>=2.0`, `tqdm` | no (BYO) |
 | `pip install -e .[embedding]` | `vllm==0.9.2`, `protobuf==5.29.5` | yes (0.9.2) |
@@ -51,14 +54,15 @@ Relevant env flags (`arctic_inference/envs.py`, all default `0`):
 
 ## Build behavior
 
-- `[build-system].requires` includes `torch==...`, `protobuf==...`, plus
-  `cmake`, `ninja`, `nanobind`, `grpcio-tools`.
+- `[build-system].requires` includes `torch>=2.10.0` (a floor, not an exact pin),
+  `protobuf==...`, plus `cmake`, `ninja`, `nanobind`, `grpcio-tools`.
 - `setup.py` imports only `torch` (for `torch.utils.cmake_prefix_path` + CUDA arch),
   runs CMake to compile `csrc`, and generates the embedding gRPC protobuf stubs.
   It never imports `vllm`.
-- Under default build isolation, `csrc` is compiled against the build-system
-  torch ABI. That torch must equal the torch the installed vLLM pins, or the
-  compiled ops are ABI-mismatched at runtime.
+- Under default build isolation, `csrc` is compiled against whatever torch the
+  floor resolves to (the newest torch >= `2.10.0`). That torch must match the torch
+  the installed vLLM pins, or the compiled ops are ABI-mismatched at runtime — so
+  for a non-default torch, preinstall it and build with `--no-build-isolation`.
 
 ## vLLM -> (torch, protobuf)
 
