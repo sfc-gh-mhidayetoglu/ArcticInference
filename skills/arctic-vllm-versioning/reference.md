@@ -10,8 +10,12 @@ Detail behind [SKILL.md](SKILL.md). Paths are relative to the ArcticInference re
 - unless `ARCTIC_INFERENCE_SKIP_PLATFORM_CHECK`: requires `current_platform.is_cuda()`.
 - **version gate:** unless `ARCTIC_INFERENCE_SKIP_VERSION_CHECK`, if
   `not plugin_version_compatible()` (i.e. `vllm.__version__ !=
-  get_compatible_vllm_version()`) it **logs a warning and returns** (no patching);
-  it used to `raise RuntimeError`.
+  get_compatible_vllm_version()`) it **raises `RuntimeError`** with a message that
+  names both versions and the fixes (install matching vLLM / unset
+  `ARCTIC_INFERENCE_ENABLED` / set `ARCTIC_INFERENCE_SKIP_VERSION_CHECK=1`).
+  Enabling Arctic is an explicit acceleration request, so an unmatched vLLM fails
+  loud instead of silently running unpatched. (There was a brief interim where
+  this warned + skipped; it now raises again, matching the original `CP-A`.)
 - only when compatible: sets `os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"` (Arctic
   patches target the V1 model runner) and
   `from .patches import apply_arctic_patches; apply_arctic_patches()`.
@@ -102,12 +106,25 @@ left torch unpinned.
 
 ## Server decoupling (BYO vLLM)
 
-`arctic_inference/server/**` runs on any recent vLLM. `worker.initialize()` calls
-`plugin_version_compatible()`: on the supported pin it uses `ArcticAsyncEngineArgs`
-(the plugin has registered the Arctic fields); otherwise it imports vanilla
-`AsyncEngineArgs` and strips the Arctic-only kwargs (`ulysses_sequence_parallel_size`,
-`enable_shift_parallel`, `shift_parallel_threshold`, `forest_cascade_attn_configs`,
-`fp32_lm_head`). It still needs *some* vLLM present, and the V1 surfaces it calls
+`arctic_inference/server/**` runs on any recent vLLM **when
+`ARCTIC_INFERENCE_ENABLED` is unset** — that is the BYO mode. `worker.initialize()`
+calls `vllm.plugins.load_general_plugins()` itself, then selects engine args with
+`use_arctic = arctic_inference_effective_enabled()`: enabled uses
+`ArcticAsyncEngineArgs` (the plugin has registered the Arctic fields), otherwise it
+imports vanilla `AsyncEngineArgs` and strips the Arctic-only kwargs
+(`ulysses_sequence_parallel_size`, `enable_shift_parallel`,
+`shift_parallel_threshold`, `forest_cascade_attn_configs`, `fp32_lm_head`).
+
+Caveat with the hard-fail gate: because vLLM does **not** wrap the plugin *call* in
+try/except (only the import — see `vllm/plugins/__init__.py`), enabling Arctic on a
+mismatched vLLM makes `load_general_plugins()` raise, crashing the server at
+`worker.py::initialize()`. So on a non-target vLLM the server must run with
+`ARCTIC_INFERENCE_ENABLED` unset. The old separate `plugin_version_compatible()`
+recheck in `worker.py` is gone: if the process got past `load_general_plugins()`
+with Arctic enabled, the patches were applied, so `use_arctic` only needs the
+enabled flag.
+
+It still needs *some* vLLM present, and the V1 surfaces it calls
 (`AsyncLLM.from_vllm_config`, `SamplingParams`, `metrics.py`'s `StatLoggerBase`/
 `VllmConfig`/`IterationStats`/`SchedulerStats`, `weight_sync/` NCCL/`CuMemAllocator`)
 must exist on that vLLM — so "any vLLM" is really "any sufficiently-recent vLLM".

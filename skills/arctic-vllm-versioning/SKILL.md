@@ -72,10 +72,14 @@ runtime, in the plugin entrypoint `arctic_inference/vllm/plugin.py`:
 
 1. No-op unless `ARCTIC_INFERENCE_ENABLED=1`.
 2. Platform check (cuda) unless `ARCTIC_INFERENCE_SKIP_PLATFORM_CHECK=1`.
-3. **Version gate (graceful skip):** unless `ARCTIC_INFERENCE_SKIP_VERSION_CHECK=1`,
-   if `vllm.__version__ != get_compatible_vllm_version()`, **warn and return
-   without patching** — vLLM runs unmodified so the server / other vLLM users keep
-   working. (It used to raise `RuntimeError`.)
+3. **Version gate (hard fail):** unless `ARCTIC_INFERENCE_SKIP_VERSION_CHECK=1`,
+   if `vllm.__version__ != get_compatible_vllm_version()`, **raise `RuntimeError`**.
+   Enabling Arctic is an explicit request for acceleration, so a version mismatch
+   fails loudly (with a message telling the user to install the matching vLLM,
+   unset `ARCTIC_INFERENCE_ENABLED`, or set `ARCTIC_INFERENCE_SKIP_VERSION_CHECK=1`)
+   rather than silently running unpatched. To run unmodified vLLM, leave
+   `ARCTIC_INFERENCE_ENABLED` unset — then the plugin no-ops at step 1 and never
+   reaches this gate.
 4. Only when compatible: force `VLLM_USE_V2_MODEL_RUNNER=0` and apply the
    version-specific monkeypatches via `apply_arctic_patches()`.
 
@@ -94,35 +98,45 @@ what makes Arctic opt-in. The version check (`plugin_version_compatible()`, whic
 reads `VLLM_PATCH_VERSION`) is **downstream** — it is never evaluated unless the
 flag is on.
 
-The whole gate collapses to one boolean rule:
+The gate has three outcomes — patch, run vanilla, or hard-fail:
 
 ```
-patch  iff  ENABLED and (version_match or SKIP_VERSION_CHECK)
+ENABLED off              -> vanilla vLLM (version never checked)
+ENABLED on + (match or SKIP_VERSION_CHECK) -> patch
+ENABLED on + mismatch (no SKIP)            -> raise RuntimeError
 ```
 
 Evaluated as a short-circuit: (1) if `ENABLED` is off (default), nothing else is
 even checked → vanilla vLLM; (2) once enabled, patch if the installed vLLM equals
 `VLLM_PATCH_VERSION` **or** `SKIP_VERSION_CHECK` overrides a mismatch; (3) enabled
-but wrong version with no override → warn + graceful skip (still working vanilla
-vLLM). The skip flag only matters when the versions *don't* match.
+but wrong version with no override → **raise** (fail loud; enabling Arctic is an
+explicit request for acceleration, so silently running unpatched is treated as a
+misconfiguration). The skip flag only matters when the versions *don't* match.
 
-| `ENABLED` | `version_match` | `SKIP_VERSION_CHECK` | Patch? |
+| `ENABLED` | `version_match` | `SKIP_VERSION_CHECK` | Result |
 |---|---|---|---|
-| `0` (default) | — (not checked) | — (not checked) | No — vanilla vLLM |
-| `1` | T | — (irrelevant) | **Yes** |
-| `1` | F | T | **Yes** (forced; dev/rebase escape hatch) |
-| `1` | F | F | No — warn + graceful skip |
+| `0` (default) | — (not checked) | — (not checked) | Vanilla vLLM |
+| `1` | T | — (irrelevant) | **Patch** |
+| `1` | F | T | **Patch** (forced; dev/rebase escape hatch) |
+| `1` | F | F | **`RuntimeError`** (install matching vLLM or unset `ENABLED`) |
 
-The BYO server re-checks both conditions together rather than assuming the plugin
-ran: `worker.py` uses `use_arctic = arctic_inference_effective_enabled() and
-plugin_version_compatible()`; if either is false it falls back to vanilla
+**Server interaction.** The BYO server calls `vllm.plugins.load_general_plugins()`
+itself in `worker.py::initialize()`, which runs the plugin entry point. vLLM only
+wraps plugin *import* in try/except, not the *call*, so the hard-fail propagates:
+running the server with `ARCTIC_INFERENCE_ENABLED=1` on a mismatched vLLM now
+**crashes at `load_general_plugins()`** (this is intentional — it was the old
+"CP-A" behavior, restored on purpose). The BYO path is therefore "run with
+`ARCTIC_INFERENCE_ENABLED` unset on a non-target vLLM": then the plugin no-ops and
+the server uses vanilla args. Because reaching the code after
+`load_general_plugins()` with Arctic enabled implies the patches were applied,
+`worker.py` selects args with just `use_arctic = arctic_inference_effective_enabled()`
+(no separate version recheck) and, when false, falls back to vanilla
 `AsyncEngineArgs` and strips Arctic-only kwargs.
 `arctic_inference_effective_enabled()` also consults `extra_env` (e.g.
 `ModelConfig.extra_env`), not just `os.environ`, so the driver can predict whether
 *workers* will enable the plugin and omit Arctic engine kwargs accordingly. Note
 `server/config.py` gates its Arctic kwargs on `arctic_inference_effective_enabled()`
-**only** (not the version); `worker.py` is the single place that additionally
-applies the version gate.
+too.
 
 ## Scope: what the pin actually governs
 
@@ -152,10 +166,17 @@ surface map are in [reference.md](reference.md).
   version; the constant makes unpinning safe.
 - **Build torch is a floor:** `[build-system].requires` uses `torch>=2.10.0`
   instead of an exact pin, so the build no longer hard-fails on nearby torch.
-- **Graceful skip:** the version gate warns + skips instead of raising, so the
-  server and other vLLM users keep working on a non-supported vLLM.
-- **BYO server:** `server/worker.py` falls back to vanilla `AsyncEngineArgs`
-  (stripping Arctic-only kwargs) when the plugin isn't applied.
+- **Hard fail on enabled + mismatch:** the version gate now **raises
+  `RuntimeError`** (not warn+skip) when `ARCTIC_INFERENCE_ENABLED=1` but the
+  installed vLLM != `VLLM_PATCH_VERSION`, with a message pointing at the fixes
+  (install matching vLLM / unset the flag / `SKIP_VERSION_CHECK`). Rationale:
+  enabling Arctic is an explicit request for acceleration, so silently running
+  unpatched is a misconfiguration. (This restores the pre-decoupling "CP-A"
+  behavior on purpose; the earlier graceful-skip is reverted.)
+- **BYO server:** `server/worker.py` runs vanilla vLLM when
+  `ARCTIC_INFERENCE_ENABLED` is unset (falls back to `AsyncEngineArgs`, stripping
+  Arctic-only kwargs). On a non-target vLLM it must run with the flag unset, since
+  enabling it now hard-fails at `load_general_plugins()`.
 - **Version-named shortcuts:** `vllm-26` / `vllm-18` extras (torch matching is the
   user's responsibility; only the target version is accelerated).
 

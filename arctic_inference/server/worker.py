@@ -139,15 +139,16 @@ class InferenceWorker:
         vllm.plugins.load_general_plugins()
 
         from vllm.v1.engine.async_llm import AsyncLLM
-        from arctic_inference.utils import plugin_version_compatible
 
-        # Use Arctic engine args only when the plugin is actually applied
-        # (enabled AND installed vLLM matches the supported pin). Otherwise fall
-        # back to vanilla AsyncEngineArgs and drop Arctic-only kwargs that vanilla
-        # vLLM would reject. Source of the kwarg list: ArcticArgs in
-        # arctic_inference/vllm/args.py.
-        use_arctic = (arctic_inference_effective_enabled()
-                      and plugin_version_compatible())
+        # If we reach here with Arctic enabled, load_general_plugins() above has
+        # already applied the Arctic patches: the plugin raises on an
+        # enabled-but-version-mismatch (unless ARCTIC_INFERENCE_SKIP_VERSION_CHECK
+        # forced it through), so an enabled process that got this far is patched.
+        # Arctic engine args are therefore valid exactly when Arctic is enabled;
+        # otherwise fall back to vanilla AsyncEngineArgs and drop Arctic-only
+        # kwargs that vanilla vLLM would reject. Source of the kwarg list:
+        # ArcticArgs in arctic_inference/vllm/args.py.
+        use_arctic = arctic_inference_effective_enabled()
         if use_arctic:
             from arctic_inference.vllm.args import \
                 ArcticAsyncEngineArgs as _EngineArgs
