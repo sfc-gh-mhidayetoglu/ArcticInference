@@ -11,7 +11,7 @@ requires = [
     # vllm 0.26.0 requires protobuf>=5.29.6
     "protobuf==5.29.6",
     "grpcio-tools",
-    "torch==2.11.0", # need to be same as user env (vllm 0.26.0 pins torch==2.11.0).
+    "torch>=2.10.0", # need to be same as user env (vllm 0.26.0 pins torch==2.11.0).
 ]
 build-backend = "setuptools.build_meta"
 
