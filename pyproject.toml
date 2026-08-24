@@ -54,7 +54,7 @@ packages = [
 [project.optional-dependencies]
 # Canonical supported/accelerated pin for this branch (read by the version check).
 vllm = [
-    'vllm==0.26.0',
+    'vllm',
 ]
 
 # Explicit-version install shortcuts. The user picks the pin to match their torch;
