@@ -13,19 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
-from importlib.metadata import requires
+# The exact vLLM version this branch's patches target. This is the single source
+# of truth for the plugin's version check and is intentionally decoupled from the
+# install extras: the `vllm` extra is left unpinned so users can resolve vLLM
+# against their own torch. Arctic patches are only applied when the *installed*
+# vLLM matches this version; on any other version the plugin skips patching and
+# vLLM runs unmodified (no acceleration).
+VLLM_PATCH_VERSION = "0.26.0"
 
 
 def get_compatible_vllm_version():
-    # The `vllm` extra is the single canonical *supported* pin (the version the
-    # plugin's patches target). Version-named shortcuts (vllm-18/vllm-26) are
-    # intentionally NOT matched here, so this stays unambiguous.
-    reqs = requires("arctic_inference")
-    for req in reqs:
-        match = re.match("vllm==(.*); extra == \"vllm\"", req)
-        if match is not None:
-            return match.groups()[0]
+    """The exact vLLM version the plugin's patches are written against."""
+    return VLLM_PATCH_VERSION
 
 
 def plugin_version_compatible() -> bool:

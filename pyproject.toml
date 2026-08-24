@@ -52,7 +52,10 @@ packages = [
 "arctic_inference.embedding" = ["arctic_inference/embedding/proto/*.proto"]
 
 [project.optional-dependencies]
-# Canonical supported/accelerated pin for this branch (read by the version check).
+# Unpinned so vLLM resolves against the user's torch. The plugin only applies
+# Arctic patches when the installed vLLM matches VLLM_PATCH_VERSION in
+# arctic_inference/utils.py; on any other version vLLM still runs, just without
+# Arctic acceleration.
 vllm = [
     'vllm',
 ]
