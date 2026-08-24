@@ -24,7 +24,6 @@ from vllm.v1.worker.worker_base import WorkerBase
 
 import arctic_inference.envs as envs
 from arctic_inference.patching import ArcticPatch
-from arctic_inference.utils import get_compatible_vllm_version
 from arctic_inference.vllm.args import EngineArgsPatch, AsyncEngineArgsPatch
 from arctic_inference.vllm.config import (ParallelConfigPatch,
                                           SpeculativeConfigPatch,
