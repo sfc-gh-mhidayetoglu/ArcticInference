@@ -16,7 +16,7 @@
          presence_penalty: float | None = 0.0,
          frequency_penalty: float | None = 0.0,
          repetition_penalty: float | None = 1.0,
-@@ -394,6 +396,7 @@
+@@ -414,6 +416,7 @@
  
          return SamplingParams(
              n=1 if n is None else n,

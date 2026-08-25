@@ -1,4 +1,4 @@
-## Rollout Replay Patch for v0.24.0
+## Rollout Replay Patch for v0.26.0
 
 This patch extends SamplingParams to specify the length of each sequence when n > 1.
 
