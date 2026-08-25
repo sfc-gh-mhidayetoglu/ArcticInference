@@ -14,16 +14,20 @@ from typing import ClassVar
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.layers.attention import Attention
+from vllm.utils.torch_utils import (
+    canonicalize_singleton_dim_strides,
+    is_quantized_kv_cache,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionType,
     MultipleOf,
-    is_quantized_kv_cache,
 )
 from vllm.v1.attention.backends.fa_utils import (
-    flash_attn_supports_fp8,
+    flash_attn_supports_quant_query_input,
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
@@ -45,9 +49,7 @@ from vllm.config import (
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import (
-    vllm_is_batch_invariant,
-)
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
@@ -119,21 +121,29 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        # v0.26: K and V are packed into the content dim: logical (B, H, N, 2*D).
+        return (num_blocks, num_kv_heads, block_size, 2 * head_size)
 
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
+        # `stride_order` indicates the permutation that gets us from
+        # `get_kv_cache_shape` (logical (B, H, N, 2*D)) to the actual memory
+        # layout we want.
         cache_layout = get_kv_cache_layout()
         if cache_layout == "NHD" and include_num_layers_dimension:
-            return (2, 0, 1, 3, 4, 5)
+            # (num_blocks, num_layers, block_size, num_kv_heads, 2*head_size)
+            return (1, 0, 3, 2, 4)
         elif cache_layout == "NHD":
-            stride_order = (0, 1, 2, 3, 4)
+            # (num_blocks, block_size, num_kv_heads, 2*head_size)
+            stride_order = (0, 2, 1, 3)
         elif cache_layout == "HND" and include_num_layers_dimension:
-            return (2, 4, 0, 1, 3, 5)
+            # (num_blocks, num_kv_heads, num_layers, block_size, 2*head_size)
+            return (1, 2, 0, 3, 4)
         elif cache_layout == "HND":
-            stride_order = (0, 1, 3, 2, 4)
+            # (num_blocks, num_kv_heads, block_size, 2*head_size)
+            stride_order = (0, 1, 2, 3)
         else:
             raise ValueError(f"Unknown cache layout format {cache_layout}.")
         return stride_order
@@ -155,9 +165,14 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> bool:
         if kv_cache_dtype is None:
             return True
-        if kv_cache_dtype.startswith("fp8"):
-            return flash_attn_supports_fp8()
-        return kv_cache_dtype in ["auto"]
+        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
+            if current_platform.is_xpu():
+                return True
+            return (
+                get_flash_attn_version() == 3
+                and current_platform.is_device_capability_family(90)
+            )
+        return kv_cache_dtype in ["auto", "float16", "bfloat16"]
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -454,7 +469,7 @@ class FlashAttentionMetadataBuilder(
         ):
             max_num_splits = self.max_num_splits
 
-        if vllm_is_batch_invariant():
+        if envs.VLLM_BATCH_INVARIANT:
             max_num_splits = 1
 
         def schedule(
@@ -871,15 +886,8 @@ class FlashAttentionImpl(AttentionImpl):
 
         self.attn_type = attn_type
         self.vllm_flash_attn_version = get_flash_attn_version()
-        self.batch_invariant_enabled = vllm_is_batch_invariant()
-
-        if (
-            is_quantized_kv_cache(self.kv_cache_dtype)
-            and not flash_attn_supports_fp8()
-        ):
-            raise NotImplementedError(
-                "FlashAttention does not support fp8 kv-cache on this device."
-            )
+        # Cache the batch invariant result for use in forward passes
+        self.batch_invariant_enabled = envs.VLLM_BATCH_INVARIANT
 
         self.sinks = sinks
         if self.sinks is not None:
@@ -891,7 +899,7 @@ class FlashAttentionImpl(AttentionImpl):
                 "heads in the layer"
             )
 
-        self.supports_quant_query_input = True
+        self.supports_quant_query_input = flash_attn_supports_quant_query_input()
 
     def forward(
         self,
@@ -912,7 +920,7 @@ class FlashAttentionImpl(AttentionImpl):
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
             kv_cache: shape =
-                [2, num_blocks, block_size, num_kv_heads, head_size]
+                [num_blocks, 2, block_size, num_kv_heads, head_size]
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
@@ -945,8 +953,18 @@ class FlashAttentionImpl(AttentionImpl):
                 layer,
             )
 
-        # For decoder and cross-attention, use KV cache as before
-        key_cache, value_cache = kv_cache.unbind(0)
+        # For decoder and cross-attention, use KV cache as before.
+        # v0.26: KV cache is packed as [num_blocks, num_kv_heads, block_size,
+        # 2 * head_size]; key/value are split out of the last dim (was a
+        # separate dim-1 `unbind(1)` in v0.24). The resulting views keep the
+        # same logical shape [num_blocks, block_size, num_kv_heads, head_size]
+        # as before, so the downstream cascade paths are unaffected.
+        # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(
+            self.head_size, dim=-1
+        )
+        key_cache = canonicalize_singleton_dim_strides(key_cache)
+        value_cache = canonicalize_singleton_dim_strides(value_cache)
 
         if (
             self.kv_sharing_target_layer_name is None
@@ -1718,7 +1736,7 @@ def forest_cascade_attention(
     suffix_descale_shape = (B, num_kv_heads)
 
     effective_num_splits = (
-        1 if vllm_is_batch_invariant() else max_num_splits
+        1 if envs.VLLM_BATCH_INVARIANT else max_num_splits
     )
 
     # Prefix attention: groups as sequences, causal=False.
@@ -1881,7 +1899,7 @@ def cascade_attention(
             else None
         ),
         s_aux=s_aux,
-        num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
+        num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
     )
 
     descale_shape = (cu_query_lens.shape[0] - 1, key_cache.shape[-2])
@@ -1918,7 +1936,7 @@ def cascade_attention(
             if v_descale is not None
             else None
         ),
-        num_splits=1 if vllm_is_batch_invariant() else max_num_splits,
+        num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
     )
 
     # Merge prefix and suffix outputs, and store the result in output.

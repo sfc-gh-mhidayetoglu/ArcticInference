@@ -1,0 +1,68 @@
+{
+  "_comment": "Cross-version consistency probes for the ArcticInference rebase skill. Each probe extracts a small, salient expression from a patched file so the same surface can be compared across every pinned vLLM version (main + every rebase/vllm_v* branch + the in-progress working tree). ADD A NEW PROBE whenever you fix a novel *recurring* drift, so future bumps automatically track it. `regex` is a Python re pattern; the matched text (group 1 if present, else group 0) is what shows in the table. `all: true` joins every match; otherwise the first match is used.",
+  "probes": [
+    {
+      "label": "vllm pin",
+      "file": "pyproject.toml",
+      "regex": "vllm\\s*=\\s*\\[\\s*(?:#[^\\n]*\\n\\s*)*['\"](vllm==[0-9][^'\"]*)",
+      "dotall": true
+    },
+    {
+      "label": "torch pin (build-system; unpinned <0.11.0)",
+      "file": "pyproject.toml",
+      "regex": "['\"](torch==[0-9][^'\"]*)"
+    },
+    {
+      "label": "protobuf pin (build-system)",
+      "file": "pyproject.toml",
+      "regex": "['\"](protobuf==[0-9][^'\"]*)"
+    },
+    {
+      "label": "FCA get_kv_cache_shape (drift #8)",
+      "file": "arctic_inference/vllm/attention/flash_attn_forest_cascade.py",
+      "regex": "return\\s+(\\((?:2, )?num_blocks[^)]*\\))"
+    },
+    {
+      "label": "FCA forward KV split (drift #8)",
+      "file": "arctic_inference/vllm/attention/flash_attn_forest_cascade.py",
+      "regex": "key_cache, value_cache = (kv_cache\\.(?:unbind|transpose)\\([^\\n]*)"
+    },
+    {
+      "label": "_capture_cudagraphs profiler kwarg (drift #1)",
+      "file": "arctic_inference/vllm/model_runner.py",
+      "regex": "(profiler\\s*:[^=]*=\\s*None)"
+    },
+    {
+      "label": "V2-runner force (guardrail #10)",
+      "file": "arctic_inference/vllm/plugin.py",
+      "regex": "VLLM_USE_V2_MODEL_RUNNER\"\\]\\s*=\\s*\"[01]\""
+    },
+    {
+      "label": "is_quantized_kv_cache import path (#7/#8 move)",
+      "file": "arctic_inference/vllm/attention/flash_attn_forest_cascade.py",
+      "regex": "from (vllm[\\w.]*) import (?:[^\\n]*is_quantized_kv_cache|\\([^)]*?is_quantized_kv_cache)",
+      "dotall": true
+    },
+    {
+      "label": "graph_capture graph_capture_context kwarg (drift #1, 0.24->0.26)",
+      "file": "arctic_inference/vllm/ulysses.py",
+      "regex": "def graph_capture\\(device[^)]*?(graph_capture_context[^)]*)\\)",
+      "dotall": true
+    },
+    {
+      "label": "EngineCore step_with_batch_queue iteration-details (drift #12, 0.24->0.26)",
+      "file": "arctic_inference/vllm/ulysses.py",
+      "regex": "(self\\.(?:log_iteration_details|capture_iteration_details|_attach_iteration_details))"
+    },
+    {
+      "label": "args plugin-timing backfill (drift #11, 0.24->0.26)",
+      "file": "arctic_inference/vllm/args.py",
+      "regex": "(_ensure_arctic_fields)\\(self\\)"
+    },
+    {
+      "label": "SwiftKV FA KV split (drift #8 second site)",
+      "file": "arctic_inference/vllm/swiftkv/llama_swiftkv.py",
+      "regex": "(kv_cache\\.(?:unbind|transpose)\\([^\\n]*)"
+    }
+  ]
+}

@@ -6,6 +6,7 @@ from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.config import get_current_vllm_config, set_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import (FusedMoE)
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
@@ -53,6 +54,14 @@ class OriginalFp8LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.cutlass_block_fp8_supported = cutlass_block_fp8_supported()
         self.out_dtype = torch.get_default_dtype()
+        # v0.24: init_fp8_linear_kernel now requires input_dtype + weight_shape,
+        # so the kernel is built in create_weights (where the shape is known).
+        # Stash the vllm config so a lazy kernel build in apply() (used by the
+        # speculator's manually-assigned LM head, see apply) can re-establish it:
+        # building the kernel instantiates ops that call get_current_vllm_config(),
+        # which is only set during model init, not at forward time.
+        self.vllm_config = get_current_vllm_config()
+        self.input_dtype = self.vllm_config.model_config.dtype
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
@@ -66,18 +75,15 @@ class OriginalFp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             self.use_marlin = False
 
+        self.fp8_linear = None
         if not self.block_quant:
             from vllm.model_executor.layers.quantization.utils.quant_utils import (
                 kFp8DynamicTokenSym, kFp8DynamicTensorSym, kFp8StaticTensorSym)
             if cutlass_fp8_supported():
-                activation_quant_key = kFp8DynamicTokenSym
+                self.activation_quant_key = kFp8DynamicTokenSym
             else:
-                activation_quant_key = kFp8DynamicTensorSym
-            self.fp8_linear = init_fp8_linear_kernel(
-                activation_quant_key=activation_quant_key,
-                weight_quant_key=kFp8StaticTensorSym,
-                out_dtype=torch.get_default_dtype(),
-            )
+                self.activation_quant_key = kFp8DynamicTensorSym
+            self.weight_quant_key = kFp8StaticTensorSym
 
     def create_weights(
         self,
@@ -136,6 +142,17 @@ class OriginalFp8LinearMethod(LinearMethodBase):
                                       output_dim=0,
                                       weight_loader=weight_loader)
         layer.register_parameter("weight", weight)
+
+        # v0.24: build the fp8 linear kernel now that the weight shape is known.
+        if not self.block_quant:
+            self.fp8_linear = init_fp8_linear_kernel(
+                activation_quant_key=self.activation_quant_key,
+                weight_quant_key=self.weight_quant_key,
+                weight_shape=layer.weight.shape,
+                input_dtype=self.input_dtype,
+                out_dtype=self.out_dtype,
+                module_name=self.__class__.__name__,
+            )
 
         # If checkpoint is serialized fp8, load them.
         # Otherwise, wait until process_weights_after_loading.
@@ -306,6 +323,29 @@ class OriginalFp8LinearMethod(LinearMethodBase):
                 cutlass_block_fp8_supported=self.cutlass_block_fp8_supported,
             )
 
+        if self.fp8_linear is None:
+            # The Arctic speculator assigns this quant method to its LM head
+            # manually (see arctic_speculator) without going through
+            # create_weights, so build the kernel lazily on first use. In v0.24
+            # init_fp8_linear_kernel needs weight_shape (only drives kernel
+            # *selection*; the kernel reads layer.weight at call time) and
+            # instantiates ops that call get_current_vllm_config() — which is
+            # unset at forward time, so re-establish the init-time config.
+            with set_current_vllm_config(self.vllm_config):
+                self.fp8_linear = init_fp8_linear_kernel(
+                    activation_quant_key=self.activation_quant_key,
+                    weight_quant_key=self.weight_quant_key,
+                    weight_shape=layer.weight.shape,
+                    input_dtype=self.input_dtype,
+                    out_dtype=self.out_dtype,
+                    module_name=self.__class__.__name__,
+                )
+            # Arctic's forked process_weights_after_loading never delegates to
+            # the kernel (upstream Fp8LinearMethod does), so kernel-side state
+            # such as CutlassFP8ScaledMMLinearKernel.logical_output_size is
+            # unset. Run it once here for the manually-built LM-head kernel.
+            self.fp8_linear.process_weights_after_loading(layer)
+
         return self.fp8_linear.apply_weights(layer, x, bias)
 
 class Fp8LinearMethodEmbedding(OriginalFp8LinearMethod):
@@ -330,7 +370,8 @@ class Fp8ConfigWithEmbedding(Fp8Config):
                 return UnquantizedLinearMethod()
             return OriginalFp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            return Fp8MoEMethod(self)
+            # v0.24: Fp8MoEMethod.__init__ now requires (quant_config, layer).
+            return Fp8MoEMethod(self, layer)
         elif isinstance(layer, Attention):
             return Fp8KVCacheMethod(self)
         elif isinstance(layer, VocabParallelEmbedding):

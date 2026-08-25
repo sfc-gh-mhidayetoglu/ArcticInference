@@ -294,7 +294,7 @@ class UlyssesParallelState(ArcticPatch[parallel_state]):
             )
 
     @contextmanager
-    def graph_capture(device: torch.device):
+    def graph_capture(device: torch.device, graph_capture_context=None):
         """
         `graph_capture` is a context manager which should surround the code that
         is capturing the CUDA graph. Its main purpose is to ensure that the
@@ -307,12 +307,17 @@ class UlyssesParallelState(ArcticPatch[parallel_state]):
         the graph capture is running on a separate stream from the default stream,
         in order to explicitly distinguish the kernels to capture
         from other kernels possibly launched on background in the default stream.
+
+        v0.26: upstream added an optional ``graph_capture_context`` arg (the
+        caller in ``profile_cudagraph_memory`` / cudagraph capture passes one);
+        honor it when provided, mirroring base ``graph_capture``.
         """
         from vllm.distributed.parallel_state import GraphCaptureContext
         from vllm.distributed.device_communicators.cuda_communicator import (
             CudaCommunicator,
         )
-        context = GraphCaptureContext(torch.cuda.Stream(device=device))
+        context = graph_capture_context or GraphCaptureContext(
+            torch.cuda.Stream(device=device))
 
         def _get_ca(group):
             if (group is not None
@@ -462,7 +467,7 @@ class UlyssesCudagraphDispatcher(ArcticPatch[CudagraphDispatcher]):
     _orig_initialize_cudagraph_keys = CudagraphDispatcher.initialize_cudagraph_keys
 
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode,
-                                  uniform_decode_query_len: int):
+                                  uniform_decode_query_len: int = 1):
         self._orig_initialize_cudagraph_keys(cudagraph_mode, uniform_decode_query_len)
 
         # sp_group = getattr(parallel_state, "_SP", None)
@@ -698,10 +703,15 @@ class UlyssesEngineCore(ArcticPatch[EngineCore]):
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule()
-            exec_future = self.model_executor.execute_model(
-                scheduler_output, non_block=True
+            # v0.26: schedule() takes the prefill-throttle flag; execute_model
+            # is now wrapped in log_error_detail.
+            scheduler_output = self.scheduler.schedule(
+                self._should_throttle_prefills()
             )
+            with self.log_error_detail(scheduler_output):
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -726,14 +736,14 @@ class UlyssesEngineCore(ArcticPatch[EngineCore]):
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
-                if (
-                    model_executed
-                    and len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
+                # v0.26: return `model_executed` (not a bare True), and gate on
+                # `model_executed or scheduler.has_requests()`.
+                if len(batch_queue) < self.batch_queue_size and (
+                    model_executed or self.scheduler.has_requests()
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
-                    return None, True
+                    return None, model_executed
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
@@ -743,9 +753,11 @@ class UlyssesEngineCore(ArcticPatch[EngineCore]):
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        # v0.26: log_iteration_details context manager was replaced by
+        # capture_iteration_details(...) + a post-hoc _attach_iteration_details.
         with (
+            self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
             if model_output is None:
@@ -760,23 +772,23 @@ class UlyssesEngineCore(ArcticPatch[EngineCore]):
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
         if deferred_scheduler_output:
-            # If we are doing speculative decoding with structured output,
-            # we need to get the draft token ids from the prior step before
-            # we can compute the grammar bitmask for the deferred request.
-            if self.use_spec_decode:
+            # v0.26: gate on check_for_draft_tokens and tolerate a None result
+            # (was `use_spec_decode` + an unconditional assert).
+            if self.check_for_draft_tokens:
                 draft_token_ids = self.model_executor.take_draft_token_ids()
-                assert draft_token_ids is not None
-                # Update the draft token ids in the scheduler output to
-                # filter out the invalid spec tokens, which will be padded
-                # with -1 and skipped by the grammar bitmask computation.
-                self.scheduler.update_draft_token_ids_in_output(
-                    draft_token_ids, deferred_scheduler_output
-                )
+                if draft_token_ids is not None:
+                    # Update the draft token ids in the scheduler output to
+                    # filter out the invalid spec tokens, which will be padded
+                    # with -1 and skipped by the grammar bitmask computation.
+                    self.scheduler.update_draft_token_ids_in_output(
+                        draft_token_ids, deferred_scheduler_output
+                    )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
             grammar_output = self.scheduler.get_grammar_bitmask(

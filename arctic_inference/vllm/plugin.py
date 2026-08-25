@@ -13,30 +13,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import sys
 
 import vllm
 from vllm.platforms import current_platform
 
 import arctic_inference.envs as envs
-from arctic_inference.utils import get_compatible_vllm_version
+from arctic_inference.utils import (get_compatible_vllm_version,
+                                    plugin_version_compatible)
 
 
 def arctic_inference_plugin():
     if not envs.ARCTIC_INFERENCE_ENABLED:
         return
 
-    if not envs.ARCTIC_INFERENCE_SKIP_VERSION_CHECK:
-        compatible_version = get_compatible_vllm_version()
-        if vllm.__version__ != compatible_version:
-            raise RuntimeError(
-                f"Arctic Inference plugin requires vllm=={compatible_version} "
-                f"but found vllm=={vllm.__version__}!")
-    
     if not envs.ARCTIC_INFERENCE_SKIP_PLATFORM_CHECK:
         if not current_platform.is_cuda():
             raise RuntimeError(
                 "Arctic Inference plugin requires the cuda platform!")
+
+    # The patches below are version-specific. Enabling Arctic Inference is an
+    # explicit request for acceleration, so if the installed vLLM does not match
+    # the version the patches target we fail loudly rather than silently running
+    # unpatched. To run unmodified vLLM instead, leave ARCTIC_INFERENCE_ENABLED
+    # unset; ARCTIC_INFERENCE_SKIP_VERSION_CHECK forces patching regardless.
+    if (not envs.ARCTIC_INFERENCE_SKIP_VERSION_CHECK
+            and not plugin_version_compatible()):
+        raise RuntimeError(
+            f"Arctic Inference is enabled (ARCTIC_INFERENCE_ENABLED=1) but the installed "
+            f"vllm=={vllm.__version__} does not match the version its patches require: "
+            f"(vllm=={get_compatible_vllm_version()}). Either install the matching vLLM "
+            f"(`pip install vllm=={get_compatible_vllm_version()}`) or unset "
+            f"ARCTIC_INFERENCE_ENABLED to run unmodified vLLM. To bypass this check at "
+            f"your own risk, set ARCTIC_INFERENCE_SKIP_VERSION_CHECK=1. "
+            f"If you did not enable Arctic Inference yourself, turn off FCA in your "
+            f"framework's config.")
+
+    # Applying the (version-dependent) plugin from here on.
+    # TODO: port ArcticInference patches to the V2 model runner and drop this.
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 
     print("\x1b[36;1mArctic Inference plugin is enabled!\x1b[0m",
           file=sys.stderr)
