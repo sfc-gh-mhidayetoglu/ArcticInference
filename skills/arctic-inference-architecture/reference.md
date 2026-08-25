@@ -1,6 +1,6 @@
 # ArcticInference architecture — per-feature design
 
-Detail behind [SKILL.md](SKILL.md). Snapshot at the vLLM 0.18.0 baseline; verify
+Detail behind [SKILL.md](SKILL.md). Snapshot at the vLLM 0.26.0 baseline; verify
 paths/line numbers against the current tree.
 
 ## 1. Advanced parallelism (Arctic Ulysses + Shift Parallelism)
@@ -43,7 +43,7 @@ step (`UlyssesEngineCore`) and is invisible to the caller; CUDA graphs are
 pre-captured for both modes.
 
 Where to look: `projects/ulysses/README.md`; step-level decision
-`is_shift_parallel_mode()` in `model_runner.py` (~line 94); layer A2A
+`is_shift_parallel_mode()` in `model_runner.py` (~line 96); layer A2A
 `UlyssesAttention.forward` in `ulysses.py`.
 
 ## 2. Speculative decoding (Arctic Speculator + Suffix Decoding)
@@ -107,7 +107,7 @@ For `method="arctic"` + `enable_suffix_decoding=true`,
 `SpeculativeConfigPatch.__post_init__` sets
 `suffix_speculative_tokens = suffix_cache_max_depth` so suffix drafts extend to
 tree depth while Arctic still drafts `n_predict`; both go into
-`scheduled_spec_decode_tokens`. The `AsyncSchedulerPatch` (`patches.py` ~45-218):
+`scheduled_spec_decode_tokens`. The `AsyncSchedulerPatch` (`patches.py` ~45-243):
 1. `disable_by_batch_size` placeholder allocation — only first N decode requests
    get spec-token placeholders (matches worker draft cap).
 2. Dynamic placeholder sizing — reads the previous step's *actual* draft length
@@ -194,7 +194,7 @@ at runtime. Installed by hot-replacing
 (`kvcached/patches.py`). Substrate for the multi-model server's GPU sharing.
 
 ### Sleep / wake_up with drafter preservation
-**Source:** `WorkerPatch` in `patches.py` (~lines 221-311). Level 1 frees KV pages
+**Source:** `WorkerPatch` in `patches.py` (~lines 262-335). Level 1 frees KV pages
 (weights stay); level 2 frees everything and `wake_up()` restores main weights via
 `reload_weights()`. Problem: `reload_weights()` only handles the **main** model;
 the drafter isn't in the upstream weight-sync registry and its `load_model()`
@@ -219,6 +219,31 @@ read of `vocab*hidden*2` bytes. Patches `LogitsProcessor._get_logits` and the
 heads. Enable `--fp32-lm-head` or `ARCTIC_FP32_LM_HEAD=1`; the CLI flag in
 `EngineArgsPatch.__post_init__` exports the env var so worker subprocesses inherit
 it before applying patches.
+
+### Rollout replay (per-sequence output length for `n > 1`)
+**Source:** `arctic_inference/vllm/sampling.py::ParentRequestPatch`. RL rollout
+replay needs each of the `n` sampled sequences to stop at a *prescribed* length
+(replaying a recorded trajectory). Upstream `SamplingParams` only has a single
+`max_tokens` shared by all `n` children. The patch overrides
+`ParentRequest._get_child_sampling_params` (`vllm/v1/engine/parallel_sampling.py`)
+so that child `i` gets `max_tokens = max_tokens_n[i]` when the parent request
+carries a `max_tokens_n` list; combine with `ignore_eos=True` to force exact
+lengths. Requests without `max_tokens_n` are untouched (normal `max_tokens` +
+child-param caching preserved).
+
+The lengths travel in `SamplingParams.extra_args["max_tokens_n"]`, **not** a new
+field: `SamplingParams` is a `msgspec.Struct` (fixed fields, `__slots__`,
+msgspec-encoded across the front-end -> EngineCore boundary), so a plugin cannot
+add a real serialized field at runtime — `extra_args` is an existing serialized
+field we ride on. Usage:
+```python
+SamplingParams(n=2, ignore_eos=True, extra_args={"max_tokens_n": [25, 50]})
+```
+Rebase note: the override mirrors an upstream method body, so it is a Phase-3
+behavioral-parity surface — re-diff `_get_child_sampling_params` against the
+target `parallel_sampling.py` each bump. (Formerly a standalone
+`benchmark/rollout/*.patch`; folded into the plugin.) See
+`benchmark/rollout/README.md`.
 
 ### NCCL weight sync (training -> inference)
 **Source:** `arctic_inference/server/weight_sync/` (5 files). Pushes fresh weights

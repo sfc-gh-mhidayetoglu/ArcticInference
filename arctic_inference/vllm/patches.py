@@ -31,6 +31,7 @@ from arctic_inference.vllm.config import (ParallelConfigPatch,
                                           MLPSpeculatorConfigPatch)
 from arctic_inference.vllm.fp32_lm_head import (
     apply_fp32_lm_head_patches, set_fp32_lm_head_enabled)
+from arctic_inference.vllm.sampling import ParentRequestPatch
 from arctic_inference.vllm.stats import (SpecDecodingStatsPatch,
                                          SpecDecodingLoggingPatch)
 from arctic_inference.vllm.structured_output import XgrammarBackendPatch
@@ -376,6 +377,9 @@ def apply_arctic_patches():
     VllmConfigPatch.apply_patch()
     XgrammarBackendPatch.apply_patch()
     MLPSpeculatorConfigPatch.apply_patch()
+
+    # Rollout replay: per-child max_tokens for n>1 via extra_args["max_tokens_n"].
+    ParentRequestPatch.apply_patch()
 
     # Forest Cascade Attention backend (always registered; runtime-gated
     # by --forest-cascade-attn-configs).

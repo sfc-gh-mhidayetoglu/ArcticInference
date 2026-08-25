@@ -253,9 +253,12 @@ for both live in reference.md; use these two as templates for scoping and for
 expecting a substantial post-Phase-5 GPU loop.
 
 ## Adjacent artifacts that also pin a vLLM version (not the plugin, but bump too)
-- `ArcticInference/benchmark/rollout/*.patch` (`sampling_params.patch`,
-  `parallel_sampling.patch`, applied via `patch_sampling.sh`) add a `max_tokens_n`
-  rollout-replay feature and are written against a specific vLLM. Re-diff their
-  target files (`vllm/sampling_params.py`, `vllm/v1/engine/parallel_sampling.py`)
-  against the target tree and regenerate. `SamplingParams` is a `msgspec.Struct`
-  (`omit_defaults=True`) — a new field after `n` (both have defaults) is safe.
+- Rollout replay (`max_tokens_n` per-sequence output length for `n>1`) is now a
+  **plugin patch**, not a standalone `benchmark/rollout/*.patch`:
+  `arctic_inference/vllm/sampling.py::ParentRequestPatch` overrides
+  `ParentRequest._get_child_sampling_params` (`vllm/v1/engine/parallel_sampling.py`).
+  Because it mirrors an upstream method body, treat it as a normal **Phase-3**
+  behavioral-parity surface — re-diff that method `OLD→TARGET` and port drift like
+  any other override. The lengths ride on `SamplingParams.extra_args` (a real,
+  serialized field) rather than a new struct field, since `SamplingParams` is a
+  `msgspec.Struct` whose fields can't be extended at runtime.

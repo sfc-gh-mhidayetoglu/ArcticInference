@@ -146,5 +146,8 @@ above (all ran with DCP=1, DP=1, no sliding-window model). Get sign-off before p
   see phase notes. Run before shipping.
 
 ## Adjacent artifacts (bump separately if used)
-- `benchmark/rollout/*.patch` (`sampling_params.patch`, `parallel_sampling.patch`): re-diff
-  their target files against `/tmp/vllm_new` and regenerate if you use rollout replay.
+- Rollout replay (`max_tokens_n`) is now the plugin patch
+  `arctic_inference/vllm/sampling.py::ParentRequestPatch` (overrides
+  `ParentRequest._get_child_sampling_params`) — a Phase-3 behavioral-parity surface,
+  no longer a standalone `benchmark/rollout/*.patch`. Re-diff that method against
+  `/tmp/vllm_new/vllm/v1/engine/parallel_sampling.py` each bump.

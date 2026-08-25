@@ -18,7 +18,7 @@ orient in an unfamiliar code path or to explain what changes when
 `ARCTIC_INFERENCE_ENABLED=1`. Per-feature design detail is in
 [reference.md](reference.md).
 
-> **Snapshot baseline: vLLM 0.18.0.** File layout and feature set are stable, but
+> **Snapshot baseline: vLLM 0.26.0.** File layout and feature set are stable, but
 > exact line numbers / vLLM symbol paths drift per release — verify against the
 > current tree (and see the `rebase-arctic-inference` skill for drift). For how
 > the vLLM pin itself is declared/enforced, see the `arctic-vllm-versioning` skill.
@@ -43,7 +43,7 @@ single ordered list of patch installs:
 3. Static patches: `AsyncSchedulerPatch`, `EngineArgsPatch`, `AsyncEngineArgsPatch`,
    `ParallelConfigPatch`, `SpeculativeConfigPatch`, `SpecDecodingStatsPatch`,
    `SpecDecodingLoggingPatch`, `VllmConfigPatch`, `XgrammarBackendPatch`,
-   `MLPSpeculatorConfigPatch`.
+   `MLPSpeculatorConfigPatch`, `ParentRequestPatch` (rollout replay).
 4. `apply_forest_cascade_patches()` — always installs the FCA-aware backend
    (runtime-gated).
 5. `apply_shift_parallel_patches()` — always installs the Ulysses/shift surface
@@ -81,7 +81,7 @@ Every `_orig_*` alias is a hard dependency on the base still having that attribu
 | 3 | Attention | Forest Cascade Attention (FCA) |
 | 4 | Model optimization | SwiftKV (Llama) |
 | 5 | KV cache & memory | kvcached prefix caching, sleep/wake (level 1 & 2) |
-| 6 | RL / training | FP32 LM head, NCCL weight sync |
+| 6 | RL / training | FP32 LM head, NCCL weight sync, rollout replay (per-sequence output length) |
 | 7 | Serving infrastructure | Multi-model gRPC/HTTP server, embeddings server, Dynasor |
 
 See [reference.md](reference.md) for each group's design.
@@ -102,6 +102,7 @@ See [reference.md](reference.md) for each group's design.
 | kvcached prefix caching | `arctic_inference/vllm/kvcached/` | `KVCACHED_AUTOPATCH=1` |
 | Sleep/wake (level 2) | `arctic_inference/vllm/patches.py::WorkerPatch` | `enable_sleep_mode=True`, then `llm.sleep(level=2)/wake_up()` |
 | NCCL weight sync | `arctic_inference/server/weight_sync/` | multi-model server `/sync_weights` |
+| Rollout replay (per-sequence output length, `n>1`) | `arctic_inference/vllm/sampling.py` | `SamplingParams(n=N, extra_args={"max_tokens_n": [...]})` |
 | Multi-model server | `arctic_inference/server/` | `arctic_inference_server --port 8000` |
 | Embeddings server | `arctic_inference/embedding/` | `python -m arctic_inference.embedding.replica_manager ...` |
 | Dynasor (reasoning early-stop) | `arctic_inference/dynasor/` | `python -m arctic_inference.dynasor.vllm_server ...` + client |
