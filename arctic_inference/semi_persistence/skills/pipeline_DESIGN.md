@@ -23,7 +23,7 @@ instead of a per-call-site discipline.
 
 This document assumes familiarity with [orchestrator_DESIGN.md](orchestrator_DESIGN.md)
 (especially the **State Machine**, **Slot Allocation**, and
-**Known Issues** sections) and the comment blocks in [orchestrator.py](orchestrator.py).
+**Known Issues** sections) and the comment blocks in [orchestrator.py](../orchestrator.py).
 Most of what is proposed here is a structural re-framing of mechanisms
 that already exist; the goal is to make the existing pipeline an
 object instead of a discipline.
@@ -34,7 +34,7 @@ object instead of a discipline.
 
 Every entry point on `Orchestrator` (`register`, `move`, `generate`,
 `pause`, `resume`, `remove`) submits a `_*_sync` callable to a shared
-`ThreadPoolExecutor` (`_pool`, sized to 4096 workers in [orchestrator.py:448](orchestrator.py))
+`ThreadPoolExecutor` (`_pool`, sized to 4096 workers in [orchestrator.py:448](../orchestrator.py))
 and stashes the returned `Future` somewhere. There is no single
 "pipeline" object: there are three loosely coupled per-`model_id`
 channels that together encode "what is happening on this model right
@@ -112,20 +112,20 @@ non-generate caller has to remember to:
 That same discipline shows up at every call site, each with slightly
 different rules:
 
-- `move` at [orchestrator.py:820-907](orchestrator.py) -- snapshots
+- `move` at [orchestrator.py:820-907](../orchestrator.py) -- snapshots
   `prev`, `prev_gen_future`, `prev_gen_events`, passes all three into
   `_move_sync`.
-- `_evict_for_phase2` at [orchestrator.py:200-300](orchestrator.py) --
+- `_evict_for_phase2` at [orchestrator.py:200-300](../orchestrator.py) --
   snapshots `prev_chain_future`, `prev_gen_future`,
   `prev_inflight_events`, then publishes its own sentinel `Future`
   onto `_futures[mid]` under `gen_lock`.
-- `_drain_inflight_generates` at [orchestrator.py:134-198](orchestrator.py)
+- `_drain_inflight_generates` at [orchestrator.py:134-198](../orchestrator.py)
   -- re-snapshots `_last_generate_future[mid]` and `_inflight[mid]`
   events.
-- `remove` at [orchestrator.py:2300-2360](orchestrator.py) -- snapshots
+- `remove` at [orchestrator.py:2300-2360](../orchestrator.py) -- snapshots
   `prev` and `prev_gen_events`.
 - `_generate_sync` sentinel re-check loop at
-  [orchestrator.py:1625-1739](orchestrator.py) -- re-fetches
+  [orchestrator.py:1625-1739](../orchestrator.py) -- re-fetches
   `_futures[mid]` under `gen_lock` against its submit-time snapshot
   and loops if a sentinel was published in the gap.
 
@@ -389,13 +389,13 @@ pipeline is the source of truth for per-model ordering:
 |---|---|
 | `Orchestrator._futures: dict[str, Future]` | The pipeline's queue IS the chain; `submit()` returns the per-op Future directly. |
 | `Orchestrator._last_generate_future: dict[str, Future]` | `GenerateOp` is just another op in the same FIFO. No separate channel for it to occupy. |
-| `Orchestrator._await_prev` at [orchestrator.py:302-327](orchestrator.py) | Predecessor ordering is provided by the queue; no manual chain-on-prev needed. |
-| `Orchestrator._get_generate_lock` + the `RLock`-with-nested-acquisition contortion at [orchestrator.py:117-132](orchestrator.py) | `gen_lock` exists to make "publish under gen_lock so the worker pipe enqueue order matches" atomic. The pipeline worker is the single sender for its `model_id`, so worker-pipe enqueue order = op execution order trivially. |
-| `Orchestrator._drain_inflight_generates` at [orchestrator.py:134-198](orchestrator.py) | A `MoveOp("sleep")` in the FIFO is necessarily behind every previously-submitted `GenerateOp`; there is nothing to drain. |
-| `Orchestrator._evict_for_phase2`'s sentinel-future plumbing at [orchestrator.py:200-300](orchestrator.py) | Becomes `pipelines[incumbent].submit(EvictForPeerOp(...)).result()` from inside the acquirer's `MoveOp.execute()`. No sentinel needed; see section 4. |
-| `_generate_sync`'s sentinel re-check loop at [orchestrator.py:1625-1739](orchestrator.py) | No parallel channel for the eviction to publish into. |
+| `Orchestrator._await_prev` at [orchestrator.py:302-327](../orchestrator.py) | Predecessor ordering is provided by the queue; no manual chain-on-prev needed. |
+| `Orchestrator._get_generate_lock` + the `RLock`-with-nested-acquisition contortion at [orchestrator.py:117-132](../orchestrator.py) | `gen_lock` exists to make "publish under gen_lock so the worker pipe enqueue order matches" atomic. The pipeline worker is the single sender for its `model_id`, so worker-pipe enqueue order = op execution order trivially. |
+| `Orchestrator._drain_inflight_generates` at [orchestrator.py:134-198](../orchestrator.py) | A `MoveOp("sleep")` in the FIFO is necessarily behind every previously-submitted `GenerateOp`; there is nothing to drain. |
+| `Orchestrator._evict_for_phase2`'s sentinel-future plumbing at [orchestrator.py:200-300](../orchestrator.py) | Becomes `pipelines[incumbent].submit(EvictForPeerOp(...)).result()` from inside the acquirer's `MoveOp.execute()`. No sentinel needed; see section 4. |
+| `_generate_sync`'s sentinel re-check loop at [orchestrator.py:1625-1739](../orchestrator.py) | No parallel channel for the eviction to publish into. |
 | The four "skip-if-paused" `ev.wait(timeout=0.5)` polling loops (in `_move_sync`, `_drain_inflight_generates`, `_evict_for_phase2`, and the `_generate_sync` Phase-3 wait) | `InterruptFlag.wait_or_interrupt` collapses each to a single event-driven wait. The `_generate_sync` Phase-3 case becomes simpler still: the user's `done_event.wait()` happens on the user's calling thread (not the pipeline worker), so it is not subject to interruption at all -- the user's generation paused-and-resumed transparently. See section 5. |
-| `Orchestrator._pool = ThreadPoolExecutor(max_workers=4096)` at [orchestrator.py:448](orchestrator.py) | Replaced by one thread per `ModelPipeline`. Cross-model coordination may briefly park a pipeline worker on a peer pipeline's op (section 4); thread count is bounded by registered model count. |
+| `Orchestrator._pool = ThreadPoolExecutor(max_workers=4096)` at [orchestrator.py:448](../orchestrator.py) | Replaced by one thread per `ModelPipeline`. Cross-model coordination may briefly park a pipeline worker on a peer pipeline's op (section 4); thread count is bounded by registered model count. |
 
 ### What survives but shrinks
 
@@ -422,7 +422,7 @@ pipeline is the source of truth for per-model ordering:
 Phase-2 HBM eviction is the only place in the orchestrator today
 where one model's op synchronously needs another model's state to
 change. `_step_up(sleep -> up)` for the *acquirer* calls
-`_evict_for_phase2(incumbent)` at [orchestrator.py:1372](orchestrator.py).
+`_evict_for_phase2(incumbent)` at [orchestrator.py:1372](../orchestrator.py).
 With per-model pipelines we need a story for "acquirer's pipeline
 worker tells incumbent's pipeline to evict, then waits".
 
@@ -489,7 +489,7 @@ one-directional.
 
 ### 4.4 Implication for `sub` (GPU drain)
 
-`_sub_sync` at [orchestrator.py:692-799](orchestrator.py) currently
+`_sub_sync` at [orchestrator.py:692-799](../orchestrator.py) currently
 maintains a `submitted: dict[mid, Future]` "at-most-once per drain"
 ledger because `Orchestrator.move()` overwrites `_futures[mid]` on
 every call and chains via `prev.result()`, which re-raises the prior
@@ -534,7 +534,7 @@ runs the op on its own thread). The 4096-thread pool can go.
 
 ## 5. Pause as interrupt, via `InterruptFlag`
 
-The comment block at [orchestrator.py:1961-2027](orchestrator.py)
+The comment block at [orchestrator.py:1961-2027](../orchestrator.py)
 spends ~70 lines explaining why `pause` is "deliberately unchained"
 -- it cannot wait its turn behind the very generate it is trying to
 interrupt. The explanation is correct but the *structure* is wrong:
@@ -718,7 +718,7 @@ transient interrupt signal rather than a "model is paused" status.
   `submit_front(PauseOp)` when there is something to pause.
 - **Deferred-pause / phantom-running hang** (Known Issues): the
   `_pause_sync` re-check that `_inflight[mid]` is non-empty under
-  `gen_lock` (at [orchestrator.py:2056-2061](orchestrator.py))
+  `gen_lock` (at [orchestrator.py:2056-2061](../orchestrator.py))
   carries over verbatim into `PauseOp.execute()`. Because `PauseOp`
   runs on the same single-threaded pipeline worker that runs
   `GenerateOp`'s Phase 2 enqueue, the re-check is automatically
@@ -751,14 +751,14 @@ yield-point fix for them:
   add / sub / status / models` keep their existing sync signatures
   and behaviour. `wait(mid)` becomes `pipelines[mid].drain()`;
   `wait()` fans out across all pipelines. Callers in
-  [register.py](register.py), [orch_server.py](orch_server.py), and
-  [client.py](client.py) do not change.
+  `register.py`, [orch_server.py](../orch_server.py), and
+  [client.py](../client.py) do not change.
 - **State machine.** `saved <-> checkpoint <-> sleep <-> up ->
   running` is unchanged. The pipeline refactor is about *how* ops
   are sequenced, not *what* each op does. The body of each
   `*Op.execute()` is a near-verbatim port of the corresponding
   `_*_sync` function.
-- **Slot allocator** ([slots.py](slots.py)) and `Slots._cv` --
+- **Slot allocator** ([slots.py](../slots.py)) and `Slots._cv` --
   unchanged. The pipeline operates above `Slots`. Tier A/B/C
   acquisition logic in `_acquire_slot_for_running` stays inside
   `MoveOp` / `GenerateOp`.
@@ -805,7 +805,7 @@ ORCHESTRATOR (today, outt)                  WORKER (today, inst12.log)
 ```
 
 Today the fix is the `_evict_for_phase2` sentinel future at
-[orchestrator.py:200-300](orchestrator.py): it publishes a
+[orchestrator.py:200-300](../orchestrator.py): it publishes a
 sentinel onto `_futures[model 13]` under `gen_lock` before sending
 sleep, and the racing `_generate_sync` re-checks `_futures[mid]`
 under `gen_lock` and awaits the sentinel before sending its own
@@ -895,11 +895,16 @@ Suggested order, each step landing as a reviewable commit:
 One reproducible test per Known Issues entry that the pipeline
 either eliminates structurally or simplifies. The structural-property
 tests live at the pipeline-primitive layer in
-[`tests/test_pipeline.py`](tests/test_pipeline.py); end-to-end
-repros (real vLLM subprocesses, multi-GPU eviction) live in
-[`tests/test_eviction.py`](tests/test_eviction.py) and
-[`tests/test_generate.py`](tests/test_generate.py) since they need
-real hardware.
+[`tests/test_pipeline.py`](../tests/test_pipeline.py), which is the only
+part of this plan runnable under `pytest`.
+
+End-to-end repros need real hardware (real vLLM subprocesses,
+multi-GPU eviction) and so live outside `tests/` as imperative
+scripts.  Only the generate repro exists today, as
+[`scripts/test_generate.py`](../scripts/test_generate.py).  **The eviction repro is
+still missing**: `test_eviction.py` was a byte-identical copy of the
+generate script and has been removed rather than left standing in as
+phantom coverage.
 
 | Known Issues entry | Test shape under new design | Implementation |
 |---|---|---|

@@ -1,4 +1,8 @@
+import os
+import sys
 import threading
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from instance import Instance
 from slots import Slots

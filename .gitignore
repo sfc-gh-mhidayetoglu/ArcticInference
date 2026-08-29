@@ -6,3 +6,5 @@ __pycache__
 docs/_build
 .idea
 arctic_inference/embedding/proto/python/
+arctic_inference/semi_persistence/*.log
+arctic_inference/semi_persistence/**/outt_*

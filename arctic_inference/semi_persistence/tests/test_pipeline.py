@@ -488,8 +488,8 @@ def test_pending_request_dataclass() -> None:
 #
 # These tests cover STRUCTURAL properties of the pipeline that make the
 # original bug shapes non-recurrable.  Full end-to-end repros (real vLLM
-# subprocesses, multi-GPU eviction) live in tests/test_eviction.py and
-# tests/test_generate.py since they need real hardware.
+# subprocesses, multi-GPU eviction) need real hardware, so they live
+# outside this directory as the imperative scripts/test_generate.py.
 # ---------------------------------------------------------------------------
 
 

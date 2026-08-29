@@ -12,8 +12,8 @@ Exercises the per-model env-var path end to end:
    the persisted ``vllm_config`` so the orchestrator can rediscover it
    on reboot and client-side dedup stays honest.
 
-Imperative test in the style of the rest of this directory: run with
-``python tests/test_env.py [gpu_a] [gpu_b]``.  Defaults to GPUs 0 and 1.
+Imperative script requiring two real GPUs: run with
+``python scripts/test_env.py [gpu_a] [gpu_b]``.  Defaults to GPUs 0 and 1.
 """
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ import json
 import os
 import shutil
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from instance import Instance
 

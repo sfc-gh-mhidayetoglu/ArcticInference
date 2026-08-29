@@ -649,7 +649,7 @@ inst.wait() <-------- demuxer.wait_idle()  (condvar on _pending_count)
 ### Demuxer architecture
 
 Each Instance owns a single per-instance `Demuxer` thread (see
-[`demuxer.py`](demuxer.py)) that is the **sole consumer** of
+[`demuxer.py`](../demuxer.py)) that is the **sole consumer** of
 `_result_queue`.  The demuxer is created lazily by `_ensure_queues`
 (at `init` / `load_image`) and torn down by `_close_queues` (at
 `teardown` / `_reset`).  For every result it:
@@ -805,22 +805,43 @@ semi_persistence/
   instance.py        -- Instance class (GPU-agnostic handle, owns worker process)
   worker.py          -- Worker loop, child thread, checkpoint/restore/CRIU save/load
   vllm_child.py      -- vLLM child process (owns GPU, pinned memory, async engine loop)
+  demuxer.py         -- Result-queue demultiplexer (keeps Instance state fresh)
+  slots.py           -- Buddy allocator for fractional GPU slots (see slots_DESIGN.md)
+  pipeline.py        -- Per-model Op pipeline (see pipeline_DESIGN.md)
   orchestrator.py    -- Orchestrator class (see orchestrator_DESIGN.md)
-  gpu_pool.py        -- GPU pool with semaphore-based acquisition
+  orch_server.py     -- HTTP front end for the Orchestrator
+  client.py          -- OrchestratorClient (see client_DESIGN.md)
   state_server.py    -- HTTP /state endpoint for dashboard/monitor
   dashboard.py       -- Curses-based live dashboard (GPU/CPU tiers, requests)
-  monitor.py         -- Plotext-based live monitor (scatter + utilization charts)
-  replay.py          -- Curses replay viewer (dashboard + charts side by side)
-  compare.py         -- Side-by-side comparison of two recordings
   abstract.py        -- Abstract InstanceBase interface (reference only)
-  demo.py            -- CLI demo script (stdout/stderr redirected to log file)
-  demo.ipynb         -- Jupyter notebook demo
-  main_test.py       -- Integration test
-  test_migrate.py    -- Cross-GPU migration test
-  test_image.py      -- CRIU save/load image cache test
-  instance_DESIGN.md -- This file
-  async_generate_DETAILS.md -- Async generate implementation details
-  CRIU_PLUMBING.md   -- CRIU dump/restore complications and fixes
+  semip_logging.py   -- Logging setup
+
+  tests/             -- pytest suite (CPU-only, no GPU required)
+    test_pipeline.py -- Pipeline primitives against fake Ops
+    test_slots.py    -- Buddy-allocator unit tests
+
+  scripts/           -- Imperative repro scripts (require real GPUs + vLLM)
+    main_test.py     -- Integration walkthrough of the Instance primitives
+    test_copy.py     -- Concurrent multi-model restore driven through Slots
+    test_env.py      -- Per-model vllm_config["_env"] smoke test
+    test_generate.py -- Orchestrator end-to-end register/generate/move
+    test_image.py    -- CRIU save/load image cache test
+
+  tools/             -- Standalone CLIs (consume state_server's /state)
+    monitor.py       -- Plotext-based live monitor (scatter + utilization charts)
+    compare.py       -- Side-by-side comparison of two recordings
+
+  skills/            -- Agent skill + all documentation
+    SKILL.md         -- Orientation map for the subsystem
+    reference.md     -- Per-subsystem detail behind SKILL.md
+    instance_DESIGN.md        -- This file
+    orchestrator_DESIGN.md    -- Orchestrator state machine and API
+    pipeline_DESIGN.md        -- Per-model Op pipeline
+    slots_DESIGN.md           -- Buddy allocator
+    client_DESIGN.md          -- OrchestratorClient job/model split
+    async_generate_DETAILS.md -- Async generate implementation details
+    CRIU_PLUMBING.md          -- CRIU dump/restore complications and fixes
+    INSTALL.md                -- CRIU install + draft model sync
 ```
 
 ## Known Issues
