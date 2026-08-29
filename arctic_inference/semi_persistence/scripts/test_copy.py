@@ -2,6 +2,9 @@ import os
 import sys
 import threading
 
+# Unlike its sibling scripts this one drives ``Slots`` directly, which is
+# not part of the package's public surface, so it imports flat off the
+# package directory rather than via ``arctic_inference.semi_persistence``.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from instance import Instance

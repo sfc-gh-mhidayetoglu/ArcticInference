@@ -1,8 +1,6 @@
-import os, sys
+import os
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from instance import Instance
+from arctic_inference.semi_persistence import Instance
 
 MODEL = "Qwen/Qwen3-8B-FP8"
 IMAGE_CACHE = "/data-fast/image-cache/test_image"

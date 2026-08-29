@@ -1,9 +1,4 @@
-import os
-import sys
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from orchestrator import Orchestrator as orch
+from arctic_inference.semi_persistence import Orchestrator as orch
 
 config_qwen3_8b = {
     "model": "Qwen/Qwen3-8B",

@@ -22,9 +22,7 @@ import os
 import shutil
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from instance import Instance
+from arctic_inference.semi_persistence import Instance
 
 
 CONFIG = {"model": "Qwen/Qwen3.5-2B", "gpu_memory_utilization": 0.4}
