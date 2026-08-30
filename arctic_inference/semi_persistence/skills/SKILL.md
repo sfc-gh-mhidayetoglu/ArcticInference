@@ -51,7 +51,7 @@ Read bottom-up; each layer only knows about the one below it.
 | Pipeline | `pipeline.py` | One worker thread + FIFO queue per model, ops as `Op` subclasses |
 | Orchestrator | `orchestrator.py` | `model_id` -> `Instance`, the state ladder, eviction policy |
 | Serving | `orch_server.py`, `client.py` | HTTP front end and the job-keyed client |
-| Observability | `state_server.py`, `dashboard.py`, `tools/` | `/state` endpoint, curses dashboard, monitor, compare |
+| Observability | `state_server.py`, `dashboard.py` | `/state` endpoint, curses dashboard |
 | Support | `abstract.py`, `semip_logging.py` | `InstanceBase` interface, logging |
 
 ## Process hierarchy
@@ -125,7 +125,6 @@ semi_persistence/
   *.py           library code (orchestrator, instance, worker, client, dashboard, ...)
   tests/         pytest: CPU-only, hermetic, ~2.5s, no GPU
   scripts/       imperative repros: need real GPUs and real vLLM
-  tools/         standalone CLIs: monitor.py, compare.py
   skills/        this skill (SKILL.md + reference.md) and every design doc
 ```
 
@@ -135,7 +134,7 @@ Running things:
 cd arctic_inference/semi_persistence
 python -m pytest tests/ -q        # 35 tests, no GPU needed
 python scripts/test_env.py 0 1    # needs two real GPUs
-python tools/monitor.py           # needs plotext (not a declared dependency)
+python dashboard.py               # needs a running orchestrator on :8157
 ```
 
 `tests/` is the only part runnable in CI. Everything in `scripts/` allocates

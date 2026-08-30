@@ -811,7 +811,7 @@ semi_persistence/
   orchestrator.py    -- Orchestrator class (see orchestrator_DESIGN.md)
   orch_server.py     -- HTTP front end for the Orchestrator
   client.py          -- OrchestratorClient (see client_DESIGN.md)
-  state_server.py    -- HTTP /state endpoint for dashboard/monitor
+  state_server.py    -- HTTP /state endpoint for the dashboard
   dashboard.py       -- Curses-based live dashboard (GPU/CPU tiers, requests)
   abstract.py        -- Abstract InstanceBase interface (reference only)
   semip_logging.py   -- Logging setup
@@ -826,10 +826,6 @@ semi_persistence/
     test_env.py      -- Per-model vllm_config["_env"] smoke test
     test_generate.py -- Orchestrator end-to-end register/generate/move
     test_image.py    -- CRIU save/load image cache test
-
-  tools/             -- Standalone CLIs (consume state_server's /state)
-    monitor.py       -- Plotext-based live monitor (scatter + utilization charts)
-    compare.py       -- Side-by-side comparison of two recordings
 
   skills/            -- Agent skill + all documentation
     SKILL.md         -- Orientation map for the subsystem

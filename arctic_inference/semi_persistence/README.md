@@ -135,7 +135,7 @@ hand.
 | `instance.py`, `worker.py`, `vllm_child.py` | The instance handle and the spawned worker / vLLM child that own the GPU |
 | `orchestrator.py`, `pipeline.py`, `slots.py` | State ladder, per-model op pipeline, buddy allocator for GPU slots |
 | `orch_server.py`, `client.py`, `state_server.py` | HTTP control plane, job-keyed client, `/state` endpoint |
-| `dashboard.py`, `tools/` | Live curses dashboard, monitor and A/B replay comparison |
+| `dashboard.py` | Live curses dashboard over the `/state` endpoint |
 | `scripts/` | Imperative repros; these need real GPUs and real weights |
 | `tests/` | CPU-only pytest suite, hermetic, no GPU required |
 | `skills/` | Design docs and install notes |

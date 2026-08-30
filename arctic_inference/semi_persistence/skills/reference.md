@@ -265,18 +265,17 @@ would import them and collect nothing.
 of the generate script and was deleted rather than left as phantom coverage;
 `pipeline_DESIGN.md` describes what it should assert.
 
-### `tools/` — standalone CLIs
+### Observability
 
-`monitor.py` (plotext scatter and utilization charts) and `compare.py`
-(side-by-side curses comparison of two recordings, imports `monitor`). Both
-consume the orchestrator's `/state` endpoint served by `state_server.py`.
+`dashboard.py` is the only live view, and it sits with the library code rather
+than in a separate CLI directory. It consumes the orchestrator's `/state`
+endpoint served by `state_server.py`.
 
-`plotext` is neither installed nor declared as a dependency anywhere in
-`pyproject.toml` or `setup.py`, so both tools fail on import until it is
-installed manually.
-
-`dashboard.py` deliberately stays with the library code rather than moving to
-`tools/`.
+A `tools/` directory previously held `monitor.py` (plotext scatter and
+utilization charts) and `compare.py` (side-by-side curses comparison of two
+recordings). Both were dropped: `plotext` was never declared as a dependency,
+and `monitor.py` rebuilt one of its functions via `exec()` of patched library
+source, which the security scanner flags as arbitrary code execution.
 
 ---
 
