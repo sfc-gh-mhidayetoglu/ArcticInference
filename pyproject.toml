@@ -35,6 +35,7 @@ packages = [
     "arctic_inference.common.swiftkv",
     "arctic_inference.dynasor",
     "arctic_inference.op_builder",
+    "arctic_inference.semi_persistence",
     "arctic_inference.suffix_decoding",
     "arctic_inference.vllm",
     "arctic_inference.vllm.swiftkv",
