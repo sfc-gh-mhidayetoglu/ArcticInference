@@ -61,6 +61,32 @@ instance_1.init(gpu=0)
 instance_2.init(gpu=1)
 ```
 
+### Optional `model_dir`
+
+`Instance(vllm_config, model_dir=None)` accepts a per-model directory
+holding `{compilation, image, weights}`.  With it, `criu_dump()` and
+`criu_restore()` need no path, the weight shards land in
+`<model_dir>/weights`, and the JIT/compile caches move under
+`<model_dir>/compilation` so the whole directory travels between nodes as
+one unit.  Without it the primitives take explicit paths and the caches
+keep their node-local defaults, which is what the orchestrator uses.
+See [semi-p_DESIGN.md](semi-p_DESIGN.md).
+
+### Tensor parallelism
+
+TP size comes from `vllm_config["tensor_parallel_size"]`.  `init` and
+`cuda_restore` then take a `gpus` list that is placement only and must
+have exactly that many entries:
+
+```python
+inst = Instance({"model": "...", "tensor_parallel_size": 2}, model_dir)
+inst.init(gpus=[2, 3])
+```
+
+Four additional primitives (`destroy_nccl`, `reinit_nccl`, `cleargraph`,
+`recapture_graphs`) bracket the checkpoint and restore; all are no-ops at
+TP=1.  See [tp_DESIGN.md](tp_DESIGN.md).
+
 ## Process Hierarchy
 
 Each Instance owns one **worker process**, created when `init(gpu)` or

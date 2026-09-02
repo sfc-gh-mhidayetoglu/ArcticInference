@@ -46,18 +46,23 @@ covered there.
   8. Audit /proc/<pid>/task for non-"python" threads (informational)
 
   (back in worker)
-  9. Scan child fds for socket:[ino] → --external unix[ino]
+  9. Scan child AND descendant fds for socket:[ino] → --external unix[ino]
+     (TP>1 worker subprocesses hold the multiproc-executor IPC sockets)
  10. Scan child fds for /dev/nvidia*   → record into meta.json
  11. → criu dump (destructive): image written, child killed
 
 [Every use after dump — load from image]
 
   1. Pass pipe FD via Unix socket (SCM_RIGHTS) into sudo'd helper
-  2. helper dup2's the pipe fd into place, execvp's criu restore
+  2. helper dup2's the pipe fd into place, then unshares a fresh PID
+     namespace and forks: PID 1 is a reaper that unshares a mount ns with
+     a private /proc and execs criu restore *inside* the new namespace
+     (see Complication 10 — this frees the image's recorded PIDs)
   3. criu restore --inherit-fd fd[N]:pipe_resource
                   --inherit-fd fd[1]:stdout, fd[2]:stderr
-                  --link-remap --tcp-close --shell-job
-  4. cuda-checkpoint restore / driver API restores GPU context
+                  --link-remap --tcp-close        (no --shell-job)
+  4. worker finds the restored root's *host* PID via the inherited pipe
+  5. cuda-checkpoint restore / driver API restores GPU context
 ```
 
 ---
@@ -245,14 +250,21 @@ that occurred when remapping deleted shared-memory files.
 
 `save()` writes a `meta.json` file alongside the CRIU image containing:
 
-- **CRIU plumbing**: `child_pid`, `pipe_fd`, `pipe_resource`, `nvidia_fds`, `rank`
+- **CRIU plumbing**: `child_pid`, `pipe_fd`, `pipe_resource`, `nvidia_fds`
+- **Placement and hardware identity**: `rank`, `gpus` (the physical GPU
+  list; single-element at TP=1), and `gpu_uuids` — the *capture* node's
+  GPU UUIDs, which the restore device map needs as its "old" side so the
+  image can be restored on a different node
 - **Instance metadata**: `vllm_config` (which may include the reserved
-  `_env` mapping of per-model env vars), `total_gpu_bytes`,
-  `pinned_cpu_bytes`
+  `_env` mapping of per-model env vars), `model_dir`, `total_gpu_bytes`,
+  `pinned_cpu_bytes`, `n_gpus`, `max_pinned_bytes_per_worker`
 
-On `load()`, the instance validates that the image's `vllm_config`
-matches the instance's config.  A mismatch raises `RuntimeError`
-immediately, before any worker is spawned or CRIU restore attempted.
+On `criu_restore()`, the instance validates that the image's
+`vllm_config` and `model_dir` both match.  A mismatch raises
+`RuntimeError` immediately, before any worker is spawned or CRIU restore
+attempted.  The `model_dir` check matters because the image bakes
+absolute compile-cache paths (see
+[semi-p_DESIGN.md](semi-p_DESIGN.md)).
 
 The child's `os.environ` is itself captured inside the CRIU dump and
 restored verbatim by `load()`, so env vars set during cold start
@@ -278,19 +290,31 @@ The CRIU PPA package does not create it automatically.
 
 ## Complication 8: PID Collisions at Restore
 
-**Problem:** CRIU restores the process tree with the same PIDs recorded
-in the image.  When multiple models restore concurrently, the target PID
-may already be in use by an unrelated process on the host:
+**Problem:** CRIU restores every task at its *recorded* PID (via
+`clone3(set_tid)`), so the restore fails if that PID is already taken:
 
 ```
 Can't fork for 47619: File exists
 ```
 
-**Fix (worker):** `worker_loop` wraps `_worker_criu_load` in a retry
-loop (up to 5 attempts with 0.5s backoff).  If the error message
-contains `"File exists"`, the attempt is retried with fresh pipe
-descriptors.  The conflicting PID is typically short-lived, so a brief
-delay is sufficient.
+Three ways it gets taken:
+
+1. **A zombie from the dump.** The destructive dump kills the child, but
+   its still-live worker never reaps it, and a zombie holds its PID.
+   This one is guaranteed, not incidental — the image's own `child_pid`
+   is the PID that is occupied.
+2. **Concurrent restores.** Two images captured on the same node with
+   their child trees alive simultaneously carry adjacent/interleaved
+   PIDs, so the second restore collides with the first.
+3. **An unrelated host process** happening to hold the recorded PID.
+
+**Partial fix (retry loop):** `worker_loop` retries `_worker_criu_load`
+up to 5 times with 0.5s backoff on `"File exists"`.  This only helps for
+case 3, and only when the holder is short-lived.  A zombie under a live
+parent never goes away, so cases 1 and 2 defeat it entirely.
+
+**Real fix:** restore each tree into its own PID namespace, where the
+recorded PIDs are always free.  See Complication 10.
 
 ---
 
@@ -346,6 +370,60 @@ which are `MAP_PRIVATE`, unlike semaphores which are `MAP_SHARED`).
 
 ---
 
+## Complication 10: Per-Restore PID Namespace (and the tty it forced out)
+
+**Problem:** See Complication 8 — the recorded PIDs are frequently
+occupied, and CRIU 4.2 explicitly rejects `--join-ns pid:`, so we cannot
+ask it to place the tree into a pre-made namespace.
+
+**Fix: run criu inside a fresh PID namespace held open by a reaper.**
+The sudo'd restore helper (`_worker_criu_load` in `worker.py`):
+
+1. Receives the inherited pipe fd (SCM_RIGHTS, as in Complication 5),
+   then `unshare(CLONE_NEWPID)` and `fork()`.
+2. The host-namespace parent publishes **PID 1's host PID** to
+   `reaper.pid` (in the image dir) and blocks — this keeps the namespace,
+   and the `sudo` handle, alive.
+3. **PID 1** unshares a mount namespace, mounts a private `/proc` (so
+   criu sees the namespace's PID view), then forks `criu restore -d`
+   into the namespace, records criu's exit code to `restore.rc`, and
+   reaps forever. A live PID 1 is required both for the namespace to
+   persist and for `clone3(set_tid)` of any non-1 PID to be permitted.
+4. After criu detaches, the restored tree reparents onto PID 1. The
+   worker discovers the restored root's **host** PID via the inherited
+   pipe and drives the rest of the lifecycle with it (CUDA
+   checkpoint/restore, `/proc` walks, and signals all use host PIDs,
+   which are unaffected by the nesting) — `--pidfile` now holds the
+   meaningless in-namespace PID.
+
+Teardown SIGKILLs PID 1, which makes the kernel tear down the whole
+namespace and the restored tree in one shot. An `atexit` fallback in
+`worker_loop` catches Ctrl-C and unhandled exceptions, and a stale-reaper
+sweep (reads a leftover `reaper.pid` and kills it) covers `SIGKILL`
+deaths that cannot run cleanup.
+
+**The tty this forced out.** A private PID namespace is incompatible
+with a `--shell-job` image. The child inherited the interactive shell's
+pts on fd 0, so it was captured as a shell job tied to an external
+terminal. On restore inside the new namespace the session and pgrp
+collapse to `1`, and CRIU's `TIOCSPGRP` on the host terminal fails:
+
+```
+tty: Restore inherited group 1
+Error (criu/tty.c:689): tty: Failed to set group 1 on 0: Inappropriate ioctl for device
+Error (criu/files.c:1221): Unable to open fd=0 id=0xec
+```
+
+**Fix (dump side):** the child sheds its controlling terminal at startup
+(`vllm_child_loop`): point fd 0 at `/dev/null` and `os.setsid()` so the
+captured tree owns its own session and holds no terminal. With no tty in
+the image, `--shell-job` is unnecessary and is dropped from both `criu
+dump` and `criu restore`. This matches the CRIU maintainers' guidance for
+PID-namespace restore. **Images captured before this change (with a tty /
+`--shell-job`) must be re-dumped.**
+
+---
+
 ## Summary Table
 
 | Resource           | Problem at dump time               | Dump-side fix                      | Restore-side fix                     |
@@ -357,7 +435,8 @@ which are `MAP_PRIVATE`, unlike semaphores which are `MAP_SHARED`).
 | Pipe FD            | sudo closes FDs >= 3                | —                                  | SCM_RIGHTS via Unix socket           |
 | CUDA context       | GPU state not in CRIU image         | CRIU CUDA plugin at dump           | Driver API or cuda-checkpoint        |
 | Plugin directory   | `--libdir` path missing             | Create `/usr/lib/criu/empty`       | —                                    |
-| PID collisions     | —                                   | —                                  | Retry loop (5 attempts, 0.5s delay)  |
+| stdin / tty        | pts captured as `--shell-job`; can't reattach in a PID ns | fd 0 → `/dev/null` + `setsid()` at child start | drop `--shell-job` |
+| PID collisions     | Zombie from the destructive dump holds the recorded PID | — | Restore each tree in its own PID namespace (reaper + private /proc); retry loop as backstop |
 | Ghost remap race   | `(deleted)` .so → ghost race        | Destructive dump + sem deletion    | `--link-remap`                       |
 
 ---

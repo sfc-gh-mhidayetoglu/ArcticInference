@@ -22,22 +22,39 @@ inst.criu_dump("/data-fast/image-cache/foo").wait()
 
 | Primitive | Effect | Runs in |
 |---|---|---|
-| `init(gpu)` | Cold start with real weights; spawns worker + child; applies `_env` | Worker + child |
-| `criu_restore(path)` | CRIU-restore from disk; validates the image's `vllm_config` matches | Worker |
-| `criu_dump(path)` | CRIU-dump the child tree (**destructive**); writes `meta.json` | Worker |
+| `init(gpus=[...])` | Cold start with real weights; spawns worker + child; applies `_env`. A scalar `gpu=` still works at TP=1 | Worker + child |
+| `criu_restore(path=None)` | CRIU-restore from disk; validates the image's `vllm_config` and `model_dir` match. Defaults to `<model_dir>/image` | Worker |
+| `criu_dump(path=None)` | CRIU-dump the child tree (**destructive**); writes `meta.json`. Defaults to `<model_dir>/image` | Worker |
 | `teardown()` | Tear down instance, worker, child; resets to created state | Worker + child |
 | `remove()` | Deregister from `Instance._all`; non-blocking, non-destructive | Main |
 | `wait()` | Block until pending commands complete | Main |
+
+`Instance(vllm_config, model_dir=None)`. With a `model_dir`, the dump and
+restore paths default to `<model_dir>/image` and the compile cache moves
+under `<model_dir>/compilation`; see [semi-p_DESIGN.md](semi-p_DESIGN.md).
 
 ### GPU residency
 
 | Primitive | Effect |
 |---|---|
 | `sleep()` | `llm.sleep(level=2)` — frees GPU memory for main and drafter weights |
-| `cuda_checkpoint()` | Save CUDA state to CPU via `cuCheckpointProcess`; `gpu` becomes `None` |
-| `cuda_restore(gpu)` | Restore CUDA state onto a specific GPU (`gpu` is required) |
+| `cuda_checkpoint()` | Save CUDA state to CPU via `cuCheckpointProcess`; `gpu` becomes `None`. At TP>1 also inserts `cleargraph` + `destroy_nccl` first |
+| `cuda_restore(gpus=[...])` | Restore CUDA state onto specific GPU(s). Defaults to the placement recorded in the image; a scalar `gpu=` still works at TP=1 |
 | `wake_up_weights()` | Re-allocate weight tensors on GPU (main + drafter) |
 | `wake_up_kv_cache()` | Re-allocate the KV cache on GPU |
+
+### Tensor parallel (no-ops at TP=1)
+
+TP size comes from `vllm_config["tensor_parallel_size"]`; `gpus` is
+placement only and must have exactly that many entries. See
+[tp_DESIGN.md](tp_DESIGN.md).
+
+| Primitive | Effect |
+|---|---|
+| `destroy_nccl(graph_mode="reuse")` | Tear down NCCL and CustomAllreduce IPC before a checkpoint |
+| `reinit_nccl()` | Rebuild NCCL on a fresh port. Must run immediately after `cuda_restore`, before any collective |
+| `cleargraph(graph_mode="reuse")` | Drop CUDA-graph exec handles; `reuse` preserves them |
+| `recapture_graphs(graph_mode="reuse")` | Rebind (`reuse`) or recapture (`full`) decode graphs, after `wake_up_kv_cache` |
 
 ### CPU buffer and weight transfer
 
@@ -48,8 +65,14 @@ inst.criu_dump("/data-fast/image-cache/foo").wait()
 | `detach()` | Free the CPU buffer |
 | `repin()` / `unpin()` | `cudaHostRegister` / `cudaHostUnregister` the buffer |
 | `stage()` | Snapshot main + drafter params GPU -> pinned CPU |
-| `plan_restore_weights()` | Build and cache a chunk plan under a computed byte budget |
+| `save_weights()` | Write the staged buffer to `<model_dir>/weights` as shards + `weights_meta.json`. Call after `stage()`, before `detach()`, so the image stays small |
+| `load_weights()` | Read those shards back into the buffer. Requires a prior `attach()` on the restore side |
+| `plan_restore_weights(max_buffer_bytes=None)` | Build and cache a chunk plan under a computed byte budget; pass an explicit cap for older images |
 | `restore_weights()` | Execute the cached plan: buffer -> one reused GPU staging buffer -> scatter |
+
+`save_weights` / `load_weights` are optional: without them the staged
+weights stay inside the CRIU image, which is what the orchestrator does.
+At TP>1 the shards fan out to `weights/rank{R}/`.
 
 The drafter contributes extra parameter entries only when it exposes a `.model`
 (Eagle / Medusa / DraftModel / ArcticProposer). Ngram and Suffix drafters are

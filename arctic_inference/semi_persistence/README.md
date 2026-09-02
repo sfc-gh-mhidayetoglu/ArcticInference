@@ -126,7 +126,10 @@ inst.generate(["Hello, world!"], {}).wait().print_status()
 
 `scripts/test_image.py` is the minimal save-then-restore walkthrough;
 `scripts/main_test.py` shows five instances being multiplexed across two GPUs by
-hand.
+hand. `scripts/test_weights.py` keeps the weights outside the image
+(`save_weights` / `load_weights`, so the dump runs against a detached, small
+process), and `scripts/test_tp2.py` does the same at tensor_parallel_size=2 with
+expert parallel, cold-starting on one GPU pair and restoring onto another.
 
 ## Repository layout
 

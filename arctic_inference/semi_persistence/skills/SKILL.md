@@ -164,7 +164,9 @@ real GPUs and loads real weights.
 | [`pipeline_DESIGN.md`](pipeline_DESIGN.md) | Op model, interrupts, cross-model eviction, regression plan |
 | [`slots_DESIGN.md`](slots_DESIGN.md) | Buddy allocator algorithms, invariants, worked example |
 | [`client_DESIGN.md`](client_DESIGN.md) | Job/model two-layer split, calling shapes, session persistence |
-| [`CRIU_PLUMBING.md`](CRIU_PLUMBING.md) | The nine CRIU complications and the FD keep-list |
+| [`CRIU_PLUMBING.md`](CRIU_PLUMBING.md) | The ten CRIU complications and the FD keep-list |
+| [`tp_DESIGN.md`](tp_DESIGN.md) | Tensor parallelism: the four TP primitives, NCCL teardown/rebuild, graph reuse |
+| [`semi-p_DESIGN.md`](semi-p_DESIGN.md) | The `model_dir` layout, what a re-dump touches, what binds an image |
 | [`async_generate_DETAILS.md`](async_generate_DETAILS.md) | Async generate, IPC protocol, drain points |
 | [`INSTALL.md`](INSTALL.md) | CRIU install (PPA and from-source), draft model sync |
 
