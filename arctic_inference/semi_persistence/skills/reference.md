@@ -60,12 +60,12 @@ placement only and must have exactly that many entries. See
 
 | Primitive | Effect |
 |---|---|
-| `attach()` | Allocate unpinned CPU memory sized to main + drafter `named_parameters()` |
-| `attach_pinned()` | Allocate permanently-pinned memory; skips repin/unpin at ~34 ms/GiB cost |
-| `detach()` | Free the CPU buffer |
-| `repin()` / `unpin()` | `cudaHostRegister` / `cudaHostUnregister` the buffer |
-| `stage()` | Snapshot main + drafter params GPU -> pinned CPU |
-| `save_weights()` | Write the staged buffer to `<model_dir>/weights` as shards + `weights_meta.json`. Call after `stage()`, before `detach()`, so the image stays small |
+| `attach()` | Allocate unpinned CPU memory *per worker*, sized to that rank's main + drafter `named_parameters()` |
+| `attach_pinned()` | **Unsupported; raises.** Use `attach()` -> `repin()` |
+| `detach()` | Free each worker's CPU buffer |
+| `repin()` / `unpin()` | `cudaHostRegister` / `cudaHostUnregister` each worker's buffer. Idempotent |
+| `stage()` | Snapshot main + drafter params GPU -> that worker's CPU buffer |
+| `save_weights()` | Write each worker's buffer to `<model_dir>/weights` as shards + `weights_meta.json`. Call after `stage()`, before `detach()`, so the image stays small |
 | `load_weights()` | Read those shards back into the buffer. Requires a prior `attach()` on the restore side |
 | `plan_restore_weights(max_buffer_bytes=None)` | Build and cache a chunk plan under a computed byte budget; pass an explicit cap for older images |
 | `restore_weights()` | Execute the cached plan: buffer -> one reused GPU staging buffer -> scatter |
@@ -73,6 +73,13 @@ placement only and must have exactly that many entries. See
 `save_weights` / `load_weights` are optional: without them the staged
 weights stay inside the CRIU image, which is what the orchestrator does.
 At TP>1 the shards fan out to `weights/rank{R}/`.
+
+All of this state (buffer, param index, chunk plan) lives on the vLLM
+workers as `worker._semip_*` and runs there via `collective_rpc`, not in
+the child process. At TP>1 a buffer held in the child would be
+cloudpickled by value into each worker subprocess and its writes lost;
+each rank also owns a different shard. One code path serves both TP
+sizes. See [instance_DESIGN.md](instance_DESIGN.md).
 
 The drafter contributes extra parameter entries only when it exposes a `.model`
 (Eagle / Medusa / DraftModel / ArcticProposer). Ngram and Suffix drafters are

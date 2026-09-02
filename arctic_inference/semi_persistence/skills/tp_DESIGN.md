@@ -33,10 +33,19 @@ Three things break at TP>1 that simply do not exist at TP=1:
    physical GPUs while keeping all of them visible (the cuda-checkpoint
    physical-GPU addressing requires it), rather than pinning one GPU via
    `CUDA_VISIBLE_DEVICES`.
+4. **Where the weight-staging buffer lives.** At TP=1 vLLM uses the
+   "uni" executor and the worker *is* the vllm_child process, so a
+   buffer allocated there and captured by a `collective_rpc` closure is
+   mutated in place.  At TP>1 the multiproc executor cloudpickles that
+   closure into N subprocesses: each gets a *copy* of the buffer, writes
+   into the copy, and the writes are discarded when the call returns --
+   silently.  Each rank also owns a different shard of the parameters,
+   so a single child-side buffer is the wrong size regardless.
 
 These map to the four new primitives (`destroy_nccl`, `reinit_nccl`,
 `cleargraph`, `recapture_graphs`), the `SemipGPUWorker` + `SEMIP_GPU_MAP`
-placement mechanism, and a per-worker memory-budget correction.
+placement mechanism, the worker-local staging primitives
+(`worker._semip_*`), and a per-worker memory-budget correction.
 
 ---
 
@@ -224,6 +233,14 @@ in the child.  All of it degrades to a no-op at TP=1.
   preserved decode graphs replay after `destroy_nccl` -> `reinit_nccl`
   without a full recapture (the reuse path). This is the heaviest and
   most fragile piece of the TP work; it is entirely bypassed at TP=1.
+- **Worker-local weight staging** (`_semip_attach`, `_semip_stage`,
+  `_semip_repin`, `_semip_unpin`, `_semip_plan_load_weights`,
+  `_semip_restore_weights`, `_semip_detach`, `_semip_save_weights`,
+  `_semip_load_weights`): the staging buffer, param index and chunk plan
+  live on the worker (`worker._semip_*`) for the reason in section 1.4.
+  Unlike the primitives above this is *not* a TP-only addition -- it is
+  the single path both TP sizes take, and the child only aggregates the
+  per-worker results. `attach_pinned` is unsupported on it.
 - **Per-rank weight shards**: `save_weights`/`load_weights` fan out to
   `weights/rank{R}/` at TP>1; TP=1 keeps the flat `weights/` layout.
 
@@ -288,6 +305,11 @@ TP>1 = TP=1 baseline
      + cuda_checkpoint auto-inserts cleargraph+destroy_nccl @ TP>1    # behavior change
      + plan_restore_weights uses per-worker pinned budget             # per-GPU correctness
      + meta.json carries n_gpus / gpus / max_pinned_bytes_per_worker  # image portability
+     + weights/rank{R}/ shard layout                                  # per-rank shards
 ```
+
+Plus one change that is shared rather than TP-gated: weight staging
+lives on the workers (`worker._semip_*`) for both TP sizes, because a
+child-side buffer cannot be written by workers at TP>1.
 
 Nothing is removed from the TP=1 path; TP>1 is a strict superset.

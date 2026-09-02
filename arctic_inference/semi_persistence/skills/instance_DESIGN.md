@@ -126,8 +126,12 @@ Main process
   |           |-- [checkpoint/restore via cuCheckpointProcess ctypes]
   |           |
   |           `-- vLLM child process  (spawned)
-  |                 |-- owns CPU buffer (allocated on attach, pinned via repin)
   |                 |-- EngineCore (in-process, holds GPU memory)
+  |                 |     `-- each vLLM worker owns a CPU staging buffer
+  |                 |         (allocated on attach, pinned via repin).  At
+  |                 |         TP=1 the worker is this same process; at TP>1
+  |                 |         there is one worker subprocess (and one buffer)
+  |                 |         per rank.
   |                 `-- resource_tracker  (no GPU, skipped during checkpoint)
   |
   |-- Instance 2  (handle, main-process side)
@@ -165,15 +169,16 @@ primitives must be:
 | `criu_dump(filename)`        | CRIU-dump the child process tree to disk (destructive).  The child is killed after the image is written.  Writes `meta.json` with `vllm_config` (including `_env` if set) and CRIU metadata. | Worker (child thread) |
 | `criu_restore(filename)`        | Restore a process from a CRIU image on disk.  Validates that the image's `vllm_config` matches this instance.  Spawns a new worker and CRIU-restores the child.  Does *not* re-apply `_env` -- the child's `os.environ` is captured inside the CRIU image and restored verbatim. | Worker |
 | `cuda_restore(gpu)`          | Restore checkpointed CUDA state onto the specified GPU.  `gpu` is required. | Worker (ctypes) |
-| `attach()`              | Allocate unpinned CPU memory sized to the union of `main.named_parameters()` and (if present) `drafter.model.named_parameters()`.  Speculative-decoding drafters that expose a `.model` (Eagle / Medusa / DraftModel / ArcticProposer) contribute extra entries; non-model drafters (Ngram / Suffix) are skipped, in which case the layout collapses to main params only. | Child |
-| `attach_pinned()`       | Allocate CPU memory pinned for its entire lifetime (via torch `pin_memory=True`).  Skips the per-cycle `repin()`/`unpin()` pattern at the cost of ~34 ms/GiB extra inside `cuda_checkpoint`/`cuda_restore`.  Calling `repin()`/`unpin()` on a buffer created via `attach_pinned()` raises. | Child |
-| `detach()`              | Free CPU memory buffer.                                      | Child                                      |
-| `repin()`               | `cudaHostRegister` the buffer for DMA transfers.             | Child                                      |
-| `unpin()`               | `cudaHostUnregister` the buffer (data stays, CUDA registration removed). | Child                           |
-| `stage()`               | Snapshot main and drafter params (GPU -> pinned CPU) in vLLM's internal format. | Child                          |
-| `plan_restore_weights()` | Self-compute `max_buffer_bytes = min(pinned_cpu_bytes, allotment - pinned_cpu_bytes)` from instance state and walk `index` once to build a chunk plan (each chunk packs whole params under the budget).  Cache the plan in the child for the next `restore_weights()`. | Instance + Child |
-| `restore_weights()`      | Pure execution against the cached chunk plan: per chunk, copy a slice of the pinned buffer to a single reused GPU staging buffer, then scatter into `main.named_parameters()` and (if present) `drafter.model.named_parameters()` in place using the namespaced index.  Falls back to a single chunk if no plan was cached.  Frees the staging buffer before returning. | Child |
-| `wake_up_weights()`     | Re-allocate weight tensors on GPU (main + drafter).  The arctic patch's disk reload of the main model is suppressed via `_skip_main_reload_on_wake`; both main and drafter parameters are populated by the subsequent `restore_weights()` from the pinned buffer.  Drafter `named_buffers()` are restored here from the per-sleep CPU snapshot. | Child |
+| `attach()`              | Allocate unpinned CPU memory *per worker*, sized to the union of that rank's `main.named_parameters()` and (if present) `drafter.model.named_parameters()`.  Speculative-decoding drafters that expose a `.model` (Eagle / Medusa / DraftModel / ArcticProposer) contribute extra entries; non-model drafters (Ngram / Suffix) are skipped, in which case the layout collapses to main params only.  Reports `max_pinned_bytes_per_worker`. | Worker |
+| `attach_pinned()`       | **Unsupported; raises.**  Use `attach()` -> `repin()` instead.  (It allocated a permanently-pinned buffer via torch `pin_memory=True` before staging moved onto the workers.) | Worker |
+| `detach()`              | Free the CPU buffer on every worker.                         | Worker                                     |
+| `repin()`               | `cudaHostRegister` each worker's buffer for DMA transfers.  Idempotent. | Worker                           |
+| `unpin()`               | `cudaHostUnregister` each worker's buffer (data stays, CUDA registration removed).  Idempotent. | Worker          |
+| `stage()`               | Snapshot main and drafter params (GPU -> that worker's CPU buffer) in vLLM's internal format. | Worker           |
+| `plan_restore_weights(max_buffer_bytes=None)` | Self-compute the budget from `max_pinned_bytes_per_worker` (the per-GPU shard, not the TP-aggregate) and walk each worker's `index` once to build a chunk plan (each chunk packs whole params under the budget).  Cache the plan on the worker for the next `restore_weights()`.  An explicit `max_buffer_bytes` overrides the computation. | Instance + Worker |
+| `restore_weights()`      | Pure execution against the cached chunk plan: per chunk, copy a slice of that worker's buffer to a single reused GPU staging buffer, then scatter into `main.named_parameters()` and (if present) `drafter.model.named_parameters()` in place using the namespaced index.  Falls back to a single chunk if no plan was cached.  Frees the staging buffer and calls `empty_cache()` before returning. | Worker |
+| `save_weights()` / `load_weights()` | Write / read each worker's buffer as shards plus a `weights_meta.json` manifest.  Flat `weights/` at TP=1, per-rank `weights/rank{R}/` at TP>1. | Worker |
+| `wake_up_weights()`     | Re-allocate weight tensors on GPU (main + drafter).  The arctic patch's disk reload of the main model is suppressed via `_skip_main_reload_on_wake`; both main and drafter parameters are populated by the subsequent `restore_weights()` from the worker's buffer.  Drafter `named_buffers()` are restored here from the per-sleep CPU snapshot. | Child |
 | `wake_up_kv_cache()`    | Re-allocate KV cache on GPU.                                 | Child                                      |
 | `generate(prompts, sp)` | Submit inference to the engine.  Assigns a unique `req_id`; result stored in `generate_results[req_id]` and `last_generate_result`. | Child (async engine loop) |
 | `pause()`               | Freeze the engine and snapshot in-flight requests.  Sets `_paused`, captures every active sub-request's `(prompt_token_ids, output_token_ids_so_far, sampling_params)` into a child-local list, then `engine.abort_request(eids)` so subsequent `unpin`/`sleep`/`cuda_checkpoint` are safe.  Pending `generate_done` messages are deferred until `resume`. | Child |
@@ -185,25 +190,51 @@ primitives must be:
 
 ## CPU Buffer and Pin Management
 
-`attach()` allocates a regular (unpinned) CPU buffer via
+### The buffer lives on the worker, not in the child process
+
+All of the staging state -- the buffer, the param index, and the chunk
+plan -- lives on each vLLM worker as `worker._semip_*`, and every step
+runs there through `collective_rpc` (`_semip_attach`, `_semip_stage`,
+`_semip_repin`, `_semip_unpin`, `_semip_restore_weights`,
+`_semip_detach`, and the two weight-file primitives).
+
+This is not incidental.  At TP>1 `collective_rpc` cloudpickles the
+callable into every worker subprocess, so a buffer allocated in the
+vllm_child process and captured by a closure would be copied by value
+per worker and its writes discarded -- silently, with no error.  Each
+rank also owns a *different shard* of the parameters, so one buffer in
+the child would be the wrong size regardless.  At TP=1 the single
+worker is this same process, so the identical code path just works.
+
+The child aggregates the per-worker results: `attach` and
+`plan_restore_weights` report `max_pinned_bytes_per_worker`, which is
+what `Instance.plan_restore_weights` sizes the chunk budget from (the
+TP-aggregate `pinned_cpu_bytes` would overstate the per-GPU figure).
+
+### What each step does
+
+`attach()` allocates a regular (unpinned) CPU buffer per worker via
 `torch.empty(total_size, dtype=torch.uint8)`.  The buffer is sized to
 the total bytes of `main.named_parameters()` plus, when speculative
 decoding is configured with a model-bearing drafter,
-`drafter.model.named_parameters()`.  The layout is computed once after
-init via `collective_rpc` (not `apply_model`, which would only expose
-the main model).  An `index` dict maps each *namespaced* parameter
-name -- `"main:p:<name>"` or `"drafter:p:<name>"` -- to its
-`(offset, nbytes, dtype, shape)` in the buffer.  Non-model drafters
-(Ngram / Suffix) contribute no entries; the index then collapses to
-main params only and behavior matches the pre-drafter pipeline byte
-for byte.
+`drafter.model.named_parameters()`.  An `index` dict maps each
+*namespaced* parameter name -- `"main:p:<name>"` or
+`"drafter:p:<name>"` -- to its `(offset, nbytes, dtype, shape)` in the
+buffer.  Non-model drafters (Ngram / Suffix) contribute no entries; the
+index then collapses to main params only and behavior matches the
+pre-drafter pipeline byte for byte.
 
 Pinning is a separate step: `repin()` calls `cudaHostRegister` (via
 ctypes on `libcudart.so`) to register the buffer for DMA transfers.
 `unpin()` calls `cudaHostUnregister` to remove the registration while
-keeping the memory allocated and data intact.
+keeping the memory allocated and data intact.  Both are idempotent --
+the attach buffer starts unpinned, and a double register or an
+unregister of an unregistered buffer would hard-error.
 
 `detach()` frees the CPU buffer entirely.
+
+`attach_pinned()` is **not supported** on this path and raises; use
+`attach()` followed by `repin()`.
 
 ### Why separate attach / repin / unpin
 
@@ -245,17 +276,17 @@ the first `restore_weights()`, the instance calls `plan_restore_weights()` to
 build and cache a chunk plan in the worker.  `restore_weights()` then
 executes the cached plan as pure I/O.
 
-### stage (GPU main + drafter params -> pinned CPU)
+### stage (GPU main + drafter params -> worker CPU buffer)
 
-`stage()` uses `collective_rpc` (so the callback can reach
-`worker.model_runner.drafter` -- `apply_model` only passes the main
-`nn.Module`) to build a unified
+`stage()` runs `_semip_stage` on every worker via `collective_rpc` (so
+it can reach `worker.model_runner.drafter` -- `apply_model` only passes
+the main `nn.Module`).  Each worker builds a unified
 `name -> tensor.data` source table covering
 `main.named_parameters()` keyed `"main:p:<name>"` plus, if
 `drafter.model` exists, `drafter.model.named_parameters()` keyed
-`"drafter:p:<name>"`.  It then walks `index` and copies each entry's
-`.data` (contiguous, viewed as uint8) into the pinned buffer at the
-recorded offset.  This captures weights in vLLM's post-processed
+`"drafter:p:<name>"`.  It then walks its own `index` and copies each
+entry's `.data` (contiguous, viewed as uint8) into its own buffer at
+the recorded offset.  This captures weights in vLLM's post-processed
 internal format (e.g. Marlin-packed for GPTQ, cutlass layout for FP8,
 plain tensors for BF16) for both models in a single sweep.
 
@@ -294,24 +325,26 @@ on the worker until `detach()` resets it.
 
 ### restore_weights (cached plan -> GPU staging -> model params)
 
-For each chunk in the cached plan:
+`_semip_restore_weights` runs entirely on each worker, so both the host
+buffer and the GPU staging buffer are local to the rank that owns those
+parameters.  It allocates one
+`gpu_buf = torch.empty(chunk_size, dtype=torch.uint8, device=worker.device)`
+before the loop, then for each chunk in the cached plan:
 
-1. **Pinned CPU -> GPU staging buffer.**  Allocates one
-   `buf_gpu = torch.empty(chunk_size, dtype=torch.uint8, device="cuda:0")`
-   before the loop.  Per chunk, `buf_gpu[:n].copy_(pinned_buf[lo:hi],
-   non_blocking=True)` followed by `torch.cuda.synchronize()`.
-2. **GPU staging buffer -> main + drafter params (in place).**
-   `collective_rpc` rebuilds the namespaced
-   `name -> tensor.data` target table on the worker (mirror image of
-   `stage`'s source table) and scatters this chunk's members; each src
-   view is
-   `buf_gpu[(off - lo):(off - lo) + nbytes].view(dtype).reshape(shape)`,
+1. **Worker CPU buffer -> GPU staging buffer.**
+   `gpu_buf[:n].copy_(buf[lo:hi], non_blocking=True)` followed by
+   `torch.cuda.synchronize()`.
+2. **GPU staging buffer -> main + drafter params (in place).**  The
+   worker rebuilds the namespaced `name -> tensor.data` target table
+   (mirror image of `stage`'s source table) and scatters this chunk's
+   members; each src view is
+   `gpu_buf[(off - lo):(off - lo) + nbytes].view(dtype).reshape(shape)`,
    copied into the corresponding `"main:p:<name>"` or
    `"drafter:p:<name>"` parameter via `target.copy_(src)`.  No
    `model.load_weights()` or `process_weights_after_loading()` is
    needed because the staged data is already in vLLM's internal format.
 
-After the loop, `buf_gpu` is freed via `buf_gpu.storage().resize_(0)`
+After the loop, `gpu_buf` is freed via `gpu_buf.storage().resize_(0)`
 followed by `torch.cuda.empty_cache()`.  This releases memory through
 PyTorch's normal caching allocator path, keeping allocator metadata
 consistent for CRIU checkpoint/restore (see *Known Issues* below).
@@ -334,8 +367,8 @@ on every worker via `collective_rpc`:
 
 | Flag                            | Effect                                                                                                                                  |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `_skip_main_reload_on_wake`     | `WorkerPatch.wake_up` does not call `GPUModelRunnerPatch._orig_reload_weights(self.model_runner)` -- main params come from the pinned buffer instead. |
-| `_skip_drafter_param_snapshot`  | `WorkerPatch._save_module_state(drafter.model, skip_params=True)` skips `named_parameters()` -- drafter params come from the pinned buffer instead. |
+| `_skip_main_reload_on_wake`     | `WorkerPatch.wake_up` does not call `GPUModelRunnerPatch._orig_reload_weights(self.model_runner)` -- main params come from the worker's staging buffer instead. |
+| `_skip_drafter_param_snapshot`  | `WorkerPatch._save_module_state(drafter.model, skip_params=True)` skips `named_parameters()` -- drafter params come from the worker's staging buffer instead. |
 
 Drafter `named_buffers()` are still snapshotted unconditionally and
 restored inside `WorkerPatch.wake_up`; they are sub-MB and may carry
@@ -529,7 +562,7 @@ instance_2.wait()
 
 ### Restore and generate (hot path)
 
-After cold-start, weights are already staged in pinned CPU memory
+After cold-start, weights are already staged in each worker's CPU buffer
 (unpinned from CUDA).  Restore re-pins and moves them CPU→GPU:
 
 ```python

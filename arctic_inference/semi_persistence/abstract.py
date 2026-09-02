@@ -203,17 +203,18 @@ class InstanceBase(ABC):
 
     @abstractmethod
     def attach(self) -> InstanceBase:
-        """Allocate pinned CPU memory for staging weights."""
+        """Allocate CPU memory for staging weights, on each vLLM worker.
+
+        One buffer per worker, sized to that rank's parameters; pinning is
+        the separate repin() step.
+        """
 
     @abstractmethod
     def attach_pinned(self) -> InstanceBase:
-        """Allocate pinned host memory for staging (via torch pin_memory=True).
+        """Not supported; raises RuntimeError.  Use attach() -> repin().
 
-        Like attach() but the buffer is pinned for its entire lifetime
-        (until detach()). Skips the per-cycle repin()/unpin() pattern at
-        the cost of ~34 ms/GiB extra inside cuda_checkpoint/cuda_restore.
-        Calling repin()/unpin() on a buffer created via attach_pinned()
-        raises RuntimeError.
+        It allocated a permanently-pinned buffer (torch pin_memory=True)
+        before staging moved onto the workers.
         """
 
     @abstractmethod
