@@ -23,7 +23,8 @@ slice of pinned CPU into a single reused GPU staging buffer and
 scatter into model parameters by name.  If no plan is cached,
 restore_weights falls back to a single-chunk path.
 """
-import ctypes, os, sys, time
+import ctypes, json, os, shutil, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -42,6 +43,10 @@ def _truncate_for_display(value, limit=200):
         return out if isinstance(value, list) else tuple(out)
     return value
 
+
+# Shard size / parallelism for save_weights + load_weights disk I/O.
+_WEIGHTS_SHARD_BYTES = 2 * 2**30   # 2 GiB per shard
+_WEIGHTS_IO_WORKERS = 8            # thread pool size for shard I/O
 
 _cudart = ctypes.CDLL("libcudart.so")
 _cudart.cudaHostUnregister.argtypes = [ctypes.c_void_p]
@@ -1052,6 +1057,151 @@ def vllm_child_loop(pipe_conn, instance_id, rank):
                 log = semip_logging.child(new_id, rank)
                 info["instance_id"] = new_id
                 info["path"] = _child_log_path
+
+            elif cmd == "save_weights":
+                if pinned_buf is None or index is None:
+                    raise RuntimeError(
+                        "save_weights requires attach+stage first")
+
+                weights_dir = kwargs["weights_dir"]
+                shard_bytes = int(kwargs.get("shard_bytes")
+                                  or _WEIGHTS_SHARD_BYTES)
+                workers_req = int(kwargs.get("io_workers")
+                                  or _WEIGHTS_IO_WORKERS)
+                total = pinned_buf.numel()
+                mv = memoryview(pinned_buf.numpy())
+
+                # Recreate the dir clean so stale shards from a prior
+                # (possibly larger) model can't linger.  Aborted runs may
+                # leave root-owned files -> fall back to `sudo rm -rf`
+                # (mirrors the criu_dump dir-clear in worker.py).
+                if os.path.exists(weights_dir):
+                    try:
+                        shutil.rmtree(weights_dir)
+                    except PermissionError:
+                        subprocess.run(["sudo", "rm", "-rf", weights_dir],
+                                       check=True)
+                os.makedirs(weights_dir, exist_ok=True)
+
+                ranges = []
+                _lo = 0
+                _i = 0
+                while _lo < total:
+                    _hi = min(_lo + shard_bytes, total)
+                    ranges.append((_i, _lo, _hi))
+                    _lo = _hi
+                    _i += 1
+                workers = max(1, min(workers_req, len(ranges)))
+
+                def _write_shard(i, lo, hi):
+                    fd = os.open(
+                        os.path.join(weights_dir, f"shard_{i:04d}.bin"),
+                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                    try:
+                        pos = lo
+                        while pos < hi:            # os.write may short-write
+                            pos += os.write(fd, mv[pos:hi])
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    return hi - lo
+
+                t0 = time.perf_counter()
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    for fu in [ex.submit(_write_shard, *r) for r in ranges]:
+                        fu.result()               # re-raise worker errors
+                dt = time.perf_counter() - t0
+
+                model_name = getattr(
+                    getattr(engine, "model_config", None), "model", None)
+                manifest = {
+                    "total_bytes": total,
+                    "n_params": len(index),
+                    "model": model_name,
+                    "shard_bytes": shard_bytes,
+                    "shards": [{"name": f"shard_{i:04d}.bin",
+                                "offset": lo, "nbytes": hi - lo}
+                               for (i, lo, hi) in ranges],
+                    "layout": [[name, off, nbytes, str(dtype), list(shape)]
+                               for name, (off, nbytes, dtype, shape)
+                               in index.items()],
+                }
+                with open(os.path.join(weights_dir, "weights_meta.json"),
+                          "w") as f:
+                    json.dump(manifest, f)
+
+                info["weights_dir"] = weights_dir
+                info["bytes"] = total
+                info["n_shards"] = len(ranges)
+                log.info("  saved weights: %d shard(s), %.2f GiB in %.2fs "
+                         "(%.2f GiB/s)", len(ranges), total / 2**30, dt,
+                         (total / 2**30) / dt if dt > 0 else 0.0)
+
+            elif cmd == "load_weights":
+                if pinned_buf is None or index is None:
+                    raise RuntimeError("load_weights requires attach first")
+
+                weights_dir = kwargs["weights_dir"]
+                meta_path = os.path.join(weights_dir, "weights_meta.json")
+                if not os.path.isfile(meta_path):
+                    raise RuntimeError(
+                        f"no weights manifest at {meta_path}; "
+                        f"run save_weights first")
+                with open(meta_path) as f:
+                    manifest = json.load(f)
+
+                total = pinned_buf.numel()
+                if int(manifest["total_bytes"]) != total:
+                    raise RuntimeError(
+                        f"weights size mismatch: manifest "
+                        f"{manifest['total_bytes']}B but attached buffer "
+                        f"{total}B (config/model changed?)")
+
+                # Strict layout check against the freshly-attached index:
+                # (name, offset, nbytes) must line up exactly.
+                cur_layout = [[name, off, nbytes]
+                              for name, (off, nbytes, dtype, shape)
+                              in index.items()]
+                man_layout = [[row[0], row[1], row[2]]
+                              for row in manifest.get("layout", [])]
+                if man_layout and man_layout != cur_layout:
+                    raise RuntimeError(
+                        "weights layout mismatch between manifest and "
+                        "attached model (param order/sizes differ)")
+
+                mv = memoryview(pinned_buf.numpy())
+                shards = manifest["shards"]
+                workers = max(1, min(int(kwargs.get("io_workers")
+                                         or _WEIGHTS_IO_WORKERS), len(shards)))
+
+                def _read_shard(s):
+                    lo = int(s["offset"])
+                    n = int(s["nbytes"])
+                    dst = mv[lo:lo + n]
+                    got = 0
+                    with open(os.path.join(weights_dir, s["name"]),
+                              "rb", buffering=0) as f:
+                        while got < n:             # readinto may short-read
+                            r = f.readinto(dst[got:])
+                            if r == 0:
+                                break
+                            got += r
+                    if got != n:
+                        raise RuntimeError(
+                            f"{s['name']}: read {got} != {n}")
+                    return n
+
+                t0 = time.perf_counter()
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    for fu in [ex.submit(_read_shard, s) for s in shards]:
+                        fu.result()               # re-raise worker errors
+                dt = time.perf_counter() - t0
+
+                info["bytes"] = total
+                info["n_shards"] = len(shards)
+                log.info("  loaded weights: %d shard(s), %.2f GiB in %.2fs "
+                         "(%.2f GiB/s)", len(shards), total / 2**30, dt,
+                         (total / 2**30) / dt if dt > 0 else 0.0)
 
             else:
                 error = f"unknown command: {cmd}"

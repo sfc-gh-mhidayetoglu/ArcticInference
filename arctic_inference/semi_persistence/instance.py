@@ -103,6 +103,7 @@ class Instance:
         self.pinned_cpu_bytes = 0
         self.total_gpu_bytes = 0
         self._image_dir = None
+        self._weights_dir = None
 
         self._cmd_queue = None
         self._result_queue = None
@@ -203,6 +204,22 @@ class Instance:
         if self.model_dir is not None:
             return os.path.join(self.model_dir, "image")
         return self._image_dir
+
+    def _resolve_weights_dir(self, weights_dir=None):
+        """Pick the weights directory: explicit arg, then model_dir, then
+        a ``weights`` sibling of the image directory.
+
+        The sibling fallback keeps ``save_weights`` usable for callers that
+        pass explicit image paths (the orchestrator) rather than a model_dir.
+        """
+        if weights_dir is not None:
+            return weights_dir
+        if self.model_dir is not None:
+            return os.path.join(self.model_dir, "weights")
+        if self._image_dir is not None:
+            return os.path.join(os.path.dirname(self._image_dir.rstrip("/")),
+                                "weights")
+        return None
 
     @property
     def _pending_count(self) -> int:
@@ -415,11 +432,20 @@ class Instance:
         self._log("wake_up_kv_cache")
         return self._send("wake_up_kv_cache")
 
-    def plan_restore_weights(self):
+    def plan_restore_weights(self, max_buffer_bytes=None):
         """Precompute the chunk plan that the next restore_weights() will consume.
 
-        Self-computes the staging budget from instance state populated by
-        ``init`` (cold start) or by ``load`` reading meta.json (restore):
+        If ``max_buffer_bytes`` is given, it is passed through verbatim as
+        the staging-buffer cap.  Use this to force small chunks when
+        restoring an image whose checkpointed ``restore_weights`` does not
+        release the staging buffer back to the CUDA driver before the KV
+        cache is mapped (older images lack the ``torch.cuda.empty_cache()``
+        fix): a small staging buffer stays negligible even if it lingers in
+        torch's caching allocator, leaving room for ``wake_up_kv_cache``.
+
+        Otherwise self-computes the staging budget from instance state
+        populated by ``init`` (cold start) or by ``criu_restore`` reading
+        meta.json (restore):
 
             allotment = self.total_gpu_bytes * gpu_memory_utilization
             budget    = min(self.pinned_cpu_bytes,
@@ -434,7 +460,9 @@ class Instance:
         ``max_buffer_bytes=None`` to the child, yielding the single-chunk
         fallback (today's behavior).
         """
-        if self.total_gpu_bytes <= 0 or self.pinned_cpu_bytes <= 0:
+        if max_buffer_bytes is not None:
+            mb = int(max_buffer_bytes)
+        elif self.total_gpu_bytes <= 0 or self.pinned_cpu_bytes <= 0:
             mb = None
         else:
             util = self.vllm_config["gpu_memory_utilization"]
@@ -461,6 +489,41 @@ class Instance:
         """
         self._log("restore_weights")
         return self._send("restore_weights")
+
+    def save_weights(self, shard_bytes=None, io_workers=None,
+                     weights_dir=None):
+        """Write the staged pinned buffer to <model_dir>/weights/ as shards.
+
+        Call after ``stage()`` (buffer populated) and before ``detach()``,
+        so ``criu_dump()`` runs against a detached (tiny) process image.
+        ``shard_bytes`` / ``io_workers`` override the child defaults
+        (``None`` leaves the child default in place).
+        """
+        weights_dir = self._resolve_weights_dir(weights_dir)
+        if weights_dir is None:
+            raise RuntimeError(
+                "save_weights() requires a weights_dir, a model_dir, or a "
+                "prior criu_dump()")
+        self._weights_dir = weights_dir
+        self._log(f"save_weights({weights_dir})")
+        return self._send("save_weights", weights_dir=weights_dir,
+                          shard_bytes=shard_bytes, io_workers=io_workers)
+
+    def load_weights(self, io_workers=None, weights_dir=None):
+        """Read <model_dir>/weights/ shards back into the pinned buffer.
+
+        Requires a prior ``attach()`` on the restore side (rebuilds the
+        index and allocates the buffer).  Feeds ``restore_weights()``.
+        """
+        weights_dir = self._resolve_weights_dir(weights_dir)
+        if weights_dir is None:
+            raise RuntimeError(
+                "load_weights() requires a weights_dir, a model_dir, or a "
+                "prior criu_restore()")
+        self._weights_dir = weights_dir
+        self._log(f"load_weights({weights_dir})")
+        return self._send("load_weights", weights_dir=weights_dir,
+                          io_workers=io_workers)
 
     def generate(self, prompts, sampling_params):
         self._log(f"generate({len(prompts)} prompts)")
