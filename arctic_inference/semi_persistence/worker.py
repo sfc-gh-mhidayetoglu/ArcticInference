@@ -363,7 +363,10 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, rank,
         "-t", str(child_pid),
         "-D", image_dir,
         "-o", "dump.log",
-        "--shell-job",
+        # No --shell-job: the child detaches from the controlling terminal
+        # at startup (fd 0 -> /dev/null + setsid), so no tty enters the
+        # image.  A tty would be unreattachable inside the private PID
+        # namespace the restore path uses.
         "--tcp-close",
         "--ext-unix-sk",
         "--link-remap",
@@ -429,11 +432,67 @@ def _find_pid_by_pipe(pipe_inode):
     return None
 
 
+# CRIU restores every task at its *recorded* PID (via clone3(set_tid)).
+# Two images captured on the same node with their child trees alive at
+# the same time carry adjacent/interleaved PIDs, and a destructive dump
+# leaves the killed child as a zombie under its still-live worker, which
+# keeps that PID occupied.  Either way the restore fails with
+# "Can't fork for <pid>: File exists" (EEXIST) on whatever TID is already
+# taken.
+#
+# The fix is to give each restore its own PID namespace so the recorded
+# PIDs are free.  CRIU 4.2 can't ``--join-ns pid:`` an existing PID
+# namespace ("join-ns pid namespace not supported"), so instead we run
+# criu itself *inside* a fresh PID namespace: a privileged helper does
+# ``unshare(CLONE_NEWPID)`` + ``fork()`` so its child is PID 1, that PID 1
+# unshares a mount namespace and mounts a private /proc (so criu sees the
+# namespace's PID view), forks criu ``restore -d``, records criu's exit
+# code, then reaps forever so the namespace (and the detached restored
+# tree, reparented onto it) stays alive.  Everything the rest of the
+# worker touches keys off the restored root's *host* PID (found via the
+# inherited pipe), which is unaffected by the nested namespace.  The
+# holder tuple is ``(pid1_host_pid, popen)``; SIGKILLing PID 1 destroys
+# the namespace and the whole restored tree in one shot.
+
+
+def _kill_pidns_holder(holder, log=None):
+    """Tear down a restore's PID-namespace holder ``(pid1_host_pid, popen)``.
+
+    SIGKILLing PID 1 of the namespace makes the kernel kill every task in
+    it (the restored tree), so this doubles as the restored-tree cleanup.
+    """
+    if not holder:
+        return
+    host_pid, proc = holder
+    try:
+        subprocess.run(["sudo", "kill", "-9", str(host_pid)],
+                       capture_output=True)
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    if log is not None:
+        log.info("  PID-namespace holder torn down (reaper host_pid=%s)",
+                 host_pid)
+
+
 def _worker_criu_load(image_dir, new_pipe_fd):
     """Restore a vLLM child process tree from a CRIU image on disk.
 
-    Discovers the host PID by scanning /proc for the process holding
-    the inherited pipe fd.
+    Restores into a dedicated PID namespace (criu runs *inside* a fresh
+    namespace held open by a PID 1 reaper) so the image's recorded PIDs
+    can't collide with a concurrently-restored sibling's tree or with a
+    zombie left behind by the dump.  Returns ``(host_pid, meta, holder)``
+    where ``host_pid`` is the restored root's *host-visible* PID
+    (discovered by scanning /proc for the inherited pipe -- the
+    ``--pidfile`` reports the in-namespace PID, which is meaningless on
+    the host) and ``holder`` is ``(pid1_host_pid, popen)`` to hand to
+    ``_kill_pidns_holder`` at teardown.
     """
     import fcntl
 
@@ -486,7 +545,10 @@ def _worker_criu_load(image_dir, new_pipe_fd):
         "criu", "restore",
         "-D", image_dir,
         "-o", "restore.log",
-        "--shell-job",
+        # No --shell-job: images captured by the updated dump path own
+        # their session and hold no controlling terminal, so there is no
+        # external tty to reattach -- which is what would otherwise break
+        # restore inside the private PID namespace.
         "--tcp-close",
         "--inherit-fd", f"fd[{new_pipe_fd}]:{pipe_resource}",
         "--inherit-fd", "fd[1]:stdout",
@@ -496,52 +558,172 @@ def _worker_criu_load(image_dir, new_pipe_fd):
         "-d",
         "-v4",
     ]
+
+    # Runtime side-channels (on shared storage, visible from inside the
+    # helper's private mount namespace and from the host worker alike):
+    #   reaper.pid -- PID 1's host PID, published by the host-ns parent
+    #   restore.rc -- criu's exit code, published by PID 1 once criu exits
+    reaper_pidfile = os.path.join(image_dir, "reaper.pid")
+    rc_path = os.path.join(image_dir, "restore.rc")
+    # A prior run that died abnormally (SIGKILL, crash) may have left its
+    # reaper -- and thus its namespace + restored tree -- alive.  If a
+    # stale reaper.pid points at a live process, kill it before reusing
+    # this image so we don't accumulate orphaned namespaces.
+    if os.path.exists(reaper_pidfile):
+        try:
+            _stale_reaper = int(open(reaper_pidfile).read().strip())
+            if _stale_reaper > 1 and os.path.exists(f"/proc/{_stale_reaper}"):
+                subprocess.run(["sudo", "kill", "-9", str(_stale_reaper)],
+                               capture_output=True)
+        except (OSError, ValueError):
+            pass
+    for _stale in (reaper_pidfile, rc_path):
+        if os.path.exists(_stale):
+            os.remove(_stale)
+
+    # Helper (run as root via sudo).  sudo strips fds >= 3, so it first
+    # re-receives the inherited pipe fd over the SCM_RIGHTS socket, then
+    # unshares a PID namespace and forks: the host-ns parent publishes
+    # PID 1's host PID and blocks; PID 1 unshares a mount namespace with a
+    # private /proc, forks criu ``restore -d`` into the new namespace,
+    # records criu's exit code, and reaps forever so the namespace (and
+    # the detached restored tree) survives.
     helper_script = (
-        "import os, socket, array\n"
-        f"s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "import os, socket, array, ctypes, signal, sys, time\n"
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n"
+        "CLONE_NEWPID = 0x20000000\n"
+        "CLONE_NEWNS = 0x00020000\n"
+        "MS_REC = 0x4000\n"
+        "MS_PRIVATE = 0x40000\n"
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
         f"s.connect({sock_path!r})\n"
-        f"msg, ancdata, _, _ = s.recvmsg(1, socket.CMSG_LEN(4))\n"
-        f"for cl, ct, cd in ancdata:\n"
-        f"    if cl == socket.SOL_SOCKET and ct == socket.SCM_RIGHTS:\n"
-        f"        fds = array.array('i'); fds.frombytes(cd)\n"
-        f"        received = fds[0]\n"
-        f"s.close()\n"
+        "msg, ancdata, _, _ = s.recvmsg(1, socket.CMSG_LEN(4))\n"
+        "received = None\n"
+        "for cl, ct, cd in ancdata:\n"
+        "    if cl == socket.SOL_SOCKET and ct == socket.SCM_RIGHTS:\n"
+        "        fds = array.array('i'); fds.frombytes(cd); received = fds[0]\n"
+        "s.close()\n"
         f"os.dup2(received, {new_pipe_fd})\n"
         f"if received != {new_pipe_fd}: os.close(received)\n"
-        f"os.execvp({criu_argv[0]!r}, {criu_argv!r})\n"
+        "if libc.unshare(CLONE_NEWPID) != 0:\n"
+        "    e = ctypes.get_errno()\n"
+        "    sys.stderr.write('unshare(CLONE_NEWPID): %s\\n' % os.strerror(e))\n"
+        "    os._exit(3)\n"
+        "pid1 = os.fork()\n"
+        "if pid1 > 0:\n"
+        # host-ns parent: fd belongs to the restored tree now, drop our
+        # copy so the pipe scan uniquely finds the restored root; publish
+        # PID 1's host pid; block so this process (and the sudo handle)
+        # lives as long as the namespace.
+        f"    os.close({new_pipe_fd})\n"
+        f"    open({reaper_pidfile!r}, 'w').write(str(pid1) + '\\n')\n"
+        "    try:\n"
+        "        os.waitpid(pid1, 0)\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    os._exit(0)\n"
+        "os.setsid()\n"
+        "if libc.unshare(CLONE_NEWNS) == 0:\n"
+        "    libc.mount(b'none', b'/', None, MS_REC | MS_PRIVATE, None)\n"
+        "    libc.mount(b'proc', b'/proc', b'proc', 0, None)\n"
+        "criu_pid = os.fork()\n"
+        "if criu_pid == 0:\n"
+        f"    os.execvp({criu_argv[0]!r}, {criu_argv!r})\n"
+        "    os._exit(127)\n"
+        f"os.close({new_pipe_fd})\n"
+        "_, status = os.waitpid(criu_pid, 0)\n"
+        "rc = os.waitstatus_to_exitcode(status)\n"
+        "try:\n"
+        f"    open({rc_path!r}, 'w').write(str(rc) + '\\n')\n"
+        "except OSError:\n"
+        "    pass\n"
+        "signal.signal(signal.SIGTERM, lambda *a: os._exit(0))\n"
+        "while True:\n"
+        "    try:\n"
+        "        os.waitpid(-1, 0)\n"
+        "    except ChildProcessError:\n"
+        "        time.sleep(0.2)\n"
+        "    except OSError:\n"
+        "        time.sleep(0.2)\n"
     )
     cmd = ["sudo", "python3", "-c", helper_script]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True,
-    )
-    sender.join(timeout=2)
-    try:
-        os.remove(sock_path)
-    except OSError:
-        pass
-    subprocess.run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", image_dir],
-                   capture_output=True)
-    if result.returncode != 0:
-        detail = result.stderr or result.stdout or "(no output)"
-        log_path = os.path.join(image_dir, "restore.log")
-        if os.path.exists(log_path):
-            with open(log_path) as f:
-                detail += "\n--- restore.log ---\n" + f.read()[-2000:]
-        raise RuntimeError(
-            f"criu restore failed (rc={result.returncode}): {detail}")
 
-    new_pid = None
+    holder = None
+    # From here on, any failure must tear the namespace down (which also
+    # kills anything CRIU partially restored into it) so we don't leak a
+    # namespace / orphan tree per attempt.
     try:
-        with open(pidfile) as f:
-            new_pid = int(f.read().strip())
-    except (OSError, ValueError):
+        # stdout -> /dev/null: criu logs to restore.log (via -o) and we
+        # signal completion through files, so nothing must be drained from
+        # stdout; the restored process transiently inherits fd 1 there
+        # (rebind_log repoints it right after) and an undrained pipe could
+        # otherwise fill and block it.  Keep stderr for helper diagnostics.
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True)
+
+        # Wait for PID 1's host pid and criu's exit code to appear.  criu
+        # restore of a large model tree can take a while; poll generously.
+        deadline = time.time() + 300
+        reaper_pid = None
+        rc = None
+        while time.time() < deadline:
+            if reaper_pid is None and os.path.exists(reaper_pidfile):
+                try:
+                    reaper_pid = int(open(reaper_pidfile).read().strip())
+                    holder = (reaper_pid, proc)
+                except (OSError, ValueError):
+                    reaper_pid = None
+            if os.path.exists(rc_path):
+                try:
+                    rc = int(open(rc_path).read().strip())
+                    break
+                except (OSError, ValueError):
+                    rc = None
+            if proc.poll() is not None and reaper_pid is None:
+                # Helper died before even publishing PID 1 (e.g. unshare
+                # failed); surface its stderr.
+                break
+            time.sleep(0.1)
+
+        sender.join(timeout=2)
+        try:
+            os.remove(sock_path)
+        except OSError:
+            pass
+        subprocess.run(["sudo", "chown", "-R", f"{os.getuid()}:{os.getgid()}", image_dir],
+                       capture_output=True)
+
+        if rc is None:
+            _err = ""
+            try:
+                if proc.poll() is not None:
+                    _err = (proc.stderr.read() or "")[-500:]
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"criu restore did not complete (reaper_pid={reaper_pid!r}, "
+                f"helper stderr={_err!r})")
+        if rc != 0:
+            detail = f"rc={rc}"
+            log_path = os.path.join(image_dir, "restore.log")
+            if os.path.exists(log_path):
+                with open(log_path) as f:
+                    detail += "\n--- restore.log ---\n" + f.read()[-2000:]
+            raise RuntimeError(f"criu restore failed ({detail})")
+
+        # The restored root lives in the private namespace, so the
+        # ``--pidfile`` value is its in-namespace PID -- meaningless on the
+        # host.  Find its host PID by the inherited pipe instead.
         new_pid = _find_pid_by_pipe(pipe_inode)
-    if new_pid is None or new_pid == os.getpid():
-        raise RuntimeError(
-            f"failed to discover CRIU-restored root pid "
-            f"(pidfile={pidfile!r}, scan returned {new_pid!r})")
+        if new_pid is None or new_pid == os.getpid():
+            raise RuntimeError(
+                f"failed to discover CRIU-restored root host pid "
+                f"(pipe scan returned {new_pid!r})")
+    except BaseException:
+        _kill_pidns_holder(holder)
+        raise
 
-    return new_pid, meta
+    return new_pid, meta, holder
 
 
 # ---------------------------------------------------------------------------
@@ -890,6 +1072,18 @@ def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter):
     child_proc = None
     child_queue = None
     child_thread_obj = None
+    # Set when a restore stands up a private PID namespace for the child
+    # tree; SIGKILLing its PID 1 at teardown destroys the namespace and
+    # the whole restored tree in one shot.
+    ns_holder = None
+
+    # Fallback cleanup: teardown/exit clear ns_holder after killing it, so
+    # this only fires when the worker dies abnormally (Ctrl-C, unhandled
+    # exception).  The closure reads the *current* ns_holder at exit time.
+    # SIGKILL can't run this; that case is covered by the stale-reaper
+    # sweep in _worker_criu_load on the next restore of the same image.
+    import atexit
+    atexit.register(lambda: _kill_pidns_holder(ns_holder, log))
 
     log.info("started")
 
@@ -937,7 +1131,10 @@ def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter):
                     pipe_parent, pipe_child = mp.Pipe()
                     new_pipe_fd = pipe_child.fileno()
                     try:
-                        new_pid, meta = _worker_criu_load(image_dir, new_pipe_fd)
+                        new_pid, meta, _holder = _worker_criu_load(
+                            image_dir, new_pipe_fd)
+                        _kill_pidns_holder(ns_holder, log)
+                        ns_holder = _holder
                         pipe_child.close()
                         break
                     except RuntimeError as exc:
@@ -1018,6 +1215,8 @@ def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter):
                     log.warning("child_proc still alive after join, force-killing")
                     _kill_process_tree(child_proc.pid)
                     child_proc.join(timeout=5)
+            _kill_pidns_holder(ns_holder, log)
+            ns_holder = None
             break
 
         if cmd == "exit":
@@ -1031,6 +1230,8 @@ def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter):
                     log.warning("child_proc still alive after join, force-killing")
                     _kill_process_tree(child_proc.pid)
                     child_proc.join(timeout=5)
+            _kill_pidns_holder(ns_holder, log)
+            ns_holder = None
             result_queue.put(("exit", 0.0, None, {}))
             break
 

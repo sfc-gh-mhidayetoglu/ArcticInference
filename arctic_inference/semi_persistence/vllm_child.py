@@ -101,6 +101,28 @@ def vllm_child_loop(pipe_conn, instance_id, rank):
     _child_log_path = semip_logging.redirect_stdio_to_instance_file(
         instance_id)
 
+    # Detach from the controlling terminal before anything is captured.
+    # fd 1/2 are already the per-instance log file (above); fd 0 is still
+    # the interactive shell's pts, inherited down the spawn chain.  A pts
+    # on fd 0 makes CRIU dump the process as a --shell-job tied to an
+    # external terminal/session, which cannot be reattached when the tree
+    # is restored inside a private PID namespace (criu tty.c: TIOCSPGRP
+    # fails because the namespaced pgid can't own the host terminal).
+    # Point fd 0 at /dev/null and start a fresh session so the captured
+    # tree owns its own session and holds no controlling terminal.
+    try:
+        _devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(_devnull, 0)
+        os.close(_devnull)
+    except OSError:
+        pass
+    try:
+        os.setsid()
+    except OSError:
+        # Already a session/group leader (rare for a spawned child); the
+        # fd-0 redirect above is the part that matters for CRIU.
+        pass
+
     torch.cuda.set_device(0)
 
     llm = None
