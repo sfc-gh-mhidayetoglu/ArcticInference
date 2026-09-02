@@ -15,8 +15,8 @@ def main():
 
     Instance.print_status()
 
-    instance_1.init(gpu=0).attach().sleep()
-    instance_2.init(gpu=1).attach().sleep()
+    instance_1.init(gpu=0).attach().repin().stage().unpin().sleep()
+    instance_2.init(gpu=1).attach().repin().stage().unpin().sleep()
 
     instance_1.wait()
     instance_2.wait()
@@ -32,7 +32,8 @@ def main():
 
     # -- Create instance 3 on GPU 0 after instance 1 finishes -----------------
 
-    instance_3.after(instance_1).init(gpu=0).attach().sleep()
+    instance_1.wait()
+    instance_3.init(gpu=0).attach().repin().stage().unpin().sleep()
 
     instance_3.wait()
     instance_2.wait()
@@ -52,18 +53,18 @@ def main():
     # -- Restore instance 1 and 2 ---------------------------------------------
 
     instance_1.cuda_restore(gpu=0)
-    instance_1.wake_up(["weights"])
-    instance_1.stage("/data-fast/Qwen/Qwen3-1.7B")
+    instance_1.wake_up_weights()
+    instance_1.repin()
     instance_1.restore_weights()
     instance_1.detach()
-    instance_1.wake_up(["kv_cache"])
+    instance_1.wake_up_kv_cache()
 
     instance_2.cuda_restore(gpu=1)
-    instance_2.wake_up(["weights"])
-    instance_2.stage("/data-fast/nvidia/Llama-3.1-70B-Instruct-FP8")
+    instance_2.wake_up_weights()
+    instance_2.repin()
     instance_2.restore_weights()
     instance_2.detach()
-    instance_2.wake_up(["kv_cache"])
+    instance_2.wake_up_kv_cache()
 
     instance_1.wait()
     instance_2.wait()
@@ -76,13 +77,13 @@ def main():
 
     instance_1.sleep().cuda_checkpoint()
 
-    instance_3.after(instance_1)
+    instance_1.wait()
     instance_3.cuda_restore(gpu=0)
-    instance_3.wake_up(["weights"])
-    instance_3.stage("/data-fast/Qwen/Qwen3-32B")
+    instance_3.wake_up_weights()
+    instance_3.repin()
     instance_3.restore_weights()
     instance_3.detach()
-    instance_3.wake_up(["kv_cache"])
+    instance_3.wake_up_kv_cache()
     instance_3.wait()
 
     #    GPU 0     GPU 1
@@ -99,16 +100,18 @@ def main():
 
     instance_2.sleep().detach().cuda_checkpoint()
 
-    instance_4.after(instance_2).init(gpu=1).attach()
-    instance_5.after(instance_4).init(gpu=1).attach()
+    instance_2.wait()
+    instance_4.init(gpu=1).attach().repin().stage().unpin()
+    instance_4.wait()
+    instance_5.init(gpu=1).attach().repin().stage().unpin()
     instance_4.sleep().cuda_checkpoint()
     instance_5.sleep().cuda_checkpoint()
     instance_4.wait()
     instance_5.wait()
 
     # Restore instance 4 and 5 on the same GPU
-    instance_4.cuda_restore(gpu=1).wake_up(["weights"]).stage("/data-fast/Qwen/Qwen2.5-7B").restore_weights().detach().wake_up(["kv_cache"])
-    instance_5.cuda_restore(gpu=1).wake_up(["weights"]).stage("/data-fast/Qwen/Qwen3-1.7B").restore_weights().detach().wake_up(["kv_cache"])
+    instance_4.cuda_restore(gpu=1).wake_up_weights().repin().restore_weights().detach().wake_up_kv_cache()
+    instance_5.cuda_restore(gpu=1).wake_up_weights().repin().restore_weights().detach().wake_up_kv_cache()
 
     instance_4.wait()
     instance_5.wait()

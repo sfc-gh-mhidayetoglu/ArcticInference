@@ -652,6 +652,10 @@ class Instance:
         print(f"{bar}\n", flush=True)
         return self if self is not None else cls
 
+    # Chainable alias used by the scripts; reads better mid-chain than
+    # ``status`` and works both bound and unbound, as ``status`` does.
+    print_status = status
+
     @staticmethod
     def _print_instance(inst, pid_gpu_bytes):
         model = inst.vllm_config.get("model", "?")
