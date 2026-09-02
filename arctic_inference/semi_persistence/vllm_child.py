@@ -14,14 +14,21 @@ to accept new generate requests (and other commands) while the engine
 is actively decoding, enabling concurrent request handling without
 asyncio or extra threads.
 
-Attach allocates pinned CPU memory sized to model.named_parameters().
-Stage snapshots the post-processed GPU parameters into the pinned
-buffer.  plan_restore_weights walks the param index once and caches
-a chunk plan (chunk_lo, chunk_hi, members) bounded by max_buffer_bytes.
+Attach allocates CPU memory sized to model.named_parameters().  Stage
+snapshots the post-processed GPU parameters into that buffer.
+plan_restore_weights walks the param index once and caches a chunk plan
+(chunk_lo, chunk_hi, members) bounded by max_buffer_bytes.
 restore_weights then loops over the cached plan: per chunk, copy a
-slice of pinned CPU into a single reused GPU staging buffer and
+slice of host memory into a single reused GPU staging buffer and
 scatter into model parameters by name.  If no plan is cached,
 restore_weights falls back to a single-chunk path.
+
+All of that state lives on each vLLM worker (``worker._semip_*``) and
+runs there via ``collective_rpc``, not in this process.  At TP>1 the
+callable is cloudpickled into every worker subprocess, so a buffer held
+here would be copied by value per worker and its writes discarded; each
+rank also owns a different shard of the parameters.  The same code path
+serves TP=1, where the single worker is in-process.
 """
 import ctypes, json, os, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
@@ -85,6 +92,276 @@ def _repin_buffer(buf):
     )
     if ret != 0:
         raise RuntimeError(f"cudaHostRegister failed with cudaError={ret}")
+
+
+# ---------------------------------------------------------------------------
+# Worker-local semi-persistence primitives (TP-safe).
+#
+# These run inside each vLLM worker via ``llm.collective_rpc``.  At TP>1 the
+# callable is cloudpickled and executed in every worker process, so the
+# staging buffer must live on the worker object (``worker._semip_*``), not in
+# the vllm_child process -- a captured closure over a vllm_child-local buffer
+# would be copied by value per worker and its writes discarded.  The same code
+# path works at TP=1 (a single worker, in-process).  ``worker`` is whatever
+# ``collective_rpc`` passes (the WorkerWrapperBase driver at TP=1, the real
+# Worker at TP>1); attribute reads forward to the underlying Worker either way,
+# and attribute writes persist across calls because the object is stable.
+#
+# Param names are namespaced ``main:p:`` / ``drafter:p:`` to match the layout
+# built at attach so stage/restore dispatch each entry to the right tensor.
+# ---------------------------------------------------------------------------
+def _semip_layout(worker):
+    layout = []
+    mr = worker.model_runner
+    for name, p in mr.model.named_parameters():
+        d = p.data
+        layout.append((f"main:p:{name}", d.nbytes, d.dtype, tuple(d.shape)))
+    drafter = getattr(mr, "drafter", None)
+    dm = getattr(drafter, "model", None) if drafter is not None else None
+    if dm is not None:
+        for name, p in dm.named_parameters():
+            d = p.data
+            layout.append((f"drafter:p:{name}", d.nbytes, d.dtype, tuple(d.shape)))
+    return layout
+
+
+def _semip_param_tensors(worker):
+    mr = worker.model_runner
+    t = {f"main:p:{n}": p.data for n, p in mr.model.named_parameters()}
+    drafter = getattr(mr, "drafter", None)
+    dm = getattr(drafter, "model", None) if drafter is not None else None
+    if dm is not None:
+        for n, p in dm.named_parameters():
+            t[f"drafter:p:{n}"] = p.data
+    return t
+
+
+def _semip_attach(worker):
+    layout = _semip_layout(worker)
+    total_size = sum(nb for _, nb, _, _ in layout)
+    index = {}
+    offset = 0
+    for name, nbytes, dtype, shape in layout:
+        index[name] = (offset, nbytes, dtype, shape)
+        offset += nbytes
+    worker._semip_buf = torch.empty(total_size, dtype=torch.uint8)
+    worker._semip_index = index
+    worker._semip_chunk_plan = None
+    worker._semip_chunk_size = None
+    worker._semip_pinned = False
+    return (total_size, len(layout))
+
+
+def _semip_stage(worker):
+    buf = worker._semip_buf
+    index = worker._semip_index
+    sources = _semip_param_tensors(worker)
+    for name, (offset, nbytes, dtype, shape) in index.items():
+        src = sources[name].contiguous().reshape(-1).view(torch.uint8)
+        buf[offset:offset + nbytes].copy_(src, non_blocking=True)
+    torch.cuda.synchronize()
+    return buf.numel()
+
+
+def _semip_unpin(worker):
+    # Idempotent: the attach buffer starts unpinned, so a cudaHostUnregister on
+    # an unregistered (or already-unpinned) buffer would hard-error.
+    buf = getattr(worker, "_semip_buf", None)
+    if buf is None or not getattr(worker, "_semip_pinned", False):
+        return 0
+    _unpin_buffer(buf)
+    worker._semip_pinned = False
+    return buf.numel()
+
+
+def _semip_repin(worker):
+    # Idempotent: a double cudaHostRegister would hard-error.
+    buf = getattr(worker, "_semip_buf", None)
+    if buf is None:
+        return 0
+    if getattr(worker, "_semip_pinned", False):
+        return buf.numel()
+    _repin_buffer(buf)
+    worker._semip_pinned = True
+    return buf.numel()
+
+
+def _semip_plan_load_weights(worker, max_buffer_bytes=None):
+    buf = worker._semip_buf
+    index = worker._semip_index
+    total_bytes = buf.numel()
+    cs = total_bytes if max_buffer_bytes is None else min(int(max_buffer_bytes), total_bytes)
+    plan = []
+    cur = []
+    cur_lo = 0
+    for name, (off, nbytes, dtype, shape) in index.items():
+        if nbytes > cs:
+            raise RuntimeError(f"param {name} ({nbytes}B) exceeds chunk_size ({cs}B)")
+        if cur and (off + nbytes - cur_lo) > cs:
+            cur_hi = cur[-1][1] + cur[-1][2]
+            plan.append((cur_lo, cur_hi, cur))
+            cur = []
+            cur_lo = off
+        cur.append((name, off, nbytes, dtype, shape))
+    if cur:
+        cur_hi = cur[-1][1] + cur[-1][2]
+        plan.append((cur_lo, cur_hi, cur))
+    worker._semip_chunk_plan = plan
+    worker._semip_chunk_size = cs
+    return {"bytes": total_bytes, "n_chunks": len(plan), "chunk_size": cs}
+
+
+def _semip_restore_weights(worker):
+    buf = worker._semip_buf
+    index = worker._semip_index
+    targets = _semip_param_tensors(worker)
+    total_bytes = buf.numel()
+    plan = worker._semip_chunk_plan
+    cs = worker._semip_chunk_size
+    if plan is None:
+        plan = [(0, total_bytes,
+                 [(n, o, nb, dt, sh) for n, (o, nb, dt, sh) in index.items()])]
+        cs = total_bytes
+    torch.cuda.synchronize()
+    gpu_buf = torch.empty(cs, dtype=torch.uint8, device=worker.device)
+    loaded = 0
+    for chunk_lo, chunk_hi, members in plan:
+        n = chunk_hi - chunk_lo
+        gpu_buf[:n].copy_(buf[chunk_lo:chunk_hi], non_blocking=True)
+        torch.cuda.synchronize()
+        for name, off, nbytes, dtype, shape in members:
+            start = off - chunk_lo
+            src = gpu_buf[start:start + nbytes].view(dtype).reshape(shape)
+            targets[name].copy_(src)
+            loaded += 1
+        torch.cuda.synchronize()
+    gpu_buf.storage().resize_(0)
+    del gpu_buf
+    # Return the staging buffer to the CUDA *driver*, not just to torch's
+    # caching allocator.  resize_(0)/free only hands the ~cs-byte block back
+    # to torch's pool (cudaMalloc arena); it stays reserved from the driver's
+    # point of view.  The next step, wake_up(["kv_cache"]), maps the KV cache
+    # via vLLM's cumem allocator (cuMemCreate/cuMemMap), which allocates from
+    # driver-free memory -- so a torch-cached staging block (up to the full
+    # 50+ GiB weight size at chunk_size == total) starves it and the KV map
+    # OOMs.  empty_cache() releases torch's cached blocks so cumem can map.
+    torch.cuda.empty_cache()
+    return {"bytes": total_bytes, "loaded": loaded,
+            "n_chunks": len(plan), "chunk_size": cs}
+
+
+def _semip_detach(worker):
+    buf = getattr(worker, "_semip_buf", None)
+    total = buf.numel() if buf is not None else 0
+    if buf is not None and getattr(worker, "_semip_pinned", False):
+        _unpin_buffer(buf)
+    worker._semip_buf = None
+    worker._semip_index = None
+    worker._semip_chunk_plan = None
+    worker._semip_chunk_size = None
+    worker._semip_pinned = False
+    return total
+
+
+def _semip_save_weights(worker, weights_dir, shard_bytes=None, io_workers=None):
+    buf = worker._semip_buf
+    index = worker._semip_index
+    shard_bytes = int(shard_bytes or _WEIGHTS_SHARD_BYTES)
+    workers = int(io_workers or _WEIGHTS_IO_WORKERS)
+    # TP1 keeps the flat weights/ layout; TP>1 fans out per-rank shards into
+    # weights/rank{R}/, since each rank holds a different slice of the params.
+    rank_dir = (weights_dir if _semip_tp_size(worker) <= 1
+                else os.path.join(weights_dir, f"rank{worker.rank}"))
+    if os.path.exists(rank_dir):
+        try:
+            shutil.rmtree(rank_dir)
+        except PermissionError:
+            subprocess.run(["sudo", "rm", "-rf", rank_dir], check=True)
+    os.makedirs(rank_dir, exist_ok=True)
+
+    total = buf.numel()
+    mv = memoryview(buf.numpy())
+    ranges = []
+    lo = 0
+    i = 0
+    while lo < total:
+        hi = min(lo + shard_bytes, total)
+        ranges.append((i, lo, hi))
+        lo = hi
+        i += 1
+
+    def _write_shard(i, lo, hi):
+        fd = os.open(os.path.join(rank_dir, f"shard_{i:04d}.bin"),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            pos = lo
+            while pos < hi:
+                pos += os.write(fd, mv[pos:hi])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(ranges)))) as ex:
+        for fu in [ex.submit(_write_shard, *r) for r in ranges]:
+            fu.result()
+
+    manifest = {
+        "total_bytes": total,
+        "n_params": len(index),
+        "shard_bytes": shard_bytes,
+        "shards": [{"name": f"shard_{i:04d}.bin", "offset": lo, "nbytes": hi - lo}
+                   for (i, lo, hi) in ranges],
+        "layout": [[name, off, nbytes, str(dtype), list(shape)]
+                   for name, (off, nbytes, dtype, shape) in index.items()],
+    }
+    with open(os.path.join(rank_dir, "weights_meta.json"), "w") as f:
+        json.dump(manifest, f)
+    return total
+
+
+def _semip_load_weights(worker, weights_dir, io_workers=None):
+    buf = worker._semip_buf
+    index = worker._semip_index
+    workers = int(io_workers or _WEIGHTS_IO_WORKERS)
+    rank_dir = (weights_dir if _semip_tp_size(worker) <= 1
+                else os.path.join(weights_dir, f"rank{worker.rank}"))
+    meta_path = os.path.join(rank_dir, "weights_meta.json")
+    with open(meta_path) as f:
+        manifest = json.load(f)
+
+    total = buf.numel()
+    if int(manifest["total_bytes"]) != total:
+        raise RuntimeError(
+            f"weights size mismatch: manifest {manifest['total_bytes']}B but "
+            f"attached buffer {total}B (config/model changed?)")
+    cur_layout = [[name, off, nbytes]
+                  for name, (off, nbytes, dtype, shape) in index.items()]
+    man_layout = [[row[0], row[1], row[2]] for row in manifest.get("layout", [])]
+    if man_layout and man_layout != cur_layout:
+        raise RuntimeError("weights layout mismatch between manifest and "
+                           "attached model (param order/sizes differ)")
+
+    mv = memoryview(buf.numpy())
+    shards = manifest["shards"]
+
+    def _read_shard(s):
+        lo = int(s["offset"])
+        n = int(s["nbytes"])
+        dst = mv[lo:lo + n]
+        got = 0
+        with open(os.path.join(rank_dir, s["name"]), "rb", buffering=0) as f:
+            while got < n:
+                r = f.readinto(dst[got:])
+                if r == 0:
+                    break
+                got += r
+        if got != n:
+            raise RuntimeError(f"{s['name']}: read {got} != {n}")
+
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(shards)))) as ex:
+        for fu in [ex.submit(_read_shard, s) for s in shards]:
+            fu.result()
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -845,11 +1122,10 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
 
     llm = None
     engine = None
-    pinned_buf = None
-    pinned_via_attach_pinned = False  # True iff buffer was alloc'd with pin_memory=True
-    index = None       # {name: (offset, nbytes, dtype, shape)}
-    chunk_plan = None  # list[(chunk_lo, chunk_hi, members)] from plan_restore_weights
-    chunk_size = None  # int; size of the GPU staging buffer for restore_weights
+    # The staging buffer, param index and chunk plan live on each vLLM worker
+    # (``worker._semip_*``), not here -- see the worker-local primitives above.
+    # A buffer held in this process could not be written by the workers at
+    # TP>1, where collective_rpc cloudpickles the callable into subprocesses.
 
     _active_reqs = {}     # req_id -> {"t0", "engine_ids", "finished"}
     _engine_to_req = {}   # engine_request_id -> req_id
@@ -1182,8 +1458,7 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
         return len(saved), len(all_eids)
 
     def _handle_command(cmd, kwargs):
-        nonlocal llm, engine, pinned_buf, pinned_via_attach_pinned
-        nonlocal index, chunk_plan, chunk_size
+        nonlocal llm, engine
         nonlocal _paused, _dormant
         nonlocal log, _child_log_path
 
@@ -1299,99 +1574,45 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 if _tp >= 2:
                     llm.collective_rpc(_semip_prepare_graph_reuse_snapshot)
 
-            elif cmd == "attach" or cmd == "attach_pinned":
+            elif cmd == "attach":
                 if llm is None:
-                    raise RuntimeError(f"{cmd} requires init first")
-
-                # Walk both the main model and the drafter (if it has a
-                # ``.model`` attribute -- Eagle / Medusa / DraftModel /
-                # ArcticProposer).  Non-model drafters (Ngram / Suffix)
-                # have ``drafter.model is None`` and are skipped, so the
-                # layout collapses to main params only -- no behavior
-                # change vs. ``apply_model(_compute_layout)``.
-                #
-                # Names are namespaced so ``stage`` and ``restore_weights``
-                # can dispatch each entry back to the right tensor table:
-                #   "main:p:<name>"     -> main.named_parameters()[name]
-                #   "drafter:p:<name>"  -> drafter.model.named_parameters()[name]
-                # Buffers (``named_buffers()``) are intentionally not
-                # staged -- main buffers ride stock vLLM's
-                # ``_sleep_saved_buffers`` snapshot, drafter buffers
-                # ride arctic's ``_save_module_state`` snapshot.
-                def _compute_layout_full(self):
-                    layout = []
-                    main = self.model_runner.model
-                    for name, p in main.named_parameters():
-                        d = p.data
-                        layout.append((f"main:p:{name}", d.nbytes,
-                                       d.dtype, tuple(d.shape)))
-                    drafter = getattr(self.model_runner, "drafter", None)
-                    dm = (getattr(drafter, "model", None)
-                          if drafter is not None else None)
-                    if dm is not None:
-                        for name, p in dm.named_parameters():
-                            d = p.data
-                            layout.append((f"drafter:p:{name}", d.nbytes,
-                                           d.dtype, tuple(d.shape)))
-                    return layout
-
-                layout = llm.collective_rpc(_compute_layout_full)[0]
-                total_size = sum(nbytes for _, nbytes, _, _ in layout)
-
-                # attach_pinned: pin_memory=True routes through PyTorch's
-                # CachingHostAllocator (cudaHostAlloc), so the buffer stays
-                # pinned for its entire lifetime and skips the per-cycle
-                # repin()/unpin() pattern at the cost of ~34 ms/GiB extra
-                # inside cuCheckpointProcess{Checkpoint,Restore}.
-                if cmd == "attach_pinned":
-                    pinned_buf = torch.empty(total_size, dtype=torch.uint8,
-                                             pin_memory=True)
-                    pinned_via_attach_pinned = True
-                else:
-                    pinned_buf = torch.empty(total_size, dtype=torch.uint8)
-                    pinned_via_attach_pinned = False
-
-                index = {}
-                offset = 0
-                for name, nbytes, dtype, shape in layout:
-                    index[name] = (offset, nbytes, dtype, shape)
-                    offset += nbytes
-
+                    raise RuntimeError("attach requires init first")
+                # Each worker allocates a plain (unpinned) CPU buffer sized to
+                # its own shard and records the param layout on itself; pinning
+                # is the explicit repin step.  Per-worker byte counts are
+                # reported so the instance can size the restore chunk budget by
+                # the largest worker shard (not the TP-aggregate sum).
+                results = llm.collective_rpc(_semip_attach)
+                worker_bytes = [r[0] for r in results]
+                total_size = sum(worker_bytes)
                 info["pinned_cpu_bytes"] = total_size
-                _label = ("pinned host memory (pin_memory=True)"
-                          if pinned_via_attach_pinned else "pinned memory")
-                log.info("  allocated %.2f GiB %s (%d params)",
-                         total_size / 2**30, _label, len(layout))
+                info["pinned_bytes_per_worker"] = worker_bytes
+                info["max_pinned_bytes_per_worker"] = max(worker_bytes, default=0)
+                log.info("  attached %.2f GiB across %d worker(s)",
+                         total_size / 2**30, len(results))
+
+            elif cmd == "attach_pinned":
+                raise RuntimeError(
+                    "attach_pinned is not implemented for the worker-local "
+                    "staging path; use attach -> repin instead")
 
             elif cmd == "detach":
-                if pinned_buf is not None:
-                    total = pinned_buf.numel()
-                    pinned_buf = None
-                    pinned_via_attach_pinned = False
-                    index = None
-                    chunk_plan = None
-                    chunk_size = None
+                if llm is not None:
+                    results = llm.collective_rpc(_semip_detach)
+                    total = sum(results)
                     log.info("  freed %.2f GiB pinned memory", total / 2**30)
 
             elif cmd == "unpin":
-                if pinned_buf is None:
+                if llm is None:
                     raise RuntimeError("unpin requires attach first")
-                if pinned_via_attach_pinned:
-                    raise RuntimeError(
-                        "unpin not allowed on attach_pinned() buffer; "
-                        "memory stays pinned for the buffer's lifetime")
-                _unpin_buffer(pinned_buf)
-                log.info("  unpinned %.2f GiB", pinned_buf.numel() / 2**30)
+                results = llm.collective_rpc(_semip_unpin)
+                log.info("  unpinned %.2f GiB", sum(results) / 2**30)
 
             elif cmd == "repin":
-                if pinned_buf is None:
+                if llm is None:
                     raise RuntimeError("repin requires attach first")
-                if pinned_via_attach_pinned:
-                    raise RuntimeError(
-                        "repin not allowed on attach_pinned() buffer; "
-                        "memory stays pinned for the buffer's lifetime")
-                _repin_buffer(pinned_buf)
-                log.info("  repinned %.2f GiB", pinned_buf.numel() / 2**30)
+                results = llm.collective_rpc(_semip_repin)
+                log.info("  repinned %.2f GiB", sum(results) / 2**30)
 
             elif cmd == "sleep":
                 # Invariant: while `_paused` is True, `_active_reqs`
@@ -1416,151 +1637,46 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                 _dormant = True
 
             elif cmd == "stage":
-                if pinned_buf is None:
+                if llm is None:
                     raise RuntimeError("stage requires attach first")
-                if index is None:
-                    raise RuntimeError("no index (call attach first)")
-
-                _pinned = pinned_buf
-                _index = index
-
-                # Mirror image of ``_compute_layout_full`` in attach:
-                # build a unified ``name -> tensor`` table that covers
-                # main params + drafter params (drafter only if it has
-                # a ``.model``).  Then drive copies off ``_index`` so
-                # the source set lines up exactly with what attach
-                # measured.
-                def _stage_weights(self):
-                    main = self.model_runner.model
-                    drafter = getattr(self.model_runner, "drafter", None)
-                    dm = (getattr(drafter, "model", None)
-                          if drafter is not None else None)
-                    sources = {f"main:p:{n}": p.data
-                               for n, p in main.named_parameters()}
-                    if dm is not None:
-                        for n, p in dm.named_parameters():
-                            sources[f"drafter:p:{n}"] = p.data
-                    for name, (offset, nbytes, dtype, shape) in _index.items():
-                        src = (sources[name].contiguous().reshape(-1)
-                               .view(torch.uint8))
-                        _pinned[offset:offset + nbytes].copy_(
-                            src, non_blocking=True)
-                    torch.cuda.synchronize()
-
-                llm.collective_rpc(_stage_weights)
-
-                total_bytes = pinned_buf.numel()
+                results = llm.collective_rpc(_semip_stage)
+                total_bytes = sum(results)
                 info["bytes"] = total_bytes
-                log.info("  staged %d params (%.2f GiB)",
-                         len(index), total_bytes / 2**30)
+                log.info("  staged %.2f GiB across %d worker(s)",
+                         total_bytes / 2**30, len(results))
 
             elif cmd == "wake_up_weights":
                 llm.wake_up(tags=["weights"])
 
             elif cmd == "plan_restore_weights":
-                if pinned_buf is None or index is None:
-                    raise RuntimeError(
-                        "plan_restore_weights requires attach first")
-
-                total_bytes = pinned_buf.numel()
+                if llm is None:
+                    raise RuntimeError("plan_restore_weights requires init first")
                 mb = kwargs.get("max_buffer_bytes")
-                cs = total_bytes if mb is None else min(int(mb), total_bytes)
-
-                plan = []
-                cur = []
-                cur_lo = 0
-                for name, (off, nbytes, dtype, shape) in index.items():
-                    if nbytes > cs:
-                        raise RuntimeError(
-                            f"param {name} ({nbytes}B) exceeds "
-                            f"chunk_size ({cs}B)")
-                    if cur and (off + nbytes - cur_lo) > cs:
-                        cur_hi = cur[-1][1] + cur[-1][2]
-                        plan.append((cur_lo, cur_hi, cur))
-                        cur = []
-                        cur_lo = off
-                    cur.append((name, off, nbytes, dtype, shape))
-                if cur:
-                    cur_hi = cur[-1][1] + cur[-1][2]
-                    plan.append((cur_lo, cur_hi, cur))
-
-                chunk_plan = plan
-                chunk_size = cs
-                info["n_chunks"] = len(plan)
-                info["chunk_size"] = cs
-                log.info("  planned %d chunks of <= %.2f GiB (total %.2f GiB)",
-                         len(plan), cs / 2**30, total_bytes / 2**30)
+                results = llm.collective_rpc(_semip_plan_load_weights, args=(mb,))
+                worker_bytes = [r["bytes"] for r in results]
+                chunk_bytes = [r["chunk_size"] for r in results]
+                n_chunks = [r["n_chunks"] for r in results]
+                info["bytes"] = sum(worker_bytes)
+                info["pinned_bytes_per_worker"] = worker_bytes
+                info["max_pinned_bytes_per_worker"] = max(worker_bytes, default=0)
+                info["chunk_bytes_per_worker"] = chunk_bytes
+                info["max_chunk_bytes_per_worker"] = max(chunk_bytes, default=0)
+                info["n_chunks_per_worker"] = n_chunks
+                info["n_chunks"] = max(n_chunks, default=0)
+                info["chunk_size"] = max(chunk_bytes, default=0)
+                log.info("  planned <= %d chunk(s) per worker (total %.2f GiB)",
+                         info["n_chunks"], info["bytes"] / 2**30)
 
             elif cmd == "restore_weights":
-                if pinned_buf is None or index is None:
-                    raise RuntimeError(
-                        "restore_weights requires attach+stage first")
-
-                total_bytes = pinned_buf.numel()
+                if llm is None:
+                    raise RuntimeError("restore_weights requires init first")
+                results = llm.collective_rpc(_semip_restore_weights)
+                total_bytes = sum(r["bytes"] for r in results)
+                total_loaded = sum(r["loaded"] for r in results)
                 info["bytes"] = total_bytes
-
-                # Use cached chunk plan if planned; otherwise fall back
-                # to a single-chunk plan equivalent to the prior path.
-                if chunk_plan is None:
-                    plan = [(0, total_bytes,
-                             [(n, o, nb, dt, sh)
-                              for n, (o, nb, dt, sh) in index.items()])]
-                    cs = total_bytes
-                else:
-                    plan = chunk_plan
-                    cs = chunk_size
-
-                # Drain any pending GPU work before the (potentially
-                # large) staging-buffer alloc so the cumem allocator
-                # settles on a clean contiguous block.
-                torch.cuda.synchronize(0)
-                buf_gpu = torch.empty(cs, dtype=torch.uint8,
-                                      device="cuda:0")
-                for chunk_lo, chunk_hi, members in plan:
-                    n = chunk_hi - chunk_lo
-                    buf_gpu[:n].copy_(pinned_buf[chunk_lo:chunk_hi],
-                                      non_blocking=True)
-                    torch.cuda.synchronize(0)
-
-                    _members = members
-                    _lo = chunk_lo
-                    _buf = buf_gpu
-
-                    # Mirror image of ``_compute_layout_full`` /
-                    # ``_stage_weights``: build a unified
-                    # ``name -> tensor`` table for main params + drafter
-                    # params, then dispatch each chunk member to the
-                    # right destination by namespaced name.
-                    def _scatter(self):
-                        main = self.model_runner.model
-                        drafter = getattr(self.model_runner, "drafter", None)
-                        dm = (getattr(drafter, "model", None)
-                              if drafter is not None else None)
-                        targets = {f"main:p:{n}": p.data
-                                   for n, p in main.named_parameters()}
-                        if dm is not None:
-                            for n, p in dm.named_parameters():
-                                targets[f"drafter:p:{n}"] = p.data
-                        for name, off, nbytes, dtype, shape in _members:
-                            start = off - _lo
-                            src = (_buf[start:start + nbytes]
-                                   .view(dtype).reshape(shape))
-                            targets[name].copy_(src)
-                        return len(_members)
-
-                    llm.collective_rpc(_scatter)
-                    torch.cuda.synchronize(0)
-
-                log.info("  loaded %d params in %d chunk(s) "
-                         "(chunk<= %.2f GiB, total %.2f GiB)",
-                         len(index), len(plan),
-                         cs / 2**30, total_bytes / 2**30)
-
-                # Free staging buffer through PyTorch's caching allocator
-                # so block metadata stays consistent across CRIU cycles.
-                buf_gpu.storage().resize_(0)
-                del buf_gpu
-                torch.cuda.empty_cache()
+                info["n_chunks"] = max(r["n_chunks"] for r in results)
+                log.info("  loaded %d params in <= %d chunk(s) (total %.2f GiB)",
+                         total_loaded, info["n_chunks"], total_bytes / 2**30)
 
             elif cmd == "wake_up_kv_cache":
                 llm.wake_up(tags=["kv_cache"])
@@ -1914,149 +2030,28 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
                             engine.step()
 
             elif cmd == "save_weights":
-                if pinned_buf is None or index is None:
-                    raise RuntimeError(
-                        "save_weights requires attach+stage first")
-
-                weights_dir = kwargs["weights_dir"]
-                shard_bytes = int(kwargs.get("shard_bytes")
-                                  or _WEIGHTS_SHARD_BYTES)
-                workers_req = int(kwargs.get("io_workers")
-                                  or _WEIGHTS_IO_WORKERS)
-                total = pinned_buf.numel()
-                mv = memoryview(pinned_buf.numpy())
-
-                # Recreate the dir clean so stale shards from a prior
-                # (possibly larger) model can't linger.  Aborted runs may
-                # leave root-owned files -> fall back to `sudo rm -rf`
-                # (mirrors the criu_dump dir-clear in worker.py).
-                if os.path.exists(weights_dir):
-                    try:
-                        shutil.rmtree(weights_dir)
-                    except PermissionError:
-                        subprocess.run(["sudo", "rm", "-rf", weights_dir],
-                                       check=True)
-                os.makedirs(weights_dir, exist_ok=True)
-
-                ranges = []
-                _lo = 0
-                _i = 0
-                while _lo < total:
-                    _hi = min(_lo + shard_bytes, total)
-                    ranges.append((_i, _lo, _hi))
-                    _lo = _hi
-                    _i += 1
-                workers = max(1, min(workers_req, len(ranges)))
-
-                def _write_shard(i, lo, hi):
-                    fd = os.open(
-                        os.path.join(weights_dir, f"shard_{i:04d}.bin"),
-                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-                    try:
-                        pos = lo
-                        while pos < hi:            # os.write may short-write
-                            pos += os.write(fd, mv[pos:hi])
-                        os.fsync(fd)
-                    finally:
-                        os.close(fd)
-                    return hi - lo
-
-                t0 = time.perf_counter()
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    for fu in [ex.submit(_write_shard, *r) for r in ranges]:
-                        fu.result()               # re-raise worker errors
-                dt = time.perf_counter() - t0
-
-                model_name = getattr(
-                    getattr(engine, "model_config", None), "model", None)
-                manifest = {
-                    "total_bytes": total,
-                    "n_params": len(index),
-                    "model": model_name,
-                    "shard_bytes": shard_bytes,
-                    "shards": [{"name": f"shard_{i:04d}.bin",
-                                "offset": lo, "nbytes": hi - lo}
-                               for (i, lo, hi) in ranges],
-                    "layout": [[name, off, nbytes, str(dtype), list(shape)]
-                               for name, (off, nbytes, dtype, shape)
-                               in index.items()],
-                }
-                with open(os.path.join(weights_dir, "weights_meta.json"),
-                          "w") as f:
-                    json.dump(manifest, f)
-
-                info["weights_dir"] = weights_dir
+                if llm is None:
+                    raise RuntimeError("save_weights requires attach+stage first")
+                results = llm.collective_rpc(
+                    _semip_save_weights,
+                    args=(kwargs["weights_dir"], kwargs.get("shard_bytes"),
+                          kwargs.get("io_workers")))
+                total = sum(results)
+                info["weights_dir"] = kwargs["weights_dir"]
                 info["bytes"] = total
-                info["n_shards"] = len(ranges)
-                log.info("  saved weights: %d shard(s), %.2f GiB in %.2fs "
-                         "(%.2f GiB/s)", len(ranges), total / 2**30, dt,
-                         (total / 2**30) / dt if dt > 0 else 0.0)
+                log.info("  saved weights: %.2f GiB across %d worker(s)",
+                         total / 2**30, len(results))
 
             elif cmd == "load_weights":
-                if pinned_buf is None or index is None:
+                if llm is None:
                     raise RuntimeError("load_weights requires attach first")
-
-                weights_dir = kwargs["weights_dir"]
-                meta_path = os.path.join(weights_dir, "weights_meta.json")
-                if not os.path.isfile(meta_path):
-                    raise RuntimeError(
-                        f"no weights manifest at {meta_path}; "
-                        f"run save_weights first")
-                with open(meta_path) as f:
-                    manifest = json.load(f)
-
-                total = pinned_buf.numel()
-                if int(manifest["total_bytes"]) != total:
-                    raise RuntimeError(
-                        f"weights size mismatch: manifest "
-                        f"{manifest['total_bytes']}B but attached buffer "
-                        f"{total}B (config/model changed?)")
-
-                # Strict layout check against the freshly-attached index:
-                # (name, offset, nbytes) must line up exactly.
-                cur_layout = [[name, off, nbytes]
-                              for name, (off, nbytes, dtype, shape)
-                              in index.items()]
-                man_layout = [[row[0], row[1], row[2]]
-                              for row in manifest.get("layout", [])]
-                if man_layout and man_layout != cur_layout:
-                    raise RuntimeError(
-                        "weights layout mismatch between manifest and "
-                        "attached model (param order/sizes differ)")
-
-                mv = memoryview(pinned_buf.numpy())
-                shards = manifest["shards"]
-                workers = max(1, min(int(kwargs.get("io_workers")
-                                         or _WEIGHTS_IO_WORKERS), len(shards)))
-
-                def _read_shard(s):
-                    lo = int(s["offset"])
-                    n = int(s["nbytes"])
-                    dst = mv[lo:lo + n]
-                    got = 0
-                    with open(os.path.join(weights_dir, s["name"]),
-                              "rb", buffering=0) as f:
-                        while got < n:             # readinto may short-read
-                            r = f.readinto(dst[got:])
-                            if r == 0:
-                                break
-                            got += r
-                    if got != n:
-                        raise RuntimeError(
-                            f"{s['name']}: read {got} != {n}")
-                    return n
-
-                t0 = time.perf_counter()
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    for fu in [ex.submit(_read_shard, s) for s in shards]:
-                        fu.result()               # re-raise worker errors
-                dt = time.perf_counter() - t0
-
+                results = llm.collective_rpc(
+                    _semip_load_weights,
+                    args=(kwargs["weights_dir"], kwargs.get("io_workers")))
+                total = sum(results)
                 info["bytes"] = total
-                info["n_shards"] = len(shards)
-                log.info("  loaded weights: %d shard(s), %.2f GiB in %.2fs "
-                         "(%.2f GiB/s)", len(shards), total / 2**30, dt,
-                         (total / 2**30) / dt if dt > 0 else 0.0)
+                log.info("  loaded weights: %.2f GiB across %d worker(s)",
+                         total / 2**30, len(results))
 
             else:
                 error = f"unknown command: {cmd}"
@@ -2118,7 +2113,6 @@ def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
             if cmd == "exit":
                 _drain_engine()
                 log.info("exit")
-                pinned_buf = None
                 pipe_conn.send("exit_ack")
                 break
 

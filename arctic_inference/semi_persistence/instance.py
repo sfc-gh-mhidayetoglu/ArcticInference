@@ -341,6 +341,10 @@ class Instance:
         return self._send("attach")
 
     def attach_pinned(self):
+        """Not supported on the worker-local staging path; the child raises.
+
+        Use ``attach()`` followed by ``repin()`` instead.
+        """
         self._log("attach_pinned")
         return self._send("attach_pinned")
 
