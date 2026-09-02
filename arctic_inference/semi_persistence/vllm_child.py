@@ -71,7 +71,7 @@ def _repin_buffer(buf):
         raise RuntimeError(f"cudaHostRegister failed with cudaError={ret}")
 
 
-def vllm_child_loop(pipe_conn, instance_id, rank):
+def vllm_child_loop(pipe_conn, instance_id, rank, model_dir=None):
     """Runs in a spawned child process: owns CUDA and vLLM.
 
     The main loop has two modes:
@@ -83,6 +83,37 @@ def vllm_child_loop(pipe_conn, instance_id, rank):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["USE_LIBUV"] = "0"
+
+    # JIT/compile caches (Triton, vLLM torch.compile, torch inductor,
+    # FlashInfer) all produce .so's that get dlopen()'d into the process.
+    # CRIU records those mappings by absolute path and requires the files
+    # to exist at restore; their defaults live in node-local dirs
+    # ($HOME/.triton, ~/.cache/vllm, /tmp/torchinductor_*), so on another
+    # node they are absent and restore fails with "Can't open file ...".
+    #
+    # When the Instance supplies a model_dir, the cache lives at
+    # <model_dir>/compilation -- embedded next to the CRIU image so the
+    # compile cache is isolated per model and travels with the image as one
+    # unit.  This makes restore-on-another-node require model_dir to exist
+    # at the same absolute path on that node (copy the whole model_dir over
+    # first).  Absent a model_dir, the caches keep their defaults, which is
+    # correct for same-node restore.
+    #
+    # Must be set before vLLM (and FlashInfer, whose env module resolves
+    # these at import) is imported.
+    if model_dir:
+        _compile_root = os.path.join(model_dir, "compilation")
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(_compile_root, "triton")
+        os.environ["VLLM_CACHE_ROOT"] = os.path.join(_compile_root, "vllm")
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(
+            _compile_root, "inductor")
+        os.environ["FLASHINFER_WORKSPACE_BASE"] = os.path.join(
+            _compile_root, "flashinfer")
+        for _cache_dir in (os.environ["TRITON_CACHE_DIR"],
+                           os.environ["VLLM_CACHE_ROOT"],
+                           os.environ["TORCHINDUCTOR_CACHE_DIR"],
+                           os.environ["FLASHINFER_WORKSPACE_BASE"]):
+            os.makedirs(_cache_dir, exist_ok=True)
 
     semip_logging.init_process()
     log = semip_logging.child(instance_id, rank)
@@ -487,6 +518,13 @@ def vllm_child_loop(pipe_conn, instance_id, rank):
                     "CUDA_VISIBLE_DEVICES",
                     "VLLM_ENABLE_V1_MULTIPROCESSING",
                     "USE_LIBUV",
+                    # Compile-cache roots: CRIU bakes the resulting .so
+                    # paths into the image, so a user override here would
+                    # make the image unrestorable.
+                    "TRITON_CACHE_DIR",
+                    "VLLM_CACHE_ROOT",
+                    "TORCHINDUCTOR_CACHE_DIR",
+                    "FLASHINFER_WORKSPACE_BASE",
                 }
                 for k, v in (vllm_config.pop("_env", None) or {}).items():
                     if k in _RESERVED_ENV:

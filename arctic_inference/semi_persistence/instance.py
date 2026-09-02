@@ -280,10 +280,14 @@ class Instance:
         self.total_gpu_bytes = int(pynvml.nvmlDeviceGetMemoryInfo(h).total)
         self._log("init")
         self._ensure_queues()
+        # model_dir threads through to the vLLM child so it points its
+        # compile cache at <model_dir>/compilation (embedding the JIT/compile
+        # artifacts next to the image, whose recorded mmap paths must resolve
+        # at restore).
         self._worker = _spawn_ctx.Process(
             target=worker_loop,
             args=(self.instance_id, gpu, self._cmd_queue, self._result_queue,
-                  self._completed_counter),
+                  self._completed_counter, self.model_dir),
         )
         self._worker.start()
         return self._send("init", vllm_config=self.vllm_config)
@@ -369,6 +373,7 @@ class Instance:
         return self._send(
             "criu_dump", filename=filename,
             meta_extra={"vllm_config":      self.vllm_config,
+                        "model_dir":        self.model_dir,
                         "total_gpu_bytes":  self.total_gpu_bytes,
                         "pinned_cpu_bytes": self.pinned_cpu_bytes})
 
@@ -396,6 +401,17 @@ class Instance:
                 raise RuntimeError(
                     f"vllm_config mismatch: instance has {self.vllm_config} "
                     f"but image at {filename} was saved with {saved_config}")
+            # CRIU records the compile-cache .so/cubin mmaps by absolute
+            # path, so an image is bound to the model_dir it was dumped
+            # with; restoring under a different one leaves those mappings
+            # unresolvable ("Can't open file ...").
+            saved_model_dir = meta.get("model_dir")
+            if saved_model_dir and saved_model_dir != self.model_dir:
+                raise RuntimeError(
+                    f"model_dir mismatch: instance has {self.model_dir} but "
+                    f"image at {filename} was dumped with {saved_model_dir}; "
+                    f"the image bakes absolute compile-cache paths, so it "
+                    f"must be restored under the same model_dir")
             # Hydrate budget inputs from meta.json; the child holds the
             # real pinned buffer that survived CRIU.  Old images without
             # ``total_gpu_bytes`` degrade to single-chunk behavior in
@@ -411,7 +427,7 @@ class Instance:
         self._worker = _spawn_ctx.Process(
             target=worker_loop,
             args=(self.instance_id, 0, self._cmd_queue, self._result_queue,
-                  self._completed_counter),
+                  self._completed_counter, self.model_dir),
         )
         self._worker.start()
         return self._send("criu_restore", filename=filename)

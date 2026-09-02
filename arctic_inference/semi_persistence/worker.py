@@ -1059,8 +1059,13 @@ def _child_thread(instance_id, rank, child_pid, pipe,
 # Worker main loop
 # ---------------------------------------------------------------------------
 
-def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter):
-    """Main loop for a per-Instance worker process."""
+def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter,
+                model_dir=None):
+    """Main loop for a per-Instance worker process.
+
+    ``model_dir`` is threaded to the vLLM child so it can point its
+    compile cache at ``<model_dir>/compilation``.
+    """
     semip_logging.init_process()
     log = semip_logging.worker(instance_id, rank)
     # Route everything this process emits (worker.N records, prints,
@@ -1101,7 +1106,7 @@ def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter):
             spawn_ctx = mp.get_context("spawn")
             child_proc = spawn_ctx.Process(
                 target=vllm_child_loop,
-                args=(pipe_child, instance_id, rank),
+                args=(pipe_child, instance_id, rank, model_dir),
             )
             child_proc.start()
             pipe_child.close()
