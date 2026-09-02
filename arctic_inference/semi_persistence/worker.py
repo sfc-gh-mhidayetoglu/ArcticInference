@@ -333,7 +333,7 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, rank,
     image is later restored via load().
     """
     # Clear any stale dump in the target directory so leftover files from a
-    # prior save_image() (which CRIU may not overwrite) cannot corrupt the new
+    # prior criu_dump() (which CRIU may not overwrite) cannot corrupt the new
     # image.  Files from a previously aborted dump may be root-owned, so fall
     # back to `sudo rm -rf` (sudo is already required for criu dump).
     if os.path.exists(image_dir):
@@ -571,7 +571,7 @@ def _child_thread(instance_id, rank, child_pid, pipe,
     # ack, cleared on a successful `resume` ack.  While true, the child
     # has frozen its step loop so no `generate_done` will arrive: we
     # turn `_drain_pipe_generates` into a no-op so that subsequent
-    # synchronous commands (`unpin`, `sleep`, `checkpoint_cuda`, ...)
+    # synchronous commands (`unpin`, `sleep`, `cuda_checkpoint`, ...)
     # do not deadlock waiting on completions that will not come until
     # `resume()` re-engages the engine via prefill.
     _worker_paused = False
@@ -638,12 +638,12 @@ def _child_thread(instance_id, rank, child_pid, pipe,
         _get_descendant_pids(child_pid) + [child_pid]
         if initial_state == "checkpointed" else None
     )
-    # When restore_cuda fails the child's CUDA driver state is left in
+    # When cuda_restore fails the child's CUDA driver state is left in
     # an inconsistent (locked / partially-restored) state.  Any
     # subsequent pipe-bound op (repin, generate, sleep, ...) would
     # deadlock the child in the driver.  Latch a "broken" flag so we
     # auto-fail those instead of forwarding them, until a later
-    # restore_cuda succeeds (or the worker is torn down).
+    # cuda_restore succeeds (or the worker is torn down).
     cuda_broken = False
     cuda_broken_reason = None
 
@@ -664,7 +664,7 @@ def _child_thread(instance_id, rank, child_pid, pipe,
             log.info("exited")
             break
 
-        if cmd == "checkpoint_cuda":
+        if cmd == "cuda_checkpoint":
             _drain_pipe_generates()
             t0 = time.perf_counter()
             error = None
@@ -676,12 +676,12 @@ def _child_thread(instance_id, rank, child_pid, pipe,
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
             elapsed = time.perf_counter() - t0
-            log.info("<<< checkpoint_cuda %s (%.3fs)",
+            log.info("<<< cuda_checkpoint %s (%.3fs)",
                      'OK' if error is None else 'FAILED', elapsed)
             _emit_result(cmd, elapsed, error, info)
             continue
 
-        if cmd == "restore_cuda":
+        if cmd == "cuda_restore":
             t0 = time.perf_counter()
             error = None
             target_gpu = kwargs["gpu"]
@@ -734,14 +734,14 @@ def _child_thread(instance_id, rank, child_pid, pipe,
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
                 cuda_broken = True
-                cuda_broken_reason = f"restore_cuda failed: {error}"
+                cuda_broken_reason = f"cuda_restore failed: {error}"
             elapsed = time.perf_counter() - t0
-            log.info("<<< restore_cuda %s (%.3fs)",
+            log.info("<<< cuda_restore %s (%.3fs)",
                      'OK' if error is None else 'FAILED', elapsed)
             _emit_result(cmd, elapsed, error, info)
             continue
 
-        if cmd == "save_image":
+        if cmd == "criu_dump":
             _drain_pipe_generates()
             t0 = time.perf_counter()
             error = None
@@ -780,7 +780,7 @@ def _child_thread(instance_id, rank, child_pid, pipe,
                 import traceback; traceback.print_exc()
                 error = f"{type(e).__name__}: {e}"
             elapsed = time.perf_counter() - t0
-            log.info("<<< save_image %s (%.3fs)",
+            log.info("<<< criu_dump %s (%.3fs)",
                      'OK' if error is None else 'FAILED', elapsed)
             _emit_result(cmd, elapsed, error, info)
             try:
@@ -925,7 +925,7 @@ def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter):
             child_queue.put((cmd, kwargs))
             continue
 
-        if cmd == "load_image":
+        if cmd == "criu_restore":
             t0 = time.perf_counter()
             error = None
             info = {}
@@ -1000,9 +1000,9 @@ def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter):
                 import traceback; traceback.print_exc()
                 error = f"{type(e).__name__}: {e}"
             elapsed = time.perf_counter() - t0
-            log.info("<<< load_image %s (%.3fs)",
+            log.info("<<< criu_restore %s (%.3fs)",
                      'OK' if error is None else 'FAILED', elapsed)
-            result_queue.put(("load_image", elapsed, error, info))
+            result_queue.put(("criu_restore", elapsed, error, info))
             with completed_counter.get_lock():
                 completed_counter.value += 1
             continue

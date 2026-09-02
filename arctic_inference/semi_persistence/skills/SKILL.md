@@ -143,13 +143,13 @@ real GPUs and loads real weights.
 ## Gotchas that bite
 
 - **CRIU dump is destructive.** The child is killed once the image is written,
-  so after `save_image` the model is always `saved` with no live process.
+  so after `criu_dump` the model is always `saved` with no live process.
 - **`/usr/lib/criu/empty` must exist** or dump aborts at plugin init. See
   [`INSTALL.md`](INSTALL.md).
 - **Reserved env keys** (`CUDA_VISIBLE_DEVICES`,
   `VLLM_ENABLE_V1_MULTIPROCESSING`, `USE_LIBUV`) are silently dropped from
   `vllm_config["_env"]` at apply time, but retained on disk in `meta.json`.
-- **`load_image` does not re-apply `_env`** — the child's environment is baked
+- **`criu_restore` does not re-apply `_env`** — the child's environment is baked
   into the CRIU image and restored verbatim.
 - **Staging buffers must be freed via `storage().resize_(0)`**, not
   `caching_allocator_delete`, because vLLM's cumem allocator intercepts

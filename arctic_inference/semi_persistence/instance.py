@@ -7,16 +7,23 @@ are non-blocking and return self for chaining.
 Instances can be saved to disk via CRIU after CUDA checkpoint, then
 restored (possibly on a different GPU):
 
-    inst.unpin().sleep().checkpoint_cuda().save_image(filename="/data-fast/ckpt/m").wait()
-    inst.restore_cuda(gpu=2).wake_up_weights().repin() \
+    inst.unpin().sleep().cuda_checkpoint().criu_dump(filename="/data-fast/ckpt/m").wait()
+    inst.cuda_restore(gpu=2).wake_up_weights().repin() \
         .plan_restore_weights().restore_weights().wake_up_kv_cache().wait()
 
-On a later run, load_image() restores from the on-disk image:
+On a later run, criu_restore() restores from the on-disk image:
 
     inst = Instance(vllm_config)
-    inst.load_image("/data-fast/ckpt/m").plan_restore_weights().wait()
-    inst.restore_cuda(gpu=0).wake_up_weights().repin() \
+    inst.criu_restore("/data-fast/ckpt/m").plan_restore_weights().wait()
+    inst.cuda_restore(gpu=0).wake_up_weights().repin() \
         .restore_weights().wake_up_kv_cache().wait()
+
+Passing ``model_dir`` instead lets the image path be implicit; it then
+defaults to ``<model_dir>/image`` and the filename argument can be
+omitted:
+
+    inst = Instance(vllm_config, "/data-fast/image-cache/qwen")
+    inst.unpin().sleep().cuda_checkpoint().criu_dump().wait()
 """
 from __future__ import annotations
 
@@ -64,9 +71,14 @@ class Instance:
 
     _all: weakref.WeakValueDictionary[int, "Instance"] = weakref.WeakValueDictionary()
 
-    def __init__(self, vllm_config: dict):
+    def __init__(self, vllm_config: dict, model_dir: str | None = None):
         self.gpu = None
         self.vllm_config = vllm_config
+        # Optional per-model directory.  When set, the image lives at
+        # ``<model_dir>/image`` and ``criu_dump`` / ``criu_restore`` can be
+        # called without a filename.  When unset, callers pass explicit
+        # paths (the orchestrator does).
+        self.model_dir = model_dir
         self.instance_id = _alloc_instance_id()
         Instance._all[self.instance_id] = self
         self.log = semip_logging.instance(self.instance_id, self.gpu)
@@ -184,6 +196,14 @@ class Instance:
         self._demuxer.notify_send(cmd)
         return self
 
+    def _resolve_image_dir(self, filename=None):
+        """Pick the image directory: explicit arg, then model_dir, then last used."""
+        if filename is not None:
+            return filename
+        if self.model_dir is not None:
+            return os.path.join(self.model_dir, "image")
+        return self._image_dir
+
     @property
     def _pending_count(self) -> int:
         """Number of cmds in flight; readers include the dashboard.
@@ -283,7 +303,7 @@ class Instance:
         ``(prompt_token_ids, output_token_ids_so_far,
         sampling_params, t0, first_token_ts)`` into a child-local
         list, then ``engine.abort_request(eids)`` so subsequent
-        ``unpin()`` / ``sleep()`` / ``checkpoint_cuda()`` are safe.
+        ``unpin()`` / ``sleep()`` / ``cuda_checkpoint()`` are safe.
         Pending ``generate_done`` messages are deferred until
         ``resume()`` re-adds the requests via prefill and drives them
         to completion.
@@ -310,38 +330,46 @@ class Instance:
         self._log("resume")
         return self._send("resume")
 
-    def checkpoint_cuda(self):
-        self._log("checkpoint_cuda")
-        return self._send("checkpoint_cuda")
+    def cuda_checkpoint(self):
+        self._log("cuda_checkpoint")
+        return self._send("cuda_checkpoint")
 
-    def save_image(self, filename: str):
+    def criu_dump(self, filename: str | None = None):
         """CRIU-dump the child process tree to disk (destructive).
 
-        Must be called after checkpoint_cuda() (GPU resources released).
+        Must be called after cuda_checkpoint() (GPU resources released).
         The child process is killed after a successful dump.  The
-        on-disk image is later restored via load_image().
+        on-disk image is later restored via criu_restore().
+
+        If filename is None, uses ``<model_dir>/image``.
         """
-        self._log(f"save_image({filename})")
+        filename = self._resolve_image_dir(filename)
+        if filename is None:
+            raise RuntimeError(
+                "criu_dump() requires a filename or a model_dir")
+        self._log(f"criu_dump({filename})")
         self._image_dir = filename
         return self._send(
-            "save_image", filename=filename,
+            "criu_dump", filename=filename,
             meta_extra={"vllm_config":      self.vllm_config,
                         "total_gpu_bytes":  self.total_gpu_bytes,
                         "pinned_cpu_bytes": self.pinned_cpu_bytes})
 
-    def load_image(self, filename: str | None = None):
+    def criu_restore(self, filename: str | None = None):
         """Restore a live process from a CRIU image on disk.
 
-        If filename is None, uses the image from the last save_image().
+        If filename is None, uses ``<model_dir>/image`` when a model_dir
+        was given, else the image from the last criu_dump().
         Validates that the image's vllm_config matches this instance's
         config (raises RuntimeError on mismatch).  Spawns a new worker
-        and CRIU-restores the child.  After load_image completes the
-        instance is in 'checkpointed' state, ready for restore_cuda(gpu).
+        and CRIU-restores the child.  After criu_restore completes the
+        instance is in 'checkpointed' state, ready for cuda_restore(gpu).
         """
+        filename = self._resolve_image_dir(filename)
         if filename is None:
-            filename = self._image_dir
-        if filename is None:
-            raise RuntimeError("load_image() requires a filename or prior save_image()")
+            raise RuntimeError(
+                "criu_restore() requires a filename, a model_dir, or a "
+                "prior criu_dump()")
         meta_path = os.path.join(filename, "meta.json")
         if os.path.isfile(meta_path):
             with open(meta_path) as f:
@@ -359,7 +387,7 @@ class Instance:
             self.total_gpu_bytes = int(meta.get("total_gpu_bytes", 0))
             self.pinned_cpu_bytes = int(meta.get(
                 "pinned_cpu_bytes", meta.get("pinned_bytes", 0)))
-        self._log(f"load_image({filename})")
+        self._log(f"criu_restore({filename})")
         self._image_dir = filename
         self._close_queues()
         self._ensure_queues()
@@ -369,11 +397,11 @@ class Instance:
                   self._completed_counter),
         )
         self._worker.start()
-        return self._send("load_image", filename=filename)
+        return self._send("criu_restore", filename=filename)
 
-    def restore_cuda(self, gpu: int):
-        self._log(f"restore_cuda(gpu={gpu})")
-        return self._send("restore_cuda", gpu=gpu)
+    def cuda_restore(self, gpu: int):
+        self._log(f"cuda_restore(gpu={gpu})")
+        return self._send("cuda_restore", gpu=gpu)
 
     def stage(self):
         self._log("stage")
@@ -471,19 +499,19 @@ class Instance:
                 "pinned_cpu_bytes", self.pinned_cpu_bytes)
         elif cmd == "detach":
             self.pinned_cpu_bytes = 0
-        elif cmd == "checkpoint_cuda":
+        elif cmd == "cuda_checkpoint":
             self.gpu = None
             self.log.set_gpu(None)
             self.state = "checkpointed"
-        elif cmd == "save_image":
+        elif cmd == "criu_dump":
             self._image_dir = info.get("image_dir", self._image_dir)
             self.state = "checkpointed"
-        elif cmd == "load_image":
+        elif cmd == "criu_restore":
             self.pid = info.get("pid")
             self.gpu = None
             self.log.set_gpu(None)
             self.state = "checkpointed"
-        elif cmd == "restore_cuda":
+        elif cmd == "cuda_restore":
             self.gpu = info.get("gpu", self.gpu)
             self.log.set_gpu(self.gpu)
             self.state = "alive"

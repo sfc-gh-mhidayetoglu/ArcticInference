@@ -14,8 +14,8 @@ stay optimal, and **chainable** — they all return `self`.
 
 ```python
 inst = Instance({"model": "Qwen/Qwen3-8B-FP8", "enforce_eager": True})
-inst.init(gpu=0).attach().repin().stage().unpin().sleep().checkpoint_cuda()
-inst.save_image("/data-fast/image-cache/foo").wait()
+inst.init(gpu=0).attach().repin().stage().unpin().sleep().cuda_checkpoint()
+inst.criu_dump("/data-fast/image-cache/foo").wait()
 ```
 
 ### Lifecycle
@@ -23,8 +23,8 @@ inst.save_image("/data-fast/image-cache/foo").wait()
 | Primitive | Effect | Runs in |
 |---|---|---|
 | `init(gpu)` | Cold start with real weights; spawns worker + child; applies `_env` | Worker + child |
-| `load_image(path)` | CRIU-restore from disk; validates the image's `vllm_config` matches | Worker |
-| `save_image(path)` | CRIU-dump the child tree (**destructive**); writes `meta.json` | Worker |
+| `criu_restore(path)` | CRIU-restore from disk; validates the image's `vllm_config` matches | Worker |
+| `criu_dump(path)` | CRIU-dump the child tree (**destructive**); writes `meta.json` | Worker |
 | `teardown()` | Tear down instance, worker, child; resets to created state | Worker + child |
 | `remove()` | Deregister from `Instance._all`; non-blocking, non-destructive | Main |
 | `wait()` | Block until pending commands complete | Main |
@@ -34,8 +34,8 @@ inst.save_image("/data-fast/image-cache/foo").wait()
 | Primitive | Effect |
 |---|---|
 | `sleep()` | `llm.sleep(level=2)` — frees GPU memory for main and drafter weights |
-| `checkpoint_cuda()` | Save CUDA state to CPU via `cuCheckpointProcess`; `gpu` becomes `None` |
-| `restore_cuda(gpu)` | Restore CUDA state onto a specific GPU (`gpu` is required) |
+| `cuda_checkpoint()` | Save CUDA state to CPU via `cuCheckpointProcess`; `gpu` becomes `None` |
+| `cuda_restore(gpu)` | Restore CUDA state onto a specific GPU (`gpu` is required) |
 | `wake_up_weights()` | Re-allocate weight tensors on GPU (main + drafter) |
 | `wake_up_kv_cache()` | Re-allocate the KV cache on GPU |
 
@@ -66,7 +66,7 @@ skipped, collapsing the layout to main params only.
 
 `pause` captures each active sub-request's `(prompt_token_ids,
 output_token_ids_so_far, sampling_params)` so that `unpin` / `sleep` /
-`checkpoint_cuda` are safe afterwards. `resume` replays them under a fresh
+`cuda_checkpoint` are safe afterwards. `resume` replays them under a fresh
 engine id while the caller's original `req_id` continues seamlessly; the final
 result folds pre-pause text and token counts back in.
 
@@ -226,7 +226,7 @@ for the pipe plus stdout/stderr, `--link-remap`, `--tcp-close`, and
 
 `meta.json` alongside the image holds the `vllm_config` (including `_env`) and
 the CRIU metadata, which is what lets the orchestrator rediscover saved models
-on reboot and lets `load_image` validate the image against the instance.
+on reboot and lets `criu_restore` validate the image against the instance.
 
 ---
 
@@ -291,7 +291,7 @@ source, which the security scanner flags as arbitrary code execution.
 - **`_env` reserved trio** (`CUDA_VISIBLE_DEVICES`,
   `VLLM_ENABLE_V1_MULTIPROCESSING`, `USE_LIBUV`) is hard-set at the top of the
   child loop and silently dropped from `_env`, but stays in the on-disk copy.
-- **`load_image` does not re-apply `_env`** — the environment is captured inside
+- **`criu_restore` does not re-apply `_env`** — the environment is captured inside
   the CRIU image and restored verbatim.
 - **NVML, not torch,** for GPU memory queries in the main process, to avoid
   initializing CUDA there.

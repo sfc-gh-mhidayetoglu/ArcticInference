@@ -117,10 +117,10 @@ from arctic_inference.semi_persistence import Instance
 
 inst = Instance({"model": "Qwen/Qwen3-8B-FP8", "enforce_eager": True})
 
-inst.init(gpu=0).attach().stage().sleep().checkpoint_cuda()
-inst.save_image("/data-fast/image-cache/qwen3-8b").wait()
+inst.init(gpu=0).attach().stage().sleep().cuda_checkpoint()
+inst.criu_dump("/data-fast/image-cache/qwen3-8b").wait()
 
-inst.restore_cuda(gpu=3).wake_up_weights().restore_weights().wake_up_kv_cache()
+inst.cuda_restore(gpu=3).wake_up_weights().restore_weights().wake_up_kv_cache()
 inst.generate(["Hello, world!"], {}).wait().print_status()
 ```
 
@@ -167,7 +167,7 @@ python -m pytest tests/ -q      # CPU-only, no GPU needed
   CUDA context and leaves no GPU residency behind; the on-disk form is a CRIU
   image of the entire child process tree.
 - A CRIU dump is destructive: the child is killed once the image is written, so
-  after `save_image` the model is `saved` with no live process.
+  after `criu_dump` the model is `saved` with no live process.
 - The orchestrator and its HTTP control plane are experimental research code
   with no authentication or per-user isolation. Do not expose the control port
   on an untrusted network.

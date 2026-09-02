@@ -121,9 +121,9 @@ def vllm_child_loop(pipe_conn, instance_id, rank):
     # synthesises a never-stepped record), then drained on `resume`
     # via `engine.add_request` for each entry.  All of this lives
     # in plain Python state so CRIU dumps and restores it for free
-    # across checkpoint_cuda/restore_cuda cycles, and keeping the
+    # across cuda_checkpoint/cuda_restore cycles, and keeping the
     # engine untouched while paused makes the path robust to any
-    # pipe interleaving of pause / sleep / checkpoint_cuda /
+    # pipe interleaving of pause / sleep / cuda_checkpoint /
     # generate that the orchestrator's "Walking down past `up`
     # while paused" rule permits.
     #
@@ -195,7 +195,7 @@ def vllm_child_loop(pipe_conn, instance_id, rank):
             #
             # This keeps the engine untouched for the entire dormant
             # span -- `llm.sleep` discards cumem-allocated KV blocks
-            # and `cuda-checkpoint` (during `checkpoint_cuda`)
+            # and `cuda-checkpoint` (during `cuda_checkpoint`)
             # freezes the CUDA context, so any `engine.add_request`
             # / `engine.abort_request` call inside that window would
             # either enqueue into a scheduler that can never `step`
@@ -799,7 +799,7 @@ def vllm_child_loop(pipe_conn, instance_id, rank):
 
                 # Snapshot every active sub-request and abort it in
                 # the engine so the upcoming `unpin` / `sleep` /
-                # `checkpoint_cuda` runs against an empty scheduler.
+                # `cuda_checkpoint` runs against an empty scheduler.
                 # Pending `generate_done` messages are deferred until
                 # `resume` re-adds the requests via prefill.
                 saved_count, aborted_count = _snapshot_active_into_saved()
