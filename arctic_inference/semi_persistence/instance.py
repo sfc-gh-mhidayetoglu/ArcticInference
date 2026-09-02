@@ -104,6 +104,17 @@ class Instance:
         self.total_gpu_bytes = 0
         self._image_dir = None
         self._weights_dir = None
+        # Multi-GPU (tensor-parallel) state.  TP is wired from the vLLM config
+        # (``tensor_parallel_size``, default 1) at construction, not inferred
+        # from the GPU count at ``init`` -- so ``n_gpus`` is authoritative here
+        # and ``gpus`` (the physical GPU list) is only a placement argument
+        # validated against it.  ``max_pinned_bytes_per_worker`` is the largest
+        # per-worker staging shard (used to size the restore chunk budget at
+        # TP>1, where the aggregate ``pinned_cpu_bytes`` overstates the per-GPU
+        # budget).
+        self.gpus = None
+        self.n_gpus = int(vllm_config.get("tensor_parallel_size", 1) or 1)
+        self.max_pinned_bytes_per_worker = 0
 
         self._cmd_queue = None
         self._result_queue = None
@@ -188,9 +199,11 @@ class Instance:
         self._close_queues()
         self.state = "created"
         self.gpu = None
+        self.gpus = None
         self.log.set_gpu(None)
         self.pid = None
         self.pinned_cpu_bytes = 0
+        self.max_pinned_bytes_per_worker = 0
 
     def _send(self, cmd, **kwargs):
         self._cmd_queue.put((cmd, kwargs))
@@ -268,17 +281,41 @@ class Instance:
 
     # -- Primitives (non-blocking, return self) --------------------------------
 
-    def init(self, gpu: int):
+    def init(self, gpus=None, gpu=None):
+        """Cold start the engine on the given physical GPU(s).
+
+        ``gpus`` is placement only and must have exactly
+        ``tensor_parallel_size`` entries; TP size itself comes from the vLLM
+        config.  A scalar ``gpu=`` (or positional ``init(0)``) still works
+        for TP=1.
+        """
+        if gpus is None:
+            gpus = [gpu] if gpu is not None else []
+        elif isinstance(gpus, int):
+            gpus = [gpus]
+        gpus = list(gpus)
+        if not gpus:
+            raise RuntimeError("init requires a gpu/gpus")
+        # TP is wired from the vLLM config, not inferred from the GPU count.
+        tp = self.n_gpus
+        if len(gpus) != tp:
+            raise RuntimeError(
+                f"init: {len(gpus)} gpu(s) given ({gpus}) but "
+                f"tensor_parallel_size={tp}; the gpu list must have exactly "
+                f"tensor_parallel_size entries")
+        self.gpus = gpus
+        gpu = gpus[0]
         self.gpu = gpu
         self.log.set_gpu(gpu)
         # Snapshot the GPU's physical capacity once per instance lifetime.
         # Safe under the orchestrator contract that init always takes a
         # full L1 slot (no shared tenants), so .total matches what vLLM
-        # uses internally for its gpu_memory_utilization budget.
+        # uses internally for its gpu_memory_utilization budget.  Every GPU
+        # in a TP group has the same capacity, so gpus[0] is representative.
         pynvml.nvmlInit()
         h = pynvml.nvmlDeviceGetHandleByIndex(gpu)
         self.total_gpu_bytes = int(pynvml.nvmlDeviceGetMemoryInfo(h).total)
-        self._log("init")
+        self._log(f"init(gpus={gpus})")
         self._ensure_queues()
         # model_dir threads through to the vLLM child so it points its
         # compile cache at <model_dir>/compilation (embedding the JIT/compile
@@ -286,11 +323,18 @@ class Instance:
         # at restore).
         self._worker = _spawn_ctx.Process(
             target=worker_loop,
-            args=(self.instance_id, gpu, self._cmd_queue, self._result_queue,
-                  self._completed_counter, self.model_dir),
+            args=(self.instance_id, list(gpus), self._cmd_queue,
+                  self._result_queue, self._completed_counter, self.model_dir),
         )
         self._worker.start()
-        return self._send("init", vllm_config=self.vllm_config)
+        # For TP>1: place the group on these physical GPUs via a custom worker
+        # (all GPUs visible + SEMIP_GPU_MAP).  tensor_parallel_size already
+        # comes from the user's vllm_config; we only inject the worker class.
+        # TP1 keeps the vanilla single-GPU path untouched.
+        vllm_config = dict(self.vllm_config)
+        if tp > 1:
+            vllm_config.setdefault("worker_cls", "_semip_worker.SemipGPUWorker")
+        return self._send("init", vllm_config=vllm_config)
 
     def attach(self):
         self._log("attach")
@@ -353,7 +397,42 @@ class Instance:
 
     def cuda_checkpoint(self):
         self._log("cuda_checkpoint")
+        # TP>1: drop/preserve graphs then tear down NCCL (CRIU cannot restore
+        # live communicators / CustomAllreduce IPC) before the CUDA checkpoint.
+        # graph_mode="reuse" preserves the captured graphs; destroy_nccl uses
+        # the graph-preserving unilateral-abort teardown.  Both are no-ops at
+        # TP=1, but the gate keeps the single-GPU path free of extra commands.
+        if self.n_gpus > 1:
+            self._send("cleargraph", graph_mode="reuse")
+            self._send("destroy_nccl", graph_mode="reuse")
         return self._send("cuda_checkpoint")
+
+    def reinit_nccl(self):
+        """Rebuild NCCL / the torch process group after a CRIU restore.
+
+        Must run immediately after ``cuda_restore`` and before any
+        collective (attach, weight restore, graph replay).  No-op at TP=1.
+        """
+        self._log("reinit_nccl")
+        return self._send("reinit_nccl")
+
+    def destroy_nccl(self, graph_mode="reuse"):
+        """Tear down NCCL and CustomAllreduce IPC.  No-op at TP=1."""
+        self._log(f"destroy_nccl(graph_mode={graph_mode})")
+        return self._send("destroy_nccl", graph_mode=graph_mode)
+
+    def cleargraph(self, graph_mode="reuse"):
+        """Drop CUDA-graph exec handles.  ``reuse`` preserves them."""
+        self._log(f"cleargraph(graph_mode={graph_mode})")
+        return self._send("cleargraph", graph_mode=graph_mode)
+
+    def recapture_graphs(self, graph_mode="reuse"):
+        """Rebind (``reuse``) or recapture (``full``) the decode graphs.
+
+        Run after ``wake_up_kv_cache``.  No-op at TP=1.
+        """
+        self._log(f"recapture_graphs(graph_mode={graph_mode})")
+        return self._send("recapture_graphs", graph_mode=graph_mode)
 
     def criu_dump(self, filename: str | None = None):
         """CRIU-dump the child process tree to disk (destructive).
@@ -375,7 +454,10 @@ class Instance:
             meta_extra={"vllm_config":      self.vllm_config,
                         "model_dir":        self.model_dir,
                         "total_gpu_bytes":  self.total_gpu_bytes,
-                        "pinned_cpu_bytes": self.pinned_cpu_bytes})
+                        "pinned_cpu_bytes": self.pinned_cpu_bytes,
+                        "n_gpus":           self.n_gpus,
+                        "max_pinned_bytes_per_worker":
+                            self.max_pinned_bytes_per_worker})
 
     def criu_restore(self, filename: str | None = None):
         """Restore a live process from a CRIU image on disk.
@@ -420,21 +502,57 @@ class Instance:
             self.total_gpu_bytes = int(meta.get("total_gpu_bytes", 0))
             self.pinned_cpu_bytes = int(meta.get(
                 "pinned_cpu_bytes", meta.get("pinned_bytes", 0)))
+            # TP size is authoritative from this instance's vllm_config
+            # (already equal to the image's, per the mismatch check above);
+            # meta["n_gpus"] is only a fallback for images predating
+            # config-wired TP.  Placement and the per-worker budget are
+            # hydrated from the image, with a legacy rank -> [rank] shim.
+            self.n_gpus = int(
+                self.vllm_config.get("tensor_parallel_size",
+                                     meta.get("n_gpus", 1)) or 1)
+            self.max_pinned_bytes_per_worker = int(
+                meta.get("max_pinned_bytes_per_worker", 0))
+            _meta_gpus = meta.get("gpus") or (
+                [meta["rank"]] if "rank" in meta else None)
+            if _meta_gpus:
+                self.gpus = list(_meta_gpus)
         self._log(f"criu_restore({filename})")
         self._image_dir = filename
         self._close_queues()
         self._ensure_queues()
         self._worker = _spawn_ctx.Process(
             target=worker_loop,
-            args=(self.instance_id, 0, self._cmd_queue, self._result_queue,
+            args=(self.instance_id, list(self.gpus) if self.gpus else [0],
+                  self._cmd_queue, self._result_queue,
                   self._completed_counter, self.model_dir),
         )
         self._worker.start()
         return self._send("criu_restore", filename=filename)
 
-    def cuda_restore(self, gpu: int):
-        self._log(f"cuda_restore(gpu={gpu})")
-        return self._send("cuda_restore", gpu=gpu)
+    def cuda_restore(self, gpu=None, gpus=None):
+        """Restore the checkpointed CUDA state onto the given physical GPU(s).
+
+        With neither argument, falls back to the placement hydrated from
+        ``meta.json``, so a restore can re-place the group on a different
+        physical GPU set.  The count is validated against
+        ``tensor_parallel_size``; TP size cannot change across a restore.
+        """
+        if gpus is None:
+            gpus = [gpu] if gpu is not None else list(self.gpus or [])
+        elif isinstance(gpus, int):
+            gpus = [gpus]
+        gpus = list(gpus)
+        if not gpus:
+            raise RuntimeError(
+                "cuda_restore requires a gpu/gpus (none given and no "
+                "placement recorded in the image)")
+        if len(gpus) != self.n_gpus:
+            raise RuntimeError(
+                f"cuda_restore: {len(gpus)} gpu(s) given ({gpus}) but "
+                f"tensor_parallel_size={self.n_gpus}")
+        self.gpus = gpus
+        self._log(f"cuda_restore(gpus={gpus})")
+        return self._send("cuda_restore", gpus=gpus)
 
     def stage(self):
         self._log("stage")
@@ -478,13 +596,19 @@ class Instance:
         """
         if max_buffer_bytes is not None:
             mb = int(max_buffer_bytes)
-        elif self.total_gpu_bytes <= 0 or self.pinned_cpu_bytes <= 0:
-            mb = None
         else:
-            util = self.vllm_config["gpu_memory_utilization"]
-            allotment = int(self.total_gpu_bytes * util)
-            mb = int(0.9 * min(self.pinned_cpu_bytes,
-                               allotment - self.pinned_cpu_bytes))
+            # At TP>1 the chunk budget is per-GPU, so use the largest
+            # per-worker staging shard, not the TP-aggregate
+            # ``pinned_cpu_bytes`` (which would overstate it ~N-fold and
+            # shrink chunks needlessly, or spuriously fail the
+            # "param exceeds chunk_size" check).
+            pinned = self.max_pinned_bytes_per_worker or self.pinned_cpu_bytes
+            if self.total_gpu_bytes <= 0 or pinned <= 0:
+                mb = None
+            else:
+                util = self.vllm_config["gpu_memory_utilization"]
+                allotment = int(self.total_gpu_bytes * util)
+                mb = int(0.9 * min(pinned, allotment - pinned))
         self._log(f"plan_restore_weights(max_buffer_bytes={mb})")
         return self._send("plan_restore_weights", max_buffer_bytes=mb)
 
@@ -576,8 +700,16 @@ class Instance:
         elif cmd == "attach":
             self.pinned_cpu_bytes = info.get(
                 "pinned_cpu_bytes", self.pinned_cpu_bytes)
+            self.max_pinned_bytes_per_worker = info.get(
+                "max_pinned_bytes_per_worker",
+                self.max_pinned_bytes_per_worker)
+        elif cmd == "plan_restore_weights":
+            self.max_pinned_bytes_per_worker = info.get(
+                "max_pinned_bytes_per_worker",
+                self.max_pinned_bytes_per_worker)
         elif cmd == "detach":
             self.pinned_cpu_bytes = 0
+            self.max_pinned_bytes_per_worker = 0
         elif cmd == "cuda_checkpoint":
             self.gpu = None
             self.log.set_gpu(None)
@@ -587,11 +719,20 @@ class Instance:
             self.state = "checkpointed"
         elif cmd == "criu_restore":
             self.pid = info.get("pid")
+            # Placement echo from the child; n_gpus stays config-authoritative.
+            _g = info.get("gpus")
+            if _g:
+                self.gpus = list(_g)
             self.gpu = None
             self.log.set_gpu(None)
             self.state = "checkpointed"
         elif cmd == "cuda_restore":
-            self.gpu = info.get("gpu", self.gpu)
+            gpus = info.get("gpus")
+            if gpus:
+                self.gpus = list(gpus)
+                self.gpu = gpus[0]
+            else:
+                self.gpu = info.get("gpu", self.gpu)
             self.log.set_gpu(self.gpu)
             self.state = "alive"
         elif cmd == "generate":

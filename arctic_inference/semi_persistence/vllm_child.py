@@ -30,6 +30,22 @@ import torch
 
 import semip_logging
 
+# Ensure this package dir is importable in the child + its TP worker
+# subprocesses (worker_cls="_semip_worker.SemipGPUWorker" and ca_graph_rebind
+# are resolved by bare module name).
+_semip_here = os.path.dirname(os.path.abspath(__file__))
+if _semip_here not in sys.path:
+    sys.path.insert(0, _semip_here)
+
+try:
+    import ca_graph_rebind  # dense-TP graph reuse support
+    _CA_REBIND_AVAILABLE = True
+except Exception as _ca_e:  # best-effort: reuse degrades to full recapture
+    _CA_REBIND_AVAILABLE = False
+    ca_graph_rebind = None
+    print(f"[semip-ca-rebind] unavailable: {_ca_e}", flush=True)
+
+
 def _truncate_for_display(value, limit=200):
     """Truncate strings (or strings inside a list/tuple) to ``limit`` chars,
     appending ``...(<n> chars)`` when the original exceeds ``limit``.
@@ -71,18 +87,686 @@ def _repin_buffer(buf):
         raise RuntimeError(f"cudaHostRegister failed with cudaError={ret}")
 
 
-def vllm_child_loop(pipe_conn, instance_id, rank, model_dir=None):
+# ---------------------------------------------------------------------------
+# TP>1 NCCL teardown / reinit around CRIU (worker-local, via collective_rpc).
+#
+# CRIU cannot restore live NCCL communicators or CustomAllreduce IPC handles,
+# so they are torn down before checkpoint and rebuilt after restore.  For
+# graph reuse the teardown must be graph-preserving (unilateral ncclCommAbort,
+# not the collective ncclCommDestroy that a live captured graph would deadlock);
+# for MoE/EP the abort must also be concurrent (see _nccl_abort_comms_concurrent).
+# ---------------------------------------------------------------------------
+GRAPH_MODE_REUSE = "reuse"
+GRAPH_MODE_FULL = "full"
+_MISSING = object()
+_LIBNCCL = None
+
+
+def _semip_config_value(config, key, default=None):
+    """Read ``key`` from a vllm config object or dict, falling back to its
+    nested ``parallel_config``."""
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        if key in config:
+            return config[key]
+        pc = config.get("parallel_config")
+    else:
+        if hasattr(config, key):
+            return getattr(config, key)
+        pc = getattr(config, "parallel_config", None)
+    if pc is not None:
+        if isinstance(pc, dict):
+            if key in pc:
+                return pc[key]
+        elif hasattr(pc, key):
+            return getattr(pc, key)
+    return default
+
+
+def _semip_tp_size(worker):
+    return int(_semip_config_value(
+        getattr(worker, "vllm_config", None), "tensor_parallel_size", 1) or 1)
+
+
+def _semip_ep_enabled(config):
+    return bool(_semip_config_value(config, "enable_expert_parallel", False))
+
+
+def _is_arctic_parallel_worker(worker):
+    # Ulysses / shift SP is out of scope for this port (dense TP + EP only).
+    return False
+
+
+def _clear_fd_backed_nccl_env():
+    """Drop restored NCCL/OFI env that points at process-local fds (closed
+    before CRIU save), so the next NCCL init regenerates them."""
+    native_keys = (
+        "NCCL_TOPO_FILE", "NCCL_TUNER_PLUGIN", "NCCL_NETDEVS_POLICY",
+        "NCCL_NET_FORCE_FLUSH", "NCCL_NVLS_CHUNKSIZE",
+        "NCCL_NVLSTREE_MAX_CHUNKSIZE", "NCCL_P2P_NET_CHUNKSIZE",
+        "FI_EFA_FORK_SAFE",
+    )
+    for key in native_keys:
+        os.environ.pop(key, None)
+        os.unsetenv(key)
+    for key, value in list(os.environ.items()):
+        if key == "NCCL_TOPO_FILE" or (
+                key.startswith("NCCL_") and value.startswith("/proc/self/fd/")):
+            os.environ.pop(key, None)
+            os.unsetenv(key)
+
+
+def _nccl_abort_comm(comm):
+    """ncclCommAbort(comm) via ctypes -- UNILATERAL and non-blocking, unlike the
+    collective ncclCommDestroy which deadlocks when a live captured graph or an
+    overlapping MoE/EP topology pins the comm."""
+    global _LIBNCCL
+    if _LIBNCCL is None:
+        _LIBNCCL = ctypes.CDLL("libnccl.so.2")
+        _LIBNCCL.ncclCommAbort.restype = ctypes.c_int
+        _LIBNCCL.ncclCommAbort.argtypes = [ctypes.c_void_p]
+    cp = comm if isinstance(comm, ctypes.c_void_p) else ctypes.c_void_p(int(comm))
+    return _LIBNCCL.ncclCommAbort(cp)
+
+
+def _nccl_abort_comms_concurrent(targets, timeout=60.0, after_fire=None):
+    """Abort a set of pynccl comms CONCURRENTLY (one thread each).  Sequential
+    abort deadlocks on DeepSeek-style overlapping world/tp/dp/ep comms: the
+    shared per-rank proxy only drains once every comm's abort flag is set.  The
+    ``after_fire`` hook sets the torch ProcessGroupNCCL abort flags while the
+    pynccl aborts are in flight, so all flags are set together."""
+    import threading
+    import time as _t
+    results = {}
+
+    def _worker(nm, ptr):
+        try:
+            results[nm] = ("ok", _nccl_abort_comm(ptr))
+        except BaseException as e:  # noqa: BLE001
+            results[nm] = ("err", f"{type(e).__name__}: {e}")
+
+    threads = []
+    for nm, ptr in targets:
+        th = threading.Thread(target=_worker, args=(nm, ptr), daemon=True)
+        th.start()
+        threads.append(th)
+    if after_fire is not None:
+        try:
+            after_fire()
+        except BaseException:  # noqa: BLE001
+            pass
+    deadline = _t.monotonic() + timeout
+    for th in threads:
+        th.join(max(0.0, deadline - _t.monotonic()))
+    return results
+
+
+def _abort_torch_process_groups():
+    """Abort (non-blocking) every torch NCCL process group so the subsequent
+    clean destroy does not deadlock on a comm a live graph still pins."""
+    import torch
+    from torch.distributed import distributed_c10d as c
+    try:
+        world = getattr(c, "_world", None)
+        pg_map = dict(getattr(world, "pg_map", {}) or {})
+        for pg in list(pg_map.keys()):
+            try:
+                be = pg._get_backend(torch.device("cuda"))
+            except Exception:  # noqa: BLE001
+                be = None
+            fn = getattr(be, "abort", None) or getattr(pg, "abort", None)
+            if fn is not None:
+                fn()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _semip_destroy_fi_ar_workspace():
+    """Free the FlashInfer fused allreduce+RMSNorm workspace before checkpoint
+    (full mode only).  Defensive no-op when it was never created."""
+    try:
+        from vllm.distributed.device_communicators import (
+            flashinfer_all_reduce as _fiar)
+    except Exception:
+        return
+    try:
+        _fiar.destroy_fi_ar_workspace()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _destroy_nccl(worker, graph_mode=None):
+    """Tear down NCCL process groups before checkpoint.  No-op at TP1."""
+    import torch.distributed as dist
+
+    graph_mode = graph_mode or GRAPH_MODE_REUSE
+    if _semip_tp_size(worker) <= 1:
+        return None
+
+    preserve_graph = graph_mode == GRAPH_MODE_REUSE
+    # Abort (unilateral) rather than collective-destroy when a live graph pins
+    # the comm (reuse) or the MoE/EP topology would deadlock a collective destroy.
+    abort_nccl = preserve_graph or _semip_ep_enabled(
+        getattr(worker, "vllm_config", None))
+
+    def _close_custom_allreduce_ipc_handles(ca):
+        if ca is None or getattr(ca, "disabled", True):
+            return
+        rank = ca.rank
+        for pointers in (getattr(ca, "meta_ptrs", []),
+                         getattr(ca, "buffer_ptrs", [])):
+            for i, ptr in enumerate(pointers):
+                if i == rank or not ptr:
+                    continue
+                ret = _cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr))
+                if ret != 0:
+                    raise RuntimeError(
+                        f"cudaIpcCloseMemHandle failed with cudaError={ret}")
+
+    if not dist.is_initialized():
+        return {}
+    from vllm.distributed import parallel_state as ps
+    from vllm.distributed.parallel_state import (
+        destroy_model_parallel, destroy_distributed_environment)
+
+    # Free the FlashInfer AR+RMS multicast workspace before NCCL teardown (full
+    # only; reuse preserves graphs and thus the workspace they reference).
+    if not preserve_graph:
+        _semip_destroy_fi_ar_workspace()
+
+    seen_pynccl_ids = set()
+    seen_ca_ids = set()
+    abort_targets = []
+    abort_pynccls = []
+    # Every group, not just tp/world: MoE adds ep (and may add dp/dcp/pcp/eplb);
+    # leaving any undestroyed leaks NCCL/NVLS handles across the checkpoint.
+    for name, ref in list(getattr(ps, "_groups", {}).items()):
+        group = ref() if callable(ref) else ref
+        if group is None:
+            continue
+        comm = getattr(group, "device_communicator", None)
+        if comm is None:
+            continue
+        pynccl = getattr(comm, "pynccl_comm", None)
+        if pynccl is not None and getattr(pynccl, "comm", None) is not None:
+            if id(pynccl) not in seen_pynccl_ids:
+                seen_pynccl_ids.add(id(pynccl))
+                if abort_nccl:
+                    cp = pynccl.comm
+                    cp = (int(cp.value) if isinstance(cp, ctypes.c_void_p)
+                          else int(cp))
+                    abort_targets.append((name, cp))
+                    abort_pynccls.append(pynccl)
+                else:
+                    pynccl.nccl.ncclCommDestroy(pynccl.comm)
+                    pynccl.comm = None
+        ca = getattr(comm, "ca_comm", None)
+        if ca is not None and id(ca) not in seen_ca_ids:
+            seen_ca_ids.add(id(ca))
+            _close_custom_allreduce_ipc_handles(ca)
+            ca.close()
+            comm.ca_comm = None
+
+    _torch_abort_state = {"done": False}
+
+    def _do_torch_pg_abort():
+        _abort_torch_process_groups()
+        _torch_abort_state["done"] = True
+
+    if abort_targets:
+        _nccl_abort_comms_concurrent(
+            abort_targets,
+            after_fire=(_do_torch_pg_abort if not preserve_graph else None))
+        for pynccl in abort_pynccls:
+            pynccl.comm = None
+
+    if abort_nccl and not _torch_abort_state["done"]:
+        _do_torch_pg_abort()
+
+    try:
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    except Exception:  # noqa: BLE001
+        # Aborted comms make the clean destroy raise; parallel_state is reset
+        # enough for reinit to rebuild.  Only re-raise on the clean path.
+        if not abort_nccl:
+            raise
+    _clear_fd_backed_nccl_env()
+    return {"graph_mode": graph_mode}
+
+
+def _force_dist_uninitialized_for_restore():
+    """Force torch.distributed + parallel_state to a clean uninitialized state so
+    the next init rebuilds a FRESH process group / TCP store / NCCL comms.  After
+    an abort-based teardown the CRIU image can carry is_initialized()==True with
+    dead PGs, which makes post-restore init skip init_process_group and deadlock."""
+    from vllm.distributed import parallel_state as ps
+    try:
+        import torch.distributed as dist  # noqa: F401
+        from torch.distributed import distributed_c10d as c10d
+        try:
+            c10d._update_default_pg(None)
+        except BaseException:  # noqa: BLE001
+            c10d.GroupMember.WORLD = None
+        w = getattr(c10d, "_world", None)
+        if w is not None:
+            for _attr in ("comms", "pg_map", "pg_names", "pg_group_ranks",
+                          "pg_backend_config", "pg_to_tag", "tags_to_pg",
+                          "pg_coalesce_state"):
+                try:
+                    getattr(w, _attr).clear()
+                except BaseException:  # noqa: BLE001
+                    pass
+            try:
+                w.group_count = 0
+            except BaseException:  # noqa: BLE001
+                pass
+        try:
+            c10d._unregister_all_process_groups()
+        except BaseException:  # noqa: BLE001
+            pass
+    except BaseException:  # noqa: BLE001
+        pass
+    for _g in ("_WORLD", "_INNER_DP_WORLD", "_NODE_COUNT", "_TP", "_PP", "_DP",
+               "_DCP", "_PCP", "_EP", "_EPLB", "_SP", "_SP_TP"):
+        try:
+            if hasattr(ps, _g):
+                setattr(ps, _g, None)
+        except BaseException:  # noqa: BLE001
+            pass
+
+
+def _reinit_nccl(worker, port):
+    """Re-initialize NCCL after restore on a fresh TCP port, then rebind the
+    canonical tp:0/world:0 (+ ep:0/dp:0 for MoE) group slots the captured graphs
+    look up."""
+    import traceback
+    import weakref
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed import parallel_state as ps
+    from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+    try:
+        _clear_fd_backed_nccl_env()
+        _force_dist_uninitialized_for_restore()
+        # NVLS / SymmMem exchange fds that do not survive CRIU -> keep them off.
+        os.environ["NCCL_NVLS_ENABLE"] = "0"
+        os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
+        _rd_keep = getattr(worker, "_semip_rank_data_keep", None)
+        with set_current_vllm_config(worker.vllm_config):
+            # Reuse the preserved cold-start rank_data tensor (same VA) so the
+            # kept-graph CA _dp pointers stay valid.
+            _rd_patched = bool(
+                _CA_REBIND_AVAILABLE and ca_graph_rebind is not None
+                and _rd_keep is not None
+                and ca_graph_rebind.install_rank_data_reuse_patch(_rd_keep))
+            try:
+                init_worker_distributed_environment(
+                    worker.vllm_config,
+                    worker.rank,
+                    distributed_init_method=f"tcp://127.0.0.1:{port}",
+                    local_rank=worker.local_rank,
+                    backend="nccl",
+                )
+            finally:
+                if _rd_patched:
+                    ca_graph_rebind.restore_rank_data_reuse_patch()
+        new_tp = ps.get_tp_group()
+        new_world = ps.get_world_group()
+        if hasattr(ps, "_groups"):
+            ps._groups["tp:0"] = weakref.ref(new_tp)
+            ps._groups["world:0"] = weakref.ref(new_world)
+            if _semip_ep_enabled(getattr(worker, "vllm_config", None)):
+                for _grp_name, _getter in (("ep:0", "get_ep_group"),
+                                           ("dp:0", "get_dp_group")):
+                    try:
+                        _grp = getattr(ps, _getter)()
+                    except Exception:  # noqa: BLE001
+                        _grp = None
+                    if _grp is not None:
+                        ps._groups[_grp_name] = weakref.ref(_grp)
+        return {"ok": True, "rank": getattr(worker, "rank", "?")}
+    except BaseException as e:  # noqa: BLE001
+        return {"ok": False, "rank": getattr(worker, "rank", "?"),
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc()}
+
+
+def _prepare_worker_dump(worker):
+    """Clean up per-worker FDs / io_uring / IB verbs mappings for CRIU dump.
+    Invoked from the parent's prepare_criu_dump handler via collective_rpc so
+    each TP worker subprocess sheds state CRIU cannot serialize."""
+    pid = os.getpid()
+    closed_fds = []
+    unmapped = []
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for std_fd in (1, 2):
+        os.dup2(devnull, std_fd)
+    os.close(devnull)
+    close_anon = ("infinibandevent", "io_uring")
+    close_shm = ("/dev/shm/psm_",)
+    keep_prefixes = ("/dev/nvidia", "/dev/shm", "anon_inode:", "socket:", "pipe:")
+    for fd_name in sorted(os.listdir(f"/proc/{pid}/fd"), key=int):
+        try:
+            fd_int = int(fd_name)
+            if fd_int <= 2:
+                continue
+            link = os.readlink(f"/proc/{pid}/fd/{fd_name}")
+            if link.startswith("anon_inode:"):
+                if any(bad in link for bad in close_anon):
+                    os.close(fd_int)
+                    closed_fds.append(fd_int)
+                continue
+            if any(link.startswith(p) for p in close_shm):
+                os.close(fd_int)
+                closed_fds.append(fd_int)
+                continue
+            if any(link.startswith(p) for p in keep_prefixes):
+                continue
+            os.close(fd_int)
+            closed_fds.append(fd_int)
+        except (OSError, ValueError):
+            pass
+    libc = ctypes.CDLL("libc.so.6")
+    with open(f"/proc/{pid}/maps") as f:
+        for line in f:
+            if (("io_uring" in line) or ("/dev/infiniband/" in line)
+                    or ("uverbs" in line)):
+                start_s, end_s = line.split()[0].split("-")
+                start = int(start_s, 16)
+                length = int(end_s, 16) - start
+                libc.munmap(ctypes.c_void_p(start), ctypes.c_size_t(length))
+                unmapped.append(f"0x{start:x}")
+
+    # PSM (IB/EFA) shm: do NOT munmap -- the mapping may still be referenced by
+    # a live provider thread even after NCCL teardown, so munmap SIGSEGVs the
+    # worker.  Instead unlink the /dev/shm/psm_* file while keeping the mapping;
+    # the inode stays alive so the worker is unaffected, and CRIU then captures
+    # the mapping as anonymous memory (no file to reopen on restore).
+    import glob as _glob
+    removed_psm = []
+    for _pf in _glob.glob("/dev/shm/psm_*") + _glob.glob("/dev/shm/psm2_*"):
+        try:
+            os.remove(_pf)
+            removed_psm.append(_pf)
+        except OSError:
+            pass
+    return {"closed_fds": closed_fds, "unmapped": unmapped,
+            "removed_psm": removed_psm}
+
+
+# ---------------------------------------------------------------------------
+# CUDA graph handling around CRIU (worker-local, via collective_rpc).
+#
+# Default is graph REUSE: cold-start graphs are preserved in the CRIU image and
+# their stale CustomAllreduce addresses are rewritten after reinit by
+# ca_graph_rebind (fast).  graph_mode="full" is an explicit fallback that drops
+# the graphs (cleargraph) and rebuilds them with capture_model() (slow).
+# ---------------------------------------------------------------------------
+def _semip_prepare_graph_reuse_snapshot(worker):
+    """Cold-start hook: record the CA meta/buffer/rank_data snapshot the
+    post-reinit rebind rewrites against.  No-op at TP1 or without ca_graph_rebind.
+    The cold capture was already forced onto the CA copy path + keep_graph by
+    SemipGPUWorker.compile_or_warm_up_model, so this only records state."""
+    if _semip_tp_size(worker) <= 1:
+        return {"enabled": False, "reason": "tp1"}
+    if not _CA_REBIND_AVAILABLE or ca_graph_rebind is None:
+        return {"available": False}
+    try:
+        result = ca_graph_rebind.store_snapshot(worker, None, None)
+        result["graph_mode"] = GRAPH_MODE_REUSE
+        return result
+    except Exception as e:  # noqa: BLE001
+        return {"available": True, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _semip_cleargraph(worker, graph_mode=None):
+    """Drop captured cudagraphs so the next capture_model() runs fresh.  No-op in
+    reuse mode (graphs are preserved).  In full mode: destroy exec handles, call
+    each wrapper's clear_all_graphs(), refresh the shared graph pool (else
+    recapture mints private per-size pools and OOMs), reset the MoE aux stream,
+    and reset the V2 ModelCudaGraphManager."""
+    import gc
+    from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+    from vllm.platforms import current_platform
+
+    graph_mode = graph_mode or GRAPH_MODE_REUSE
+    if graph_mode == GRAPH_MODE_REUSE:
+        return {"graph_mode": graph_mode, "skipped": "reuse_preserves_graph"}
+
+    set_cudagraph_capturing_enabled(False)
+    try:
+        mr = getattr(worker, "model_runner", None)
+        mgr = getattr(mr, "cudagraph_manager", None)
+        wrapper_classes = {}
+
+        def _consider(cls):
+            if cls is not None and hasattr(cls, "_all_instances") \
+                    and hasattr(cls, "clear_all_graphs"):
+                wrapper_classes[id(cls)] = cls
+
+        for _mod, _name in (
+                ("vllm.compilation.cuda_graph", "CUDAGraphWrapper"),
+                ("vllm.compilation.breakable_cudagraph", "BreakableCUDAGraphWrapper")):
+            try:
+                _m = __import__(_mod, fromlist=[_name])
+                _consider(getattr(_m, _name, None))
+            except Exception:  # noqa: BLE001
+                pass
+        _mdl = getattr(mr, "model", None)
+        _consider(type(_mdl) if _mdl is not None else None)
+        _inner = getattr(_mdl, "cudagraph_wrapper", None) if _mdl is not None else None
+        _consider(type(_inner) if _inner is not None else None)
+        _bcr = getattr(mgr, "breakable_cg_runner", None)
+        _consider(type(_bcr) if _bcr is not None else None)
+        if len(wrapper_classes) < 2:
+            for o in gc.get_objects():
+                t = type(o)
+                try:
+                    if hasattr(t, "_all_instances") and hasattr(t, "clear_all_graphs"):
+                        wrapper_classes[id(t)] = t
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def _entries_of(inst):
+            for attr in ("concrete_cudagraph_entries", "entries", "cudagraphs"):
+                d = getattr(inst, attr, None)
+                if isinstance(d, dict):
+                    return d
+            return {}
+
+        def _reset_graph(obj):
+            if obj is not None and hasattr(obj, "reset"):
+                try:
+                    obj.reset()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        for cls in wrapper_classes.values():
+            for i in list(getattr(cls, "_all_instances", []) or []):
+                for e in list(_entries_of(i).values()):
+                    _reset_graph(getattr(e, "cudagraph", None))
+                    cap = getattr(e, "capture", None)
+                    for seg in list(getattr(cap, "segments", []) or []):
+                        _reset_graph(getattr(seg, "__self__", None))
+
+        for cls in wrapper_classes.values():
+            try:
+                cls.clear_all_graphs()
+            except Exception:  # noqa: BLE001
+                for i in list(getattr(cls, "_all_instances", []) or []):
+                    try:
+                        i.clear_graphs()
+                    except Exception:  # noqa: BLE001
+                        try:
+                            _entries_of(i).clear()
+                        except Exception:  # noqa: BLE001
+                            pass
+
+        for cand in (_mdl, getattr(_mdl, "cudagraph_wrapper", None)
+                     if _mdl is not None else None):
+            if (cand is not None and not hasattr(type(cand), "_all_instances")
+                    and hasattr(cand, "cudagraphs") and hasattr(cand, "clear_graphs")):
+                try:
+                    cand.clear_graphs()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        fresh_pool = None
+        try:
+            type(current_platform)._global_graph_pool = None
+            fresh_pool = current_platform.get_global_graph_pool()
+        except Exception:  # noqa: BLE001
+            pass
+        if fresh_pool is not None:
+            for cls in wrapper_classes.values():
+                for i in list(getattr(cls, "_all_instances", []) or []):
+                    if hasattr(i, "graph_pool"):
+                        try:
+                            i.graph_pool = fresh_pool
+                        except Exception:  # noqa: BLE001
+                            pass
+
+        try:
+            import vllm.utils.torch_utils as _vtu
+            if getattr(_vtu, "_aux_stream", None) is not None:
+                _vtu._aux_stream = None
+        except Exception:  # noqa: BLE001
+            pass
+
+        if mgr is not None:
+            try:
+                for _g in list(getattr(mgr, "graphs", {}).values()):
+                    _reset_graph(_g)
+                if hasattr(mgr, "graphs"):
+                    mgr.graphs.clear()
+                if hasattr(mgr, "_graphs_captured"):
+                    mgr._graphs_captured = False
+                if getattr(mgr, "pool", None) is not None and fresh_pool is not None:
+                    mgr.pool = fresh_pool
+            except Exception:  # noqa: BLE001
+                pass
+
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    finally:
+        set_cudagraph_capturing_enabled(True)
+    return {"graph_mode": graph_mode}
+
+
+def _semip_reuse_graphs(worker):
+    """Repair preserved CUDA graphs against the post-restore runtime by rewriting
+    the moved CustomAllreduce addresses (ca_graph_rebind).  No capture_model()."""
+    if _semip_tp_size(worker) <= 1:
+        torch.cuda.synchronize()
+        return {"ok": True, "recaptured": False, "graph_mode": GRAPH_MODE_REUSE,
+                "skipped": "tp1_graph_reuse"}
+    if not _CA_REBIND_AVAILABLE or ca_graph_rebind is None:
+        return {"ok": False, "graph_mode": GRAPH_MODE_REUSE,
+                "error": "ca_graph_rebind unavailable"}
+    ca_rebind = ca_graph_rebind.rebind_after_reinit(worker)
+    torch.cuda.synchronize()
+    return {"ok": bool(ca_rebind.get("ok")), "recaptured": False,
+            "graph_mode": GRAPH_MODE_REUSE, "ca_rebind": ca_rebind}
+
+
+def _semip_connect_ep_channels_before_capture(worker):
+    """Connect every MoE/EP NCCL channel on the default stream before a full
+    capture_model().  Without this the ep all_gather/reduce_scatter lazily
+    connects on the graph-capture stream and recapture hangs.  EP-only."""
+    if not _semip_ep_enabled(getattr(worker, "vllm_config", None)):
+        return {"skipped": "not_ep"}
+    mr = getattr(worker, "model_runner", None)
+    dummy = getattr(mr, "_dummy_run", None)
+    if mr is None or dummy is None:
+        return {"skipped": "no_dummy_run"}
+    from vllm.config import CUDAGraphMode
+    none_mode = CUDAGraphMode.NONE
+    try:
+        cc = (getattr(mr, "compilation_config", None)
+              or getattr(getattr(worker, "vllm_config", None),
+                         "compilation_config", None))
+        sizes = getattr(cc, "cudagraph_capture_sizes", None) or [32]
+        max_sz = int(max(sizes))
+    except Exception:  # noqa: BLE001
+        max_sz = 32
+    diag = {}
+    for name, ntok, uniform in (("mixed", max_sz, False), ("decode", 1, True)):
+        try:
+            dummy(ntok, cudagraph_runtime_mode=none_mode, uniform_decode=uniform,
+                  skip_eplb=True, remove_lora=False)
+            torch.cuda.synchronize()
+            diag[name] = "ok"
+        except Exception as e:  # noqa: BLE001
+            diag[name] = f"err: {type(e).__name__}: {e}"
+    return diag
+
+
+def _semip_recapture_graphs(worker, graph_mode=None):
+    """Repair (reuse) or rebuild (full) CUDA graphs against the live post-restore
+    state."""
+    graph_mode = graph_mode or GRAPH_MODE_REUSE
+    if graph_mode == GRAPH_MODE_REUSE:
+        return _semip_reuse_graphs(worker)
+    mr = worker.model_runner
+    cleargraph = _semip_cleargraph(worker, GRAPH_MODE_FULL)
+    _semip_connect_ep_channels_before_capture(worker)
+    torch.cuda.synchronize()
+    mr.capture_model()
+    torch.cuda.synchronize()
+    return {"ok": True, "recaptured": True, "graph_mode": graph_mode,
+            "cleargraph": cleargraph, "rank": getattr(worker, "rank", "?")}
+
+
+def vllm_child_loop(pipe_conn, instance_id, gpus, model_dir=None):
     """Runs in a spawned child process: owns CUDA and vLLM.
 
-    The main loop has two modes:
+    ``gpus`` is the physical GPU list for this instance (a single-element
+    list at TP=1).  The main loop has two modes:
     - **Idle**: blocks on pipe_conn.recv() (zero CPU).
     - **Active** (engine has unfinished requests): alternates between
       engine.step() and non-blocking pipe_conn.poll() so new generate
       requests can be submitted mid-decode.
     """
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+    if isinstance(gpus, int):
+        gpus = [gpus]
+    gpus = list(gpus)
+    rank = gpus[0]
+    if len(gpus) > 1:
+        # TP>1: keep ALL GPUs visible so tensor parallelism can span the
+        # group; each vLLM worker is placed on its physical GPU by
+        # SemipGPUWorker.init_device via SEMIP_GPU_MAP.  Any inherited
+        # CUDA_VISIBLE_DEVICES mask must be cleared first, else the physical
+        # indices in SEMIP_GPU_MAP disagree with the visible-device namespace
+        # (and it would confuse the cuda-checkpoint physical-GPU addressing).
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        os.environ["SEMIP_GPU_MAP"] = ",".join(str(g) for g in gpus)
+    else:
+        # TP1: unchanged single-GPU behavior -- pin to the one GPU so it is
+        # visible as device 0.
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[0])
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     os.environ["USE_LIBUV"] = "0"
+
+    # Bind vLLM's internal rendezvous (the torch.distributed TCPStore) to
+    # loopback instead of the node's routable IP.  get_ip() otherwise picks
+    # the routable interface address, which CRIU bakes into the image as the
+    # listening socket's bound address; restoring on a different node then
+    # fails at bind() with EADDRNOTAVAIL.  127.0.0.1 exists identically on
+    # every node, so loopback makes images node-portable.
+    os.environ["VLLM_HOST_IP"] = "127.0.0.1"
+    # VLLM_HOST_IP only steers vLLM's own rendezvous.  The collective
+    # libraries pick their transport interface independently and default to
+    # the routable NIC: gloo keeps a persistent listening socket for the life
+    # of the process and NCCL opens a bootstrap listener, both of which get
+    # baked into the image bound to the capture node's IP.  Pin them to
+    # loopback so every internal socket binds to 127.0.0.1.  An instance is
+    # single-node even at TP>1 -- the TP group's ranks are local, so their
+    # NCCL bootstrap reaches across loopback fine and the data path rides
+    # NVLink/P2P rather than these sockets.
+    os.environ["NCCL_SOCKET_IFNAME"] = "lo"
+    os.environ["GLOO_SOCKET_IFNAME"] = "lo"
 
     # JIT/compile caches (Triton, vLLM torch.compile, torch inductor,
     # FlashInfer) all produce .so's that get dlopen()'d into the process.
@@ -154,7 +838,10 @@ def vllm_child_loop(pipe_conn, instance_id, rank, model_dir=None):
         # fd-0 redirect above is the part that matters for CRIU.
         pass
 
-    torch.cuda.set_device(0)
+    # TP1 pins its single GPU via CUDA_VISIBLE_DEVICES, so it is device 0
+    # here.  At TP>1 all GPUs stay visible, so address the group's first
+    # physical GPU directly.
+    torch.cuda.set_device(0 if len(gpus) == 1 else gpus[0])
 
     llm = None
     engine = None
@@ -508,6 +1195,22 @@ def vllm_child_loop(pipe_conn, instance_id, rank, model_dir=None):
                 vllm_config = dict(kwargs["vllm_config"])
                 vllm_config["enable_sleep_mode"] = True
 
+                # TP>1 only: steer the collective path onto shapes that survive
+                # a checkpoint.  Fused allreduce+RMS and NVLS/symmetric-memory
+                # allreduce keep state CRIU cannot serialize, and the MoE
+                # shared-experts side stream complicates graph capture.
+                _tp = int(vllm_config.get("tensor_parallel_size", 1) or 1)
+                if _tp >= 2:
+                    _cc = vllm_config.get("compilation_config")
+                    _cc = dict(_cc) if isinstance(_cc, dict) else {}
+                    _pc = dict(_cc.get("pass_config") or {})
+                    _pc["fuse_allreduce_rms"] = False
+                    _cc["pass_config"] = _pc
+                    vllm_config["compilation_config"] = _cc
+                    os.environ["NCCL_NVLS_ENABLE"] = "0"
+                    os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
+                    os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
+
                 # Per-model env vars: vllm_config["_env"] is a reserved
                 # mapping applied to os.environ before vLLM is imported,
                 # so flags vLLM reads at import time take effect.  The
@@ -518,6 +1221,13 @@ def vllm_child_loop(pipe_conn, instance_id, rank, model_dir=None):
                     "CUDA_VISIBLE_DEVICES",
                     "VLLM_ENABLE_V1_MULTIPROCESSING",
                     "USE_LIBUV",
+                    # Loopback pinning: repointing these at a routable NIC
+                    # bakes the capture node's IP into the image and breaks
+                    # restore elsewhere with EADDRNOTAVAIL.
+                    "VLLM_HOST_IP",
+                    "NCCL_SOCKET_IFNAME",
+                    "GLOO_SOCKET_IFNAME",
+                    "SEMIP_GPU_MAP",
                     # Compile-cache roots: CRIU bakes the resulting .so
                     # paths into the image, so a user override here would
                     # make the image unrestorable.
@@ -583,6 +1293,11 @@ def vllm_child_loop(pipe_conn, instance_id, rank, model_dir=None):
                     self.worker._skip_drafter_param_snapshot = True
 
                 llm.collective_rpc(_enable_semi_persistence_flags)
+
+                # Record the cold-start CustomAllreduce snapshot that the
+                # post-reinit graph rebind rewrites against (TP>=2, reuse).
+                if _tp >= 2:
+                    llm.collective_rpc(_semip_prepare_graph_reuse_snapshot)
 
             elif cmd == "attach" or cmd == "attach_pinned":
                 if llm is None:
@@ -1007,6 +1722,20 @@ def vllm_child_loop(pipe_conn, instance_id, rank, model_dir=None):
             elif cmd == "prepare_criu_dump":
                 _drain_engine()
 
+                # TP>1: each worker is a separate subprocess with its own FDs /
+                # io_uring rings / IB verbs mappings that CRIU cannot serialize.
+                # Clean them up before the tree is dumped.  Skipped at TP1, where
+                # the "worker" is this same (driver) process -- running it here
+                # would close this process's own FDs (incl. the worker pipe).
+                if llm is not None and len(gpus) > 1:
+                    try:
+                        wr = llm.collective_rpc(_prepare_worker_dump)
+                        info["worker_closed_fds"] = [r["closed_fds"] for r in wr]
+                        info["worker_unmapped"] = [r["unmapped"] for r in wr]
+                    except Exception as _e:
+                        log.warning(
+                            "  prepare_criu_dump: worker dump prep error: %s", _e)
+
                 closed_fds = []
                 unmapped = []
                 destroyed_pg = False
@@ -1117,6 +1846,72 @@ def vllm_child_loop(pipe_conn, instance_id, rank, model_dir=None):
                 log = semip_logging.child(new_id, rank)
                 info["instance_id"] = new_id
                 info["path"] = _child_log_path
+
+            elif cmd == "destroy_nccl":
+                if llm is None:
+                    raise RuntimeError("destroy_nccl requires init first")
+                graph_mode = kwargs.get("graph_mode")
+                results = llm.collective_rpc(_destroy_nccl, args=(graph_mode,))
+                info["graph_mode"] = graph_mode
+                if all(r is None for r in results):
+                    log.info("  destroy_nccl(%s): TP1 no-op", graph_mode)
+                else:
+                    log.info("  NCCL destroyed across %d workers (graph_mode=%s)",
+                             len(results), graph_mode)
+
+            elif cmd == "reinit_nccl":
+                if llm is None:
+                    raise RuntimeError("reinit_nccl requires init first")
+                from vllm.utils.network_utils import get_open_port
+                port = get_open_port()
+                results = llm.collective_rpc(_reinit_nccl, args=(port,))
+                failures = [r for r in results
+                            if isinstance(r, dict) and not r.get("ok", True)]
+                if failures:
+                    raise RuntimeError(f"NCCL reinit failed on workers: {failures}")
+                log.info("  NCCL re-initialized on port %d across %d workers",
+                         port, len(results))
+
+            elif cmd == "cleargraph":
+                if llm is None:
+                    raise RuntimeError("cleargraph requires init/load first")
+                graph_mode = kwargs.get("graph_mode")
+                results = llm.collective_rpc(_semip_cleargraph, args=(graph_mode,))
+                info["graph_mode"] = graph_mode
+                log.info("  cleargraph(%s) across %d worker(s)",
+                         graph_mode, len(results))
+
+            elif cmd == "recapture_graphs":
+                if llm is None:
+                    raise RuntimeError("recapture_graphs requires init/load first")
+                graph_mode = kwargs.get("graph_mode") or GRAPH_MODE_REUSE
+                results = llm.collective_rpc(
+                    _semip_recapture_graphs, args=(graph_mode,))
+                info["graph_mode"] = graph_mode
+                failures = [r for r in results
+                            if not (isinstance(r, dict) and r.get("ok", False))]
+                if failures:
+                    raise RuntimeError(
+                        f"semip recapture_graphs({graph_mode}) failed: {failures}")
+                log.info("  recapture_graphs(%s) across %d worker(s)",
+                         graph_mode, len(results))
+                # Reuse preserves graph topology but restore drops most
+                # cudaGraphExec handles; re-instantiate them in lockstep across
+                # ranks before live traffic by driving a few co-scheduled batches
+                # at increasing concurrency.
+                if graph_mode == GRAPH_MODE_REUSE:
+                    if engine is None:
+                        engine = llm.llm_engine
+                    from vllm import SamplingParams
+                    for nreq in (1, 2, 4, 8, 16):
+                        toklen = max(1, min(64 // nreq, 20))
+                        for _ in range(nreq):
+                            engine.add_request(
+                                _alloc_engine_id(),
+                                {"prompt_token_ids": [0] * toklen},
+                                SamplingParams(max_tokens=2, ignore_eos=True))
+                        while engine.has_unfinished_requests():
+                            engine.step()
 
             elif cmd == "save_weights":
                 if pinned_buf is None or index is None:

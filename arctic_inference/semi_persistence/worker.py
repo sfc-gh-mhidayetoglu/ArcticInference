@@ -223,95 +223,116 @@ def _gpu_uuids():
     return uuids
 
 
-def _build_full_device_map(old_gpu, new_gpu):
-    """Build full GPU device map string for cuda-checkpoint --device-map.
+def _gpu_migration_permutation(old_gpus, new_gpus, n):
+    """Full ``n``-GPU bijection that pins ``old_gpus[k] -> new_gpus[k]``.
 
-    cuda-checkpoint requires a bijective mapping of ALL visible GPUs,
-    not just the pair being swapped.
-    Format: oldUuid1=newUuid1,oldUuid2=newUuid2,...
+    ``cuCheckpointProcessRestore`` needs a bijection over every visible GPU.
+    Only ``old_gpus`` hold this process's allocations; the remaining GPUs are
+    paired in order to complete the permutation (works even if the sets
+    overlap, e.g. ``[4,5,6,7] -> [0,1,4,5]``).
     """
-    uuids = _gpu_uuids()
-    if not (0 <= old_gpu < len(uuids) and 0 <= new_gpu < len(uuids)):
+    perm = dict(zip(old_gpus, new_gpus))
+    spare = iter(g for g in range(n) if g not in set(new_gpus))
+    return [perm[i] if i in perm else next(spare) for i in range(n)]
+
+
+def _build_full_device_map(old_gpus, new_gpus, old_uuids=None):
+    """Build the ``oldUuid=newUuid,...`` device map for cuda-checkpoint.
+
+    cuda-checkpoint requires a bijective mapping of ALL visible GPUs, not
+    just the ones being swapped.  ``old_uuids`` are the capture node's GPU
+    UUIDs (from meta.json, the "old" side); the "new" side is read from the
+    local restore node, which is what makes cross-node migration work.
+    """
+    if not old_uuids:
         raise ValueError(
-            f"GPU index out of range: old_gpu={old_gpu}, new_gpu={new_gpu}, "
-            f"visible GPUs=[0..{len(uuids) - 1}]")
-    pairs = []
-    for i, uuid in enumerate(uuids):
-        if i == old_gpu:
-            pairs.append(f"{uuid}={uuids[new_gpu]}")
-        elif i == new_gpu:
-            pairs.append(f"{uuid}={uuids[old_gpu]}")
-        else:
-            pairs.append(f"{uuid}={uuid}")
-    return ",".join(pairs)
+            "image is missing 'gpu_uuids' in meta.json; recapture with the "
+            "updated worker so the capture node's GPU UUIDs are recorded")
+    new_uuids = _gpu_uuids()
+    perm = _gpu_migration_permutation(old_gpus, new_gpus, len(new_uuids))
+    return ",".join(f"{old_uuids[i]}={new_uuids[perm[i]]}"
+                    for i in range(len(new_uuids)))
 
 
-def _build_restore_args(old_gpu, new_gpu):
+def _build_restore_args(old_gpus, new_gpus, old_uuids=None):
     """Build a CUcheckpointRestoreArgs ctypes buffer for GPU migration.
 
-    Layout (64-bit):
-      gpuPairs*      (8 bytes pointer)
-      gpuPairsCount  (4 bytes, unsigned int)
-      reserved       (44 bytes, zeroed)
-      reserved1      (8 bytes, zeroed)
-    Each CUcheckpointGpuPair is oldUuid(16) + newUuid(16) = 32 bytes.
+    Layout (64-bit): gpuPairs* (8), gpuPairsCount (4), reserved (52 zeroed).
+    Each CUcheckpointGpuPair is oldUuid(16) + newUuid(16).  ``old_uuids`` are
+    the capture node's GPU UUIDs (from meta.json); the "new" side is local.
     """
-    uuids_str = _gpu_uuids()
-    if not (0 <= old_gpu < len(uuids_str) and 0 <= new_gpu < len(uuids_str)):
+    if not old_uuids:
         raise ValueError(
-            f"GPU index out of range: old_gpu={old_gpu}, new_gpu={new_gpu}, "
-            f"visible GPUs=[0..{len(uuids_str) - 1}]")
-    uuids = [bytes.fromhex(u.replace("GPU-", "").replace("-", ""))
-             for u in uuids_str]
+            "image is missing 'gpu_uuids' in meta.json; recapture with the "
+            "updated worker so the capture node's GPU UUIDs are recorded")
+
+    def _to_bytes(us):
+        return [bytes.fromhex(u.replace("GPU-", "").replace("-", ""))
+                for u in us]
+
+    new_uuids = _gpu_uuids()
+    n = len(new_uuids)
+    perm = _gpu_migration_permutation(old_gpus, new_gpus, n)
+    old_bytes = _to_bytes(old_uuids)
+    new_bytes = _to_bytes(new_uuids)
 
     pairs_data = bytearray()
-    for i in range(len(uuids)):
-        old_uuid = uuids[i]
-        if i == old_gpu:
-            new_uuid = uuids[new_gpu]
-        elif i == new_gpu:
-            new_uuid = uuids[old_gpu]
-        else:
-            new_uuid = uuids[i]
-        pairs_data += old_uuid + new_uuid
+    for i in range(n):
+        pairs_data += old_bytes[i] + new_bytes[perm[i]]
 
     pairs_buf = (ctypes.c_char * len(pairs_data))(*pairs_data)
     pairs_ptr = ctypes.cast(pairs_buf, ctypes.c_void_p)
-
     args_data = bytearray(64)
     struct.pack_into("<Q", args_data, 0, pairs_ptr.value)
-    struct.pack_into("<I", args_data, 8, len(uuids))
+    struct.pack_into("<I", args_data, 8, n)
     args_buf = (ctypes.c_char * 64)(*args_data)
     return args_buf, pairs_buf
 
 
-def _worker_restore(pids, old_gpu=None, new_gpu=None):
+def _worker_restore(pids, old_gpus=None, new_gpus=None, old_uuids=None):
     """Restore CUDA context on pids.
 
     State machine: checkpointed → restore → locked → unlock → running
 
     Uses driver API directly when running as root, falls back to the
     cuda-checkpoint CLI via sudo otherwise.
+
+    ``old_gpus`` / ``new_gpus`` are the capture and restore GPU lists.  When
+    they differ, a device-map bijection remaps ``old_gpus[k] -> new_gpus[k]``
+    (TP1 and TP>1).  ``old_uuids`` (from meta.json) are the "old" side, so
+    the capture and restore nodes need not be the same machine.
+
+    Two-pass: restore ALL pids, THEN unlock ALL pids.  With a TP process tree
+    an unlocked worker could otherwise touch a still-locked sibling (NCCL/IPC)
+    and race; restoring the whole tree before unlocking any avoids that.
     """
+    migrate = bool(old_gpus and new_gpus and list(old_gpus) != list(new_gpus))
+    ordered = list(reversed(pids))
     if _is_root:
         cu = _get_cu()
         args_ptr = None
         _kept_alive = None
-        if old_gpu is not None and new_gpu is not None and old_gpu != new_gpu:
-            args_buf, pairs_buf = _build_restore_args(old_gpu, new_gpu)
+        if migrate:
+            args_buf, pairs_buf = _build_restore_args(
+                old_gpus, new_gpus, old_uuids)
             args_ptr = ctypes.cast(args_buf, ctypes.c_void_p)
             _kept_alive = (args_buf, pairs_buf)
-        for pid in reversed(pids):
-            _check_cu(f"Restore({pid})", cu.cuCheckpointProcessRestore(pid, args_ptr),
+        for pid in ordered:
+            _check_cu(f"Restore({pid})",
+                      cu.cuCheckpointProcessRestore(pid, args_ptr),
                       ignore=_CU_CHECKPOINT_ALREADY_DONE)
-            _check_cu(f"Unlock({pid})", cu.cuCheckpointProcessUnlock(pid, None),
+        for pid in ordered:
+            _check_cu(f"Unlock({pid})",
+                      cu.cuCheckpointProcessUnlock(pid, None),
                       ignore=_CU_CHECKPOINT_ALREADY_DONE)
     else:
         device_map = None
-        if old_gpu is not None and new_gpu is not None and old_gpu != new_gpu:
-            device_map = _build_full_device_map(old_gpu, new_gpu)
-        for pid in reversed(pids):
+        if migrate:
+            device_map = _build_full_device_map(
+                old_gpus, new_gpus, old_uuids)
+        for pid in ordered:
             _run_cuda_checkpoint("restore", pid, device_map=device_map)
+        for pid in ordered:
             _run_cuda_checkpoint("unlock", pid, ignore_state_err=True)
 
 
@@ -325,12 +346,16 @@ def _resolve_fd_resource(pid, fd):
     return link
 
 
-def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, rank,
+def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
                       meta_extra=None):
     """Dump the vLLM child process tree to disk via CRIU (destructive).
 
+    ``gpus`` is the physical GPU list the tree currently occupies; it is
+    recorded in meta.json (with the capture node's GPU UUIDs) so a later
+    restore can build the migration device map.
+
     The child process is killed after a successful dump.  The on-disk
-    image is later restored via load().
+    image is later restored via criu_restore().
     """
     # Clear any stale dump in the target directory so leftover files from a
     # prior criu_dump() (which CRIU may not overwrite) cannot corrupt the new
@@ -343,19 +368,31 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, rank,
             subprocess.run(["sudo", "rm", "-rf", image_dir], check=True)
     os.makedirs(image_dir, exist_ok=True)
 
+    # At TP>1 the child spawns worker subprocesses whose Unix-domain IPC
+    # sockets (multiproc-executor rpc / shm-broadcast) must be declared
+    # --external to CRIU, so scan every descendant PID (deduped by inode), not
+    # just the child.  nvidia fds are only recorded off the child.
     external_unix = []
     nvidia_fds = {}
-    proc_fd_dir = f"/proc/{child_pid}/fd"
-    for fd_name in os.listdir(proc_fd_dir):
+    seen_inodes = set()
+    for scan_pid in _get_descendant_pids(child_pid) + [child_pid]:
+        proc_fd_dir = f"/proc/{scan_pid}/fd"
         try:
-            link = os.readlink(f"{proc_fd_dir}/{fd_name}")
-            if link.startswith("socket:["):
-                ino = link.split("[")[1].rstrip("]")
-                external_unix.append(f"unix[{ino}]")
-            elif "/dev/nvidia" in link:
-                nvidia_fds[int(fd_name)] = link
+            fd_names = os.listdir(proc_fd_dir)
         except OSError:
-            pass
+            continue
+        for fd_name in fd_names:
+            try:
+                link = os.readlink(f"{proc_fd_dir}/{fd_name}")
+                if link.startswith("socket:["):
+                    ino = link.split("[")[1].rstrip("]")
+                    if ino not in seen_inodes:
+                        seen_inodes.add(ino)
+                        external_unix.append(f"unix[{ino}]")
+                elif scan_pid == child_pid and "/dev/nvidia" in link:
+                    nvidia_fds[int(fd_name)] = link
+            except OSError:
+                pass
 
     cmd = [
         "sudo",
@@ -387,12 +424,21 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, rank,
         raise RuntimeError(
             f"criu dump failed (rc={result.returncode}): {detail}")
 
+    gpus = [gpus] if isinstance(gpus, int) else list(gpus)
     meta = {
         "child_pid": child_pid,
         "pipe_fd": pipe_fd,
         "pipe_resource": pipe_resource,
         "nvidia_fds": {str(k): v for k, v in nvidia_fds.items()},
-        "rank": rank,
+        "rank": gpus[0] if gpus else 0,
+        "gpus": gpus,
+        # Physical GPU UUIDs of the *capture* node.  Required for
+        # cross-node CUDA restore: cuCheckpointProcessRestore's device
+        # map must use the UUID baked into the checkpoint (capture node)
+        # as the "old" side; the restore node reads its own UUIDs for
+        # the "new" side.  Without this, cross-node restore fails with
+        # CUDA_ERROR_INVALID_VALUE (CUresult=1).
+        "gpu_uuids": _gpu_uuids(),
     }
     if meta_extra:
         meta.update(meta_extra)
@@ -730,17 +776,26 @@ def _worker_criu_load(image_dir, new_pipe_fd):
 # Child thread -- communicates with the vLLM child process via pipe
 # ---------------------------------------------------------------------------
 
-def _child_thread(instance_id, rank, child_pid, pipe,
+def _child_thread(instance_id, gpus, child_pid, pipe,
                   child_queue, result_queue, completed_counter,
-                  initial_state="alive"):
+                  initial_state="alive", capture_gpu_uuids=None):
     """Thread that owns the single child.  Pulls commands from child_queue,
     executes them serially, puts results on result_queue.
+
+    ``gpus`` is the physical GPU list this tree currently occupies (the
+    "old" side of a later migration); single-element at TP=1.
+    ``capture_gpu_uuids`` are the capture node's GPU UUIDs from meta.json,
+    needed to build the restore device map across nodes.
 
     Generate commands are fire-and-forget on the pipe.  The child sends
     back ("generate_done", ...) when done (new async child) or
     ("generate", ...) immediately (old CRIU-restored child with sync
     llm.generate).  The worker accepts both.
     """
+    if isinstance(gpus, int):
+        gpus = [gpus]
+    gpus = list(gpus)
+    rank = gpus[0]
     log = semip_logging.worker(instance_id, rank)
 
     def _emit_result(cmd, elapsed, error, info):
@@ -866,7 +921,13 @@ def _child_thread(instance_id, rank, child_pid, pipe,
         if cmd == "cuda_restore":
             t0 = time.perf_counter()
             error = None
-            target_gpu = kwargs["gpu"]
+            # TP>1 sends the whole placement list; a scalar gpu= is still
+            # accepted for TP=1 callers.
+            if kwargs.get("gpus") is not None:
+                target_gpus = list(kwargs["gpus"])
+            else:
+                target_gpus = [kwargs["gpu"]]
+            target_gpu = target_gpus[0]
             info = {}
             try:
                 if state == "alive":
@@ -901,12 +962,15 @@ def _child_thread(instance_id, rank, child_pid, pipe,
                         _all_settled = False
                 if _all_settled:
                     _worker_restore(checkpointed_pids,
-                                    old_gpu=rank,
-                                    new_gpu=target_gpu)
+                                    old_gpus=gpus,
+                                    new_gpus=target_gpus,
+                                    old_uuids=capture_gpu_uuids)
                 else:
                     log.info("  process still running after CRIU restore, skipping CUDA restore")
                 log.info("  restored pids: %s", checkpointed_pids)
                 info["gpu"] = target_gpu
+                info["gpus"] = list(target_gpus)
+                gpus = list(target_gpus)
                 rank = target_gpu
                 log.set_gpu(target_gpu)
                 checkpointed_pids = None
@@ -951,7 +1015,7 @@ def _child_thread(instance_id, rank, child_pid, pipe,
                 pipe_resource = _resolve_fd_resource(child_pid, child_pipe_fd)
 
                 meta = _worker_criu_save(
-                    child_pid, image_dir, child_pipe_fd, pipe_resource, rank,
+                    child_pid, image_dir, child_pipe_fd, pipe_resource, gpus,
                     meta_extra=kwargs.get("meta_extra"),
                 )
                 info["image_dir"] = image_dir
@@ -1059,13 +1123,21 @@ def _child_thread(instance_id, rank, child_pid, pipe,
 # Worker main loop
 # ---------------------------------------------------------------------------
 
-def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter,
+def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
                 model_dir=None):
     """Main loop for a per-Instance worker process.
 
-    ``model_dir`` is threaded to the vLLM child so it can point its
-    compile cache at ``<model_dir>/compilation``.
+    ``gpus`` is the physical GPU list for this instance (single-element at
+    TP=1; a bare int is still accepted).  ``model_dir`` is threaded to the
+    vLLM child so it can point its compile cache at
+    ``<model_dir>/compilation``.
     """
+    if isinstance(gpus, int):
+        gpus = [gpus]
+    gpus = list(gpus)
+    rank = gpus[0]
+    # Capture-node GPU UUIDs, hydrated from meta.json on the restore path.
+    capture_gpu_uuids = None
     semip_logging.init_process()
     log = semip_logging.worker(instance_id, rank)
     # Route everything this process emits (worker.N records, prints,
@@ -1106,7 +1178,7 @@ def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter,
             spawn_ctx = mp.get_context("spawn")
             child_proc = spawn_ctx.Process(
                 target=vllm_child_loop,
-                args=(pipe_child, instance_id, rank, model_dir),
+                args=(pipe_child, instance_id, list(gpus), model_dir),
             )
             child_proc.start()
             pipe_child.close()
@@ -1115,7 +1187,7 @@ def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter,
             child_queue = queue.Queue()
             child_thread_obj = threading.Thread(
                 target=_child_thread,
-                args=(instance_id, rank, child_pid, pipe_parent,
+                args=(instance_id, list(gpus), child_pid, pipe_parent,
                       child_queue, result_queue, completed_counter),
                 daemon=True,
             )
@@ -1163,7 +1235,15 @@ def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter,
 
                 child_pid = new_pid
                 child_proc = None
-                old_rank = meta.get("rank", rank)
+                # Placement the image was captured on: the "old" side of any
+                # subsequent migration.  Legacy images carry only "rank".
+                old_gpus = meta.get("gpus") or [meta.get("rank", gpus[0])]
+                old_gpus = list(old_gpus)
+                old_rank = old_gpus[0]
+                gpus = old_gpus
+                # Capture-node GPU UUIDs; required to build the cuda-restore
+                # device map when the restore node is not the capture node.
+                capture_gpu_uuids = meta.get("gpu_uuids")
 
                 # CRIU restored fd 1/2 onto the path that was open at dump
                 # time, which encodes the instance_id the model had then --
@@ -1184,15 +1264,16 @@ def worker_loop(instance_id, rank, cmd_queue, result_queue, completed_counter,
                 child_queue = queue.Queue()
                 child_thread_obj = threading.Thread(
                     target=_child_thread,
-                    args=(instance_id, old_rank, child_pid, pipe_parent,
+                    args=(instance_id, list(old_gpus), child_pid, pipe_parent,
                           child_queue, result_queue, completed_counter,
-                          "checkpointed"),
+                          "checkpointed", capture_gpu_uuids),
                     daemon=True,
                 )
                 child_thread_obj.start()
 
                 info["pid"] = new_pid
                 info["rank"] = old_rank
+                info["gpus"] = list(old_gpus)
                 info["image_dir"] = image_dir
                 info["child_log_path"] = semip_logging.instance_log_path(
                     instance_id)
