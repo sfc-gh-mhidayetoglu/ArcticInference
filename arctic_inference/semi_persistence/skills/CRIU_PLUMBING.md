@@ -424,6 +424,80 @@ PID-namespace restore. **Images captured before this change (with a tty /
 
 ---
 
+## Complication 11: Unprivileged Dump + Restore (`SEMIP_UNPRIVILEGED`)
+
+**Problem:** the default dump and restore paths need `CAP_SYS_ADMIN` in
+two places, so they only run on privileged pods:
+
+1. CRIU's kerndat init builds a throwaway *network* namespace to probe
+   kernel features; creating a netns needs `CAP_SYS_ADMIN`. Without it
+   criu aborts with "Could not initialize kernel features detection" --
+   on **both** dump and restore.
+2. The restore path additionally wraps criu in a private PID namespace
+   (Complication 10): `unshare(CLONE_NEWPID|CLONE_NEWNS)` + a private
+   `/proc` mount, which also needs `CAP_SYS_ADMIN`.
+
+Production pods are non-privileged: they grant only
+`CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE`, never `CAP_SYS_ADMIN`.
+
+**Fix: `SEMIP_UNPRIVILEGED=1` -- one flag for both sides.**
+
+- **Dump** (`_worker_criu_save`): append `--unprivileged`, which makes
+  CRIU skip the netns kerndat probe. The dump has no namespace machinery
+  of its own, so this one flag is the only change it needs; seizing the
+  target still uses `CAP_SYS_PTRACE`.
+- **Restore**: take `_worker_criu_load_lowcap` instead of
+  `_worker_criu_load`. It runs `criu restore -d --unprivileged`
+  **directly in the host PID namespace** -- no `unshare`, no reaper, no
+  private `/proc`. The recorded PID is therefore the host PID, so
+  `--pidfile` is authoritative (with a pipe-scan fallback), and teardown
+  SIGKILLs the restored tree directly (holder
+  `{"kind": "tree", "pid": host_pid}`) rather than collapsing a namespace.
+
+Why the asymmetry (a flag on dump, a whole function on restore): the dump
+had only dependency (1); the restore had (1) **and** (2), and (2) lives
+in the sudo'd wrapper *around* criu, so it cannot be undone by a criu
+flag -- it needs a different, wrapper-free restore procedure.
+
+Because `-d` makes criu exit with the restore rc, the sudo process's exit
+code *is* criu's rc, so this path needs none of the `reaper.pid` /
+`restore.rc` side-channel files the namespace path uses. Its stdout and
+stderr must go to `/dev/null` rather than pipes: with `-d` the restored
+process inherits fd 1/2 and holds them open after criu exits, so a pipe
+would never EOF and draining it would deadlock.
+
+**Capability floor:** `CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE`, no
+`CAP_SYS_ADMIN`. `clone3(set_tid)` at the recorded PIDs in the host PID
+namespace is authorized by `CAP_CHECKPOINT_RESTORE`, so it does not need
+to write the read-only `ns_last_pid` sysctl. Validate a node with
+`sudo criu check --unprivileged` (a residual read-only `ns_last_pid`
+complaint from the checker is expected and does not block restore).
+
+**Trade-off (accepted):** without the private PID namespace the recorded
+PIDs must be free on the host -- at most **one live restore per node**.
+Fine for a one-job-per-pod layout. A collision surfaces as CRIU
+"File exists" in `restore.log`, which the existing retry loop recognizes.
+Note this makes `scripts/test_weights.py`, which restores two models
+concurrently, incompatible with this mode.
+
+**Restorable image requires shed capabilities.** CRIU's `restore_creds()`
+calls `capset()` to reinstate each task's recorded caps; if the image
+recorded caps the low-cap node can't grant, restore fails at
+`criu/pie/restorer.c` ("Unable to restore capabilities"). So in
+unprivileged mode the vLLM child zeroes its caps *before* `import torch`
+-- torch and vLLM spawn many background threads and CRIU records
+credentials **per thread**, so dropping first is what makes every task
+record an empty cap set. This is **implied by `SEMIP_UNPRIVILEGED=1`**,
+not a separate flag: the worker sets an internal
+`_SEMIP_CHILD_DROP_CAPS` signal only across the child's spawn, because
+the worker itself must keep its caps to run `sudo criu`.
+
+Consequently **image portability is decided at dump time**: an image
+dumped without the flag records real caps and cannot be restored on a
+low-cap node without re-dumping.
+
+---
+
 ## Summary Table
 
 | Resource           | Problem at dump time               | Dump-side fix                      | Restore-side fix                     |
@@ -437,6 +511,7 @@ PID-namespace restore. **Images captured before this change (with a tty /
 | Plugin directory   | `--libdir` path missing             | Create `/usr/lib/criu/empty`       | —                                    |
 | stdin / tty        | pts captured as `--shell-job`; can't reattach in a PID ns | fd 0 → `/dev/null` + `setsid()` at child start | drop `--shell-job` |
 | PID collisions     | Zombie from the destructive dump holds the recorded PID | — | Restore each tree in its own PID namespace (reaper + private /proc); retry loop as backstop |
+| Privileged-only CRIU | dump + restore need `CAP_SYS_ADMIN` (netns kerndat probe; restore PID namespace) | `--unprivileged` (`SEMIP_UNPRIVILEGED=1`) skips the netns probe; caps shed in the child before `import torch` | lowcap path: `criu restore -d --unprivileged` in the host PID ns (no `unshare`), tree-kill teardown |
 | Ghost remap race   | `(deleted)` .so → ghost race        | Destructive dump + sem deletion    | `--link-remap`                       |
 
 ---

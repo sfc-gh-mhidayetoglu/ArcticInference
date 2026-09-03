@@ -153,9 +153,16 @@ a CRIU image on disk and needs neither.
   venv that differs in one compiled extension kills a cross-node restore from
   inside CRIU, with no up-front check. Run `scripts/imgdiff.py <image_dir>`
   before restoring an image captured elsewhere.
+- **An image's capability level is fixed at dump time.** Restoring on a pod
+  without `CAP_SYS_ADMIN` needs `SEMIP_UNPRIVILEGED=1` set *when the image was
+  dumped*, so the child sheds its capabilities and `restore_creds` can reinstate
+  them. An image dumped without it cannot be restored there at all. The same
+  flag costs concurrent restore (one live restore per node), which makes
+  `scripts/test_weights.py` incompatible with it. See Complication 11.
 - **Reserved env keys** (`CUDA_VISIBLE_DEVICES`,
-  `VLLM_ENABLE_V1_MULTIPROCESSING`, `USE_LIBUV`) are silently dropped from
-  `vllm_config["_env"]` at apply time, but retained on disk in `meta.json`.
+  `VLLM_ENABLE_V1_MULTIPROCESSING`, `USE_LIBUV`, the loopback trio and the
+  compile-cache roots) are silently dropped from `vllm_config["_env"]` at apply
+  time, but retained on disk in `meta.json`.
 - **`criu_restore` does not re-apply `_env`** — the child's environment is baked
   into the CRIU image and restored verbatim.
 - **Staging buffers must be freed via `storage().resize_(0)`**, not
@@ -171,7 +178,7 @@ a CRIU image on disk and needs neither.
 | [`pipeline_DESIGN.md`](pipeline_DESIGN.md) | Op model, interrupts, cross-model eviction, regression plan |
 | [`slots_DESIGN.md`](slots_DESIGN.md) | Buddy allocator algorithms, invariants, worked example |
 | [`client_DESIGN.md`](client_DESIGN.md) | Job/model two-layer split, calling shapes, session persistence |
-| [`CRIU_PLUMBING.md`](CRIU_PLUMBING.md) | The ten CRIU complications and the FD keep-list |
+| [`CRIU_PLUMBING.md`](CRIU_PLUMBING.md) | The eleven CRIU complications and the FD keep-list |
 | [`tp_DESIGN.md`](tp_DESIGN.md) | Tensor parallelism: the four TP primitives, NCCL teardown/rebuild, graph reuse |
 | [`semi-p_DESIGN.md`](semi-p_DESIGN.md) | The `model_dir` layout, what a re-dump touches, what binds an image |
 | [`async_generate_DETAILS.md`](async_generate_DETAILS.md) | Async generate, IPC protocol, drain points |

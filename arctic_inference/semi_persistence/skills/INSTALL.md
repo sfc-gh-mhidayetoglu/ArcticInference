@@ -35,6 +35,20 @@ ls /usr/lib/criu/cuda_plugin.so    # shipped by the PPA package
 sudo criu check                    # "Looks good."
 ```
 
+On a **non-privileged** node (only `CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE`,
+no `CAP_SYS_ADMIN`), plain `criu check` aborts at kernel-feature detection
+because it tries to create a throwaway network namespace.  Check such a node
+with the flag that the `SEMIP_UNPRIVILEGED=1` paths use:
+
+```bash
+sudo criu check --unprivileged      # must get past kerndat
+```
+
+A residual complaint about a read-only `ns_last_pid` is expected from the
+checker and does **not** block restore: `clone3(set_tid)` at the recorded PIDs
+is authorized by `CAP_CHECKPOINT_RESTORE`.  See Complication 11 in
+[`CRIU_PLUMBING.md`](CRIU_PLUMBING.md).
+
 After installing, create the empty plugin directory that the dump
 command references via `--libdir`:
 

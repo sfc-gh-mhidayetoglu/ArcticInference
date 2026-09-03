@@ -33,6 +33,68 @@ serves TP=1, where the single worker is in-process.
 import ctypes, json, os, shutil, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 
+
+def _drop_caps_for_portable_image():
+    """Zero this process's Linux capabilities so its CRIU image restores on
+    nodes whose capability bounding set can't grant them.
+
+    Must run in the spawned vLLM child BEFORE ``import torch`` -- torch/vLLM
+    spawn many background threads (cuda, jemalloc, hf-xet, gloo, ...) and
+    CRIU records credentials *per thread*.  A thread inherits the creating
+    thread's capabilities, so dropping here (before any are created) yields
+    an image where every task records an empty cap set; restore_creds()
+    (capset) then trivially succeeds instead of failing with EPERM on a
+    node lacking CAP_SYS_ADMIN etc.  (Dropping later, e.g. in
+    prepare_criu_dump, would only affect the main thread and leave the
+    others with full caps.)
+
+    Gated by the internal _SEMIP_CHILD_DROP_CAPS signal (set transiently by
+    the worker only across this child's spawn -- NOT a user-facing flag; the
+    user-facing switch is SEMIP_UNPRIVILEGED) so ONLY the child drops -- the
+    parent worker keeps its caps to run ``sudo criu``.  Safe for inference: host
+    pinning uses RLIMIT_MEMLOCK (unlimited on GPU nodes), not CAP_IPC_LOCK,
+    and all sockets bind to unprivileged ports.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_CAPBSET_DROP = 24
+        PR_CAP_AMBIENT = 47
+        PR_CAP_AMBIENT_CLEAR_ALL = 4
+        PR_SET_DUMPABLE = 4
+        # Drop the bounding set first -- it needs CAP_SETPCAP, which the
+        # capset() below removes.  EINVAL past the last valid cap is ignored.
+        for cap in range(64):
+            libc.prctl(PR_CAPBSET_DROP, cap, 0, 0, 0)
+        libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+
+        class _CapHeader(ctypes.Structure):
+            _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+        class _CapData(ctypes.Structure):
+            _fields_ = [("effective", ctypes.c_uint32),
+                        ("permitted", ctypes.c_uint32),
+                        ("inheritable", ctypes.c_uint32)]
+
+        _LINUX_CAPABILITY_VERSION_3 = 0x20080522
+        hdr = _CapHeader(_LINUX_CAPABILITY_VERSION_3, 0)
+        data = (_CapData * 2)()  # zero-initialized -> clears eff/prm/inh
+        rc = libc.capset(ctypes.byref(hdr), ctypes.byref(data))
+        # Keep the process dumpable so `sudo criu` seizes it cleanly after
+        # the credential change (capset can reset dumpable to suid_dumpable).
+        libc.prctl(PR_SET_DUMPABLE, 1, 0, 0, 0)
+        print(f"[semip] dropped capabilities for portable image "
+              f"(capset rc={rc})", flush=True)
+    except Exception as e:  # never block startup on a cap-drop failure
+        print(f"[semip] cap-drop failed (continuing): {e}", flush=True)
+
+
+# Internal signal (leading underscore): the worker sets _SEMIP_CHILD_DROP_CAPS
+# only in this spawned child's environment when running unprivileged.  It is
+# deliberately NOT the user-facing SEMIP_UNPRIVILEGED flag -- the worker itself
+# imports this module and must keep its caps to run `sudo criu`.
+if os.environ.get("_SEMIP_CHILD_DROP_CAPS") == "1":
+    _drop_caps_for_portable_image()
+
 import torch
 
 import semip_logging

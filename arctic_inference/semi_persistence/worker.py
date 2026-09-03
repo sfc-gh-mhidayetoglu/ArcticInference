@@ -16,6 +16,18 @@ import torch.multiprocessing as mp
 import semip_logging
 
 
+def _unprivileged():
+    """CRIU runs unprivileged (dump + restore add ``--unprivileged``, and
+    restore skips the private PID namespace) when SEMIP_UNPRIVILEGED=1.
+
+    This is the single switch for running dump and restore on a
+    non-privileged pod that grants only CAP_CHECKPOINT_RESTORE +
+    CAP_SYS_PTRACE (no CAP_SYS_ADMIN).  See the "Reduced-capability
+    restore" section below for the capability rationale.
+    """
+    return os.environ.get("SEMIP_UNPRIVILEGED") == "1"
+
+
 # ---------------------------------------------------------------------------
 # Dead-child diagnostics
 # ---------------------------------------------------------------------------
@@ -410,6 +422,13 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
         "--libdir", "/usr/lib/criu/empty",
         "-v4",
     ]
+    # SEMIP_UNPRIVILEGED=1: skip CRIU's network-namespace kerndat probe (which
+    # needs CAP_SYS_ADMIN), so the dump runs on a non-privileged pod with only
+    # CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE.  Pairs with the lowcap restore
+    # path selected by the same flag; see the "Reduced-capability restore"
+    # section below.
+    if _unprivileged():
+        cmd.append("--unprivileged")
     for ext in external_unix:
         cmd.extend(["--external", ext])
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -501,13 +520,41 @@ def _find_pid_by_pipe(pipe_inode):
 # the namespace and the whole restored tree in one shot.
 
 
-def _kill_pidns_holder(holder, log=None):
-    """Tear down a restore's PID-namespace holder ``(pid1_host_pid, popen)``.
+def _kill_restored_tree(root_pid, log=None):
+    """SIGKILL a root-owned, host-PID-namespace CRIU-restored tree.
 
-    SIGKILLing PID 1 of the namespace makes the kernel kill every task in
-    it (the restored tree), so this doubles as the restored-tree cleanup.
+    Used by the reduced-capability restore path, which has no PID namespace
+    to collapse.  The restored tasks are root-owned (restored via ``sudo
+    criu``), so kills go through ``sudo``.  The dump detaches the child into
+    its own session/process group, so we also nuke the group to catch tasks
+    that reparented away from ``root_pid``.
+    """
+    if not root_pid:
+        return
+    for p in _get_descendant_pids(root_pid) + [root_pid]:
+        subprocess.run(["sudo", "kill", "-9", str(p)], capture_output=True)
+    subprocess.run(["sudo", "kill", "-9", f"-{root_pid}"], capture_output=True)
+    if log is not None:
+        log.info("  restored tree killed (root host_pid=%s)", root_pid)
+
+
+def _kill_pidns_holder(holder, log=None):
+    """Tear down a restore's process tree.
+
+    Two holder shapes are accepted:
+
+    * ``(pid1_host_pid, popen)`` -- the namespace-based path.  SIGKILLing
+      PID 1 of the namespace makes the kernel kill every task in it (the
+      restored tree), so this doubles as the restored-tree cleanup.
+    * ``{"kind": "tree", "pid": root_host_pid}`` -- the reduced-capability
+      (host-PID-namespace) path.  There is no namespace to collapse, so the
+      restored tree is SIGKILLed directly.
     """
     if not holder:
+        return
+    if isinstance(holder, dict):
+        if holder.get("kind") == "tree":
+            _kill_restored_tree(holder.get("pid"), log=log)
         return
     host_pid, proc = holder
     try:
@@ -765,6 +812,199 @@ def _worker_criu_load(image_dir, new_pipe_fd):
             raise RuntimeError(
                 f"failed to discover CRIU-restored root host pid "
                 f"(pipe scan returned {new_pid!r})")
+    except BaseException:
+        _kill_pidns_holder(holder)
+        raise
+
+    return new_pid, meta, holder
+
+
+# ---------------------------------------------------------------------------
+# Reduced-capability restore (no private PID namespace)
+# ---------------------------------------------------------------------------
+#
+# Selected by the single SEMIP_UNPRIVILEGED=1 switch (see _unprivileged()),
+# which also makes _worker_criu_save pass --unprivileged so BOTH dump and
+# restore run on a non-privileged pod.
+#
+# The namespace-based path above needs CAP_SYS_ADMIN for two things:
+#   1. CRIU's kerndat init, which builds a throwaway *network* namespace to
+#      probe kernel features (fails with EPERM where netns creation is
+#      blocked -- see criu check / dump.log "Could not initialize kernel
+#      features detection").  This affects the dump too, which is why
+#      _worker_criu_save also passes --unprivileged in unprivileged mode.
+#   2. This worker's own unshare(CLONE_NEWPID|CLONE_NEWNS) helper, used only
+#      to avoid PID collisions between *concurrent* restores on one node.
+#
+# Neither is fundamental to restoring a single instance:
+#   * (1) is bypassed by CRIU's ``--unprivileged`` mode, which SKIPS the
+#     network-namespace kerndat probe entirely.
+#   * (2) is only needed for concurrency.  CRIU places each task at its
+#     recorded PID via clone3(set_tid), which in the *host* PID namespace is
+#     authorized by CAP_CHECKPOINT_RESTORE -- so it does NOT need to write
+#     the read-only ns_last_pid sysctl.  Dropping the namespace trades
+#     concurrent-restore safety (recorded PIDs must be free -> at most one
+#     live restore per node) for not needing CAP_SYS_ADMIN.
+#
+# Net effect: this path targets a floor of roughly
+#   CAP_CHECKPOINT_RESTORE (+ CAP_SYS_PTRACE)
+# with no unshare() calls.  The CUDA restore (cuCheckpointProcessRestore) is
+# orthogonal -- it is gated by /dev/nvidia* device access, not capabilities.
+#
+# Enable with SEMIP_UNPRIVILEGED=1.  Validate a node first with:
+#   sudo criu check --unprivileged
+# The image must record shed capabilities for restore_creds() to succeed on
+# the low-cap node -- in this mode the child drops its caps at dump
+# automatically (implied by SEMIP_UNPRIVILEGED; no separate flag).
+
+
+def _worker_criu_load_lowcap(image_dir, new_pipe_fd):
+    """Restore a vLLM child tree WITHOUT a private PID namespace.
+
+    Drop-in alternative to ``_worker_criu_load`` with the same
+    ``(host_pid, meta, holder)`` return contract, but:
+
+    * runs ``criu restore -d`` directly in the host PID namespace (no
+      unshare), so it needs no CAP_SYS_ADMIN for namespace creation;
+    * passes ``--unprivileged`` so CRIU skips the network-namespace kerndat
+      probe that otherwise aborts on nodes where netns creation is blocked;
+    * reads the restored root's host PID straight from ``--pidfile`` (with a
+      pipe-scan fallback), since without a PID namespace the recorded PID is
+      the host PID;
+    * returns ``holder = {"kind": "tree", "pid": host_pid}`` for
+      ``_kill_pidns_holder`` -> ``_kill_restored_tree`` at teardown.
+
+    Constraint: at most one live restore per node (recorded PIDs must be
+    free).  A PID collision surfaces as CRIU "File exists" in restore.log,
+    which the caller's retry loop already recognizes.
+    """
+    import fcntl, socket as _socket, tempfile, array, threading
+
+    meta_path = os.path.join(image_dir, "meta.json")
+    with open(meta_path) as f:
+        meta = json.load(f)
+    pipe_resource = meta["pipe_resource"]
+
+    pidfile = os.path.join(image_dir, "restored.pid")
+    for _stale in (pidfile, os.path.join(image_dir, "restore.log")):
+        if os.path.exists(_stale):
+            os.remove(_stale)
+
+    flags = fcntl.fcntl(new_pipe_fd, fcntl.F_GETFD)
+    fcntl.fcntl(new_pipe_fd, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
+
+    pipe_inode = os.readlink(f"/proc/self/fd/{new_pipe_fd}")
+    if pipe_inode.startswith("socket:["):
+        pipe_inode = pipe_inode.split("[")[1].rstrip("]")
+
+    # sudo strips fds >= 3, so hand the pipe fd to the (root) helper over a
+    # Unix socket via SCM_RIGHTS, same as the namespace path.
+    sock_path = os.path.join(tempfile.gettempdir(),
+                             f"criu_fd_{os.getpid()}_{new_pipe_fd}.sock")
+    if os.path.exists(sock_path):
+        os.remove(sock_path)
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    os.chmod(sock_path, 0o777)
+    srv.listen(1)
+
+    def _send_fd():
+        try:
+            conn, _ = srv.accept()
+            conn.sendmsg(
+                [b"\x00"],
+                [(_socket.SOL_SOCKET, _socket.SCM_RIGHTS,
+                  array.array("i", [new_pipe_fd]))])
+            conn.close()
+        finally:
+            srv.close()
+
+    sender = threading.Thread(target=_send_fd, daemon=True)
+    sender.start()
+
+    criu_argv = [
+        "criu", "restore",
+        "-D", image_dir,
+        "-o", "restore.log",
+        "--tcp-close",
+        "--inherit-fd", f"fd[{new_pipe_fd}]:{pipe_resource}",
+        "--inherit-fd", "fd[1]:stdout",
+        "--inherit-fd", "fd[2]:stderr",
+        "--pidfile", pidfile,
+        "--link-remap",
+        "-d",
+        "-v4",
+    ]
+    # --unprivileged makes CRIU operate within CAP_CHECKPOINT_RESTORE limits
+    # (skipping operations that would need CAP_SYS_ADMIN, e.g. the netns
+    # kerndat probe).  This path is only reached when SEMIP_UNPRIVILEGED=1, so
+    # it is always required here -- without it the restore fails on the very
+    # low-capability nodes this path exists for.
+    criu_argv.append("--unprivileged")
+
+    # Helper (root via sudo): re-receive the pipe fd, dup2 it to the number
+    # criu expects, then exec `criu restore -d` DIRECTLY -- no unshare, no
+    # new namespaces.  With -d, criu detaches the restored tree (reparented
+    # to the nearest subreaper) and exits with the restore rc, so the sudo
+    # process's exit code IS criu's rc; no long-lived reaper is required.
+    helper_script = (
+        "import os, socket, array\n"
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        f"s.connect({sock_path!r})\n"
+        "msg, ancdata, _, _ = s.recvmsg(1, socket.CMSG_LEN(4))\n"
+        "received = None\n"
+        "for cl, ct, cd in ancdata:\n"
+        "    if cl == socket.SOL_SOCKET and ct == socket.SCM_RIGHTS:\n"
+        "        fds = array.array('i'); fds.frombytes(cd); received = fds[0]\n"
+        "s.close()\n"
+        f"os.dup2(received, {new_pipe_fd})\n"
+        f"if received != {new_pipe_fd}: os.close(received)\n"
+        f"os.execvp({criu_argv[0]!r}, {criu_argv!r})\n"
+    )
+    cmd = ["sudo", "python3", "-c", helper_script]
+
+    holder = None
+    try:
+        # stdout/stderr -> /dev/null: criu logs everything to restore.log
+        # (via -o).  These must NOT be pipes -- with -d the restored process
+        # inherits fd 1/2 and holds them open after criu exits, so a pipe
+        # would never EOF and draining it (subprocess.run) would deadlock.
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+
+        sender.join(timeout=2)
+        try:
+            os.remove(sock_path)
+        except OSError:
+            pass
+        subprocess.run(["sudo", "chown", "-R",
+                        f"{os.getuid()}:{os.getgid()}", image_dir],
+                       capture_output=True)
+
+        if result.returncode != 0:
+            detail = f"rc={result.returncode}"
+            log_path = os.path.join(image_dir, "restore.log")
+            if os.path.exists(log_path):
+                with open(log_path) as f:
+                    detail += "\n--- restore.log ---\n" + f.read()[-2000:]
+            raise RuntimeError(f"criu restore failed ({detail})")
+
+        # No PID namespace: the recorded PID *is* the host PID, so --pidfile
+        # is authoritative.  Fall back to the pipe scan if it is missing or
+        # stale.
+        new_pid = None
+        if os.path.exists(pidfile):
+            try:
+                new_pid = int(open(pidfile).read().strip())
+            except (OSError, ValueError):
+                new_pid = None
+        if not new_pid or not os.path.exists(f"/proc/{new_pid}"):
+            new_pid = _find_pid_by_pipe(pipe_inode)
+        if new_pid is None or new_pid == os.getpid():
+            raise RuntimeError(
+                "failed to discover CRIU-restored root host pid "
+                "(pidfile + pipe scan both failed)")
+        holder = {"kind": "tree", "pid": new_pid}
     except BaseException:
         _kill_pidns_holder(holder)
         raise
@@ -1180,7 +1420,27 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
                 target=vllm_child_loop,
                 args=(pipe_child, instance_id, list(gpus), model_dir),
             )
-            child_proc.start()
+            # In unprivileged mode (SEMIP_UNPRIVILEGED=1), ask ONLY the spawned
+            # child to drop its Linux capabilities (at its module import,
+            # before torch) so the CRIU image records an empty cap set and
+            # restores on low-capability nodes (restore_creds/capset succeeds).
+            # Cap-drop has no separate flag: it is implied by the same switch
+            # that adds --unprivileged to dump and picks the lowcap restore.
+            # _SEMIP_CHILD_DROP_CAPS is an internal signal (leading underscore),
+            # NOT a user flag: set it only across start() so it lands in the
+            # child's environment; the worker itself must keep its caps to run
+            # `sudo criu` (it also imports vllm_child, which drops on the flag).
+            _drop_caps = _unprivileged()
+            _prev_child_flag = os.environ.get("_SEMIP_CHILD_DROP_CAPS")
+            if _drop_caps:
+                os.environ["_SEMIP_CHILD_DROP_CAPS"] = "1"
+            try:
+                child_proc.start()
+            finally:
+                if _prev_child_flag is None:
+                    os.environ.pop("_SEMIP_CHILD_DROP_CAPS", None)
+                else:
+                    os.environ["_SEMIP_CHILD_DROP_CAPS"] = _prev_child_flag
             pipe_child.close()
             child_pid = child_proc.pid
 
@@ -1203,12 +1463,20 @@ def worker_loop(instance_id, gpus, cmd_queue, result_queue, completed_counter,
             try:
                 image_dir = kwargs["filename"]
 
+                # Reduced-capability path (no private PID namespace, no
+                # unshare) when SEMIP_UNPRIVILEGED=1 -- see
+                # _worker_criu_load_lowcap.  Defaults to the namespace-based
+                # path.
+                _load_fn = (_worker_criu_load_lowcap
+                            if _unprivileged()
+                            else _worker_criu_load)
+
                 max_retries = 5
                 for _attempt in range(max_retries):
                     pipe_parent, pipe_child = mp.Pipe()
                     new_pipe_fd = pipe_child.fileno()
                     try:
-                        new_pid, meta, _holder = _worker_criu_load(
+                        new_pid, meta, _holder = _load_fn(
                             image_dir, new_pipe_fd)
                         _kill_pidns_holder(ns_holder, log)
                         ns_holder = _holder

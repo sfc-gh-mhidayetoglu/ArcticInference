@@ -236,11 +236,12 @@ run the destructive `criu dump`.
 ### Restore sequence
 
 Pass the pipe FD through a Unix socket via `SCM_RIGHTS` into a `sudo`'d helper,
-which `dup2`s it into place and `execvp`s `criu restore` with `--inherit-fd`
-for the pipe plus stdout/stderr, `--link-remap`, `--tcp-close`, and
-`--shell-job`. The CUDA context comes back via `cuda-checkpoint restore`.
+which `dup2`s it into place, unshares a private PID namespace, and runs `criu
+restore` inside it with `--inherit-fd` for the pipe plus stdout/stderr,
+`--link-remap` and `--tcp-close` (no `--shell-job` — the child holds no tty).
+The CUDA context comes back via `cuda-checkpoint restore`.
 
-### The nine complications
+### The eleven complications
 
 | # | Complication | Shape of the fix |
 |---|---|---|
@@ -251,12 +252,21 @@ for the pipe plus stdout/stderr, `--link-remap`, `--tcp-close`, and
 | 5 | Pipe FD through `sudo` | Pass via `SCM_RIGHTS`, helper `dup2`s then `execvp`s |
 | 6 | CUDA context | Driver API rather than the CLI |
 | 7 | CRIU plugin directory | `/usr/lib/criu/empty` must exist (`--libdir`) |
-| 8 | PID collisions at restore | Detect and retry |
+| 8 | PID collisions at restore | Restore into a private PID namespace; retry loop as backstop |
 | 9 | Ghost remap race (CRIU 4.2) | `--link-remap` handling |
+| 10 | Per-restore PID namespace, and the tty it forced out | Reaper + private `/proc`; child `setsid`, `--shell-job` dropped |
+| 11 | Unprivileged dump + restore | `SEMIP_UNPRIVILEGED=1`: `--unprivileged` on both sides, no-namespace restore, caps shed in the child |
 
 `meta.json` alongside the image holds the `vllm_config` (including `_env`) and
 the CRIU metadata, which is what lets the orchestrator rediscover saved models
 on reboot and lets `criu_restore` validate the image against the instance.
+
+### Environment switches
+
+| Variable | Effect |
+|---|---|
+| `SEMIP_UNPRIVILEGED=1` | Run dump and restore on a pod granting only `CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE`. Adds `--unprivileged` to both, takes the no-namespace restore path, and sheds the child's capabilities so the image is portable to a low-cap node. Costs concurrent restore (one live restore per node). See Complication 11 |
+| `_SEMIP_CHILD_DROP_CAPS=1` | Internal only, set by the worker across the child's spawn. Not a user flag |
 
 ---
 

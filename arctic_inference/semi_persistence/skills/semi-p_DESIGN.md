@@ -165,6 +165,26 @@ sibling restore or with a zombie left by a destructive dump.  See
 Complications 8 and 10 in [CRIU_PLUMBING.md](CRIU_PLUMBING.md).  Images
 captured before that change carry a tty and must be re-dumped.
 
+**`SEMIP_UNPRIVILEGED=1` trades that concurrency for a lower capability
+floor.** It is the single switch for running on pods that grant only
+`CAP_CHECKPOINT_RESTORE + CAP_SYS_PTRACE` (no `CAP_SYS_ADMIN`): the dump
+gains `--unprivileged`, the restore takes a path with no private PID
+namespace, and the child sheds its capabilities so the image is
+restorable where `capset()` cannot grant real ones.  Two consequences
+worth planning around:
+
+- **At most one live restore per node**, since the recorded PIDs must be
+  free.  `scripts/test_weights.py` restores two models concurrently and
+  is therefore incompatible with this mode.
+- **Portability is decided at dump time.**  An image dumped *without* the
+  flag records real capabilities and cannot be restored on a low-cap node
+  at all; you have to re-dump with the flag set.  Setting it on a
+  privileged pod is fine and is the normal way to produce a portable
+  image -- `--unprivileged` only skips a probe you do not need.
+
+See Complication 11 in [CRIU_PLUMBING.md](CRIU_PLUMBING.md), and validate
+a target node with `sudo criu check --unprivileged`.
+
 ---
 
 ## 5. Known gaps
