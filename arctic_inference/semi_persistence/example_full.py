@@ -26,10 +26,7 @@ MODEL_SPECS = [
     ("Qwen3.5-122b-a10b-tp2", "Qwen/Qwen3.5-122B-A10B",  2, 0.9, [0, 1], {"max_num_seqs": 128}),
     ("Qwen3-32b-tp4",         "Qwen/Qwen3-32B",          4, 0.8, [0, 1, 2, 3], {}),
     ("Qwen3-235B-A22B-tp4",   "Qwen/Qwen3-235B-A22B",    4, 0.9, [0, 1, 2, 3], {}),
-    ("Qwen3.5-397b-a17b-tp8", "Qwen/Qwen3.5-397B-A17B",  8, 0.9, list(range(8)),
-     {"max_num_seqs": 128,
-      "kernel_config": {"moe_backend": "triton",
-                        "enable_flashinfer_autotune": False}}),
+    ("Qwen3.5-397b-a17b-tp8", "Qwen/Qwen3.5-397B-A17B",  8, 0.9, list(range(8)), {"max_num_seqs": 128, "kernel_config": {"moe_backend": "triton", "enable_flashinfer_autotune": False}}),
     ("Qwen3.5-2B-tp1",        "Qwen/Qwen3.5-2B",         1, 0.2, [0], {}),
     ("Llama3.1-8B-tp1",       "meta-llama/Llama-3.1-8B", 1, 0.4, [0], {}),
     ("Qwen3.5-27B-tp1",       "Qwen/Qwen3.5-27B",        1, 0.8, [0], {}),
@@ -38,15 +35,12 @@ MODEL_SPECS = [
 
 
 def cleanup(inst):
-    try:
-        inst._cmd_queue.put(("teardown", {}))
-        worker = getattr(inst, "_worker", None)
-        if worker is not None:
-            worker.join(timeout=15)
-            if worker.is_alive():
-                worker.kill()
-    except Exception:
-        pass
+    inst._cmd_queue.put(("teardown", {}))
+    worker = getattr(inst, "_worker", None)
+    if worker is not None:
+        worker.join(timeout=15)
+        if worker.is_alive():
+            worker.kill()
     Instance._all.pop(inst.instance_id, None)
 
 
@@ -63,80 +57,77 @@ def run_one(label, model_id, tp, util, gpus, extra):
 
     inst = Instance(dict(config), model_dir)
     times = {}
-    try:
-        # -> up
-        print("== up ==", flush=True)
-        inst.init(gpus=gpus).attach().repin().stage()
-        inst.generate([PROMPT], SAMPLING).wait()
-        print(f"  answer after cold start: {str(inst.last_generate_result)[:80]!r}",
-              flush=True)
 
-        # saved -> up
-        print("\n== saved -> up ==", flush=True)
-        inst.save_weights().detach().wait()
+    print("== up ==", flush=True)
+    inst.init(gpus=gpus).attach().repin().stage()
+    inst.generate([PROMPT], SAMPLING).wait()
+    print(f"  answer after cold start: {str(inst.last_generate_result)[:80]!r}",
+          flush=True)
 
-        t0 = time.perf_counter()
-        inst.sleep().wait()
-        t1 = time.perf_counter()
-        times["sleep"] = t1 - t0
+    print("\n== saved -> up ==", flush=True)
+    inst.save_weights().detach().wait()
 
-        # cuda_checkpoint already does cleargraph + destroy_nccl when tp>1.
-        t0 = time.perf_counter()
-        inst.cuda_checkpoint().wait()
-        t1 = time.perf_counter()
-        times["checkpoint_cuda"] = t1 - t0
+    t0 = time.perf_counter()
+    inst.sleep().wait()
+    t1 = time.perf_counter()
+    times["sleep"] = t1 - t0
 
-        inst.criu_dump().wait()
-        cleanup(inst)
-        time.sleep(2)
-        image_dir = os.path.join(model_dir, "image")
-        if os.path.isdir(image_dir):
-            size = sum(f.stat().st_size for f in os.scandir(image_dir) if f.is_file())
-            print(f"  image on disk: {size / 2**30:.2f} GiB", flush=True)
+    # cuda_checkpoint already does cleargraph + destroy_nccl when tp>1.
+    t0 = time.perf_counter()
+    inst.cuda_checkpoint().wait()
+    t1 = time.perf_counter()
+    times["checkpoint_cuda"] = t1 - t0
 
-        inst = Instance(dict(config), model_dir)
-        inst.criu_restore().wait()
+    inst.criu_dump().wait()
+    cleanup(inst)
+    time.sleep(2)
+    image_dir = os.path.join(model_dir, "image")
+    if os.path.isdir(image_dir):
+        size = sum(f.stat().st_size for f in os.scandir(image_dir) if f.is_file())
+        print(f"  image on disk: {size / 2**30:.2f} GiB", flush=True)
 
-        t0 = time.perf_counter()
-        inst.cuda_restore(gpus=gpus).wait()
-        t1 = time.perf_counter()
-        times["restore_cuda"] = t1 - t0
+    inst = Instance(dict(config), model_dir)
+    inst.criu_restore().wait()
 
-        t0 = time.perf_counter()
-        inst.reinit_nccl().wait()
-        t1 = time.perf_counter()
-        times["reinit_nccl"] = t1 - t0
+    t0 = time.perf_counter()
+    inst.cuda_restore(gpus=gpus).wait()
+    t1 = time.perf_counter()
+    times["restore_cuda"] = t1 - t0
 
-        inst.attach().load_weights().wait()
+    t0 = time.perf_counter()
+    inst.reinit_nccl().wait()
+    t1 = time.perf_counter()
+    times["reinit_nccl"] = t1 - t0
 
-        t0 = time.perf_counter()
-        inst.wake_up_weights().wait()
-        t1 = time.perf_counter()
-        times["wake_up_weights"] = t1 - t0
+    inst.attach().load_weights().wait()
 
-        inst.repin().plan_restore_weights().wait()
+    t0 = time.perf_counter()
+    inst.wake_up_weights().wait()
+    t1 = time.perf_counter()
+    times["wake_up_weights"] = t1 - t0
 
-        t0 = time.perf_counter()
-        inst.restore_weights().wait()
-        t1 = time.perf_counter()
-        times["restore_weights"] = t1 - t0
+    inst.repin().plan_restore_weights().wait()
 
-        t0 = time.perf_counter()
-        inst.wake_up_kv_cache().wait()
-        t1 = time.perf_counter()
-        times["wake_up_kv_cache"] = t1 - t0
+    t0 = time.perf_counter()
+    inst.restore_weights().wait()
+    t1 = time.perf_counter()
+    times["restore_weights"] = t1 - t0
 
-        t0 = time.perf_counter()
-        inst.recapture_graphs().wait()
-        t1 = time.perf_counter()
-        times["recapture_graphs"] = t1 - t0
+    t0 = time.perf_counter()
+    inst.wake_up_kv_cache().wait()
+    t1 = time.perf_counter()
+    times["wake_up_kv_cache"] = t1 - t0
 
-        inst.generate([PROMPT], SAMPLING).wait()
-        print(f"  answer after saved: {str(inst.last_generate_result)[:80]!r}",
-              flush=True)
-        print("  times:", {k: round(v, 3) for k, v in times.items()}, flush=True)
-    finally:
-        cleanup(inst)
+    t0 = time.perf_counter()
+    inst.recapture_graphs().wait()
+    t1 = time.perf_counter()
+    times["recapture_graphs"] = t1 - t0
+
+    inst.generate([PROMPT], SAMPLING).wait()
+    print(f"  answer after saved: {str(inst.last_generate_result)[:80]!r}",
+          flush=True)
+    print("  times:", {k: round(v, 3) for k, v in times.items()}, flush=True)
+    cleanup(inst)
 
 
 def main():
