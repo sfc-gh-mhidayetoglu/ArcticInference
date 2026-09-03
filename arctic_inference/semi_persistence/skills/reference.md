@@ -52,7 +52,7 @@ placement only and must have exactly that many entries. See
 | Primitive | Effect |
 |---|---|
 | `destroy_nccl(graph_mode="reuse")` | Tear down NCCL and CustomAllreduce IPC before a checkpoint |
-| `reinit_nccl()` | Rebuild NCCL on a fresh port. Must run immediately after `cuda_restore`, before any collective |
+| `reinit_nccl()` | Rebuild NCCL on a fresh port. Must run after `cuda_restore` and before the model runs or a captured graph replays; `attach`/`load_weights` are CPU-only and unconstrained by it |
 | `cleargraph(graph_mode="reuse")` | Drop CUDA-graph exec handles; `reuse` preserves them |
 | `recapture_graphs(graph_mode="reuse")` | Rebind (`reuse`) or recapture (`full`) decode graphs, after `wake_up_kv_cache` |
 

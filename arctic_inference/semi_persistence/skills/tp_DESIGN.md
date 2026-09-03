@@ -274,8 +274,16 @@ in the child.  All of it degrades to a no-op at TP=1.
   `cleargraph`+`destroy_nccl` itself, but `reinit_nccl` (right after
   `cuda_restore`) and `recapture_graphs("reuse")` (right after
   `wake_up_kv_cache`) are the caller's responsibility.
-- **`reinit_nccl` ordering.** It must run before any collective (attach,
-  weight restore, graph replay), i.e. immediately after `cuda_restore`.
+- **`reinit_nccl` ordering.** It must run after `cuda_restore`, and before
+  anything that runs the model or replays a captured graph — in practice
+  before `recapture_graphs` and `generate`.  `attach` and `load_weights`
+  are *not* constrained by it: `collective_rpc` is the executor's
+  Unix-socket fan-out, not a device collective, and the work each rank
+  does is CPU-only (a host `torch.empty` for `_semip_attach`, then shard
+  reads from `<weights_dir>/rankN` for `_semip_load_weights`).
+  `test_tp2.py` runs both *before* `cuda_restore` for that reason.
+  `restore_weights` is in between: its H2D copies need the restored
+  context, but no NCCL.
 - **Per-worker budget, not aggregate.** Size the restore chunk plan from
   `max_pinned_bytes_per_worker`; the aggregate `pinned_cpu_bytes` is
   ~N times too large per GPU.

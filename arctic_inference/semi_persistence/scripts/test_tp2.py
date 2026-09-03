@@ -8,8 +8,10 @@ The TP-specific steps are the only difference from the single-GPU flow in
 
   * ``cuda_checkpoint()`` auto-inserts ``cleargraph`` + ``destroy_nccl``
     when tensor_parallel_size > 1, so the caller does not.
-  * ``reinit_nccl()`` must run immediately after ``cuda_restore`` and
-    before any collective (attach, weight restore, graph replay).
+  * ``reinit_nccl()`` must run after ``cuda_restore``, and before anything
+    that runs the model or replays a captured graph (``recapture_graphs``,
+    ``generate``).  ``attach`` and ``load_weights`` are CPU-only per rank,
+    so they are not constrained by it and run first below.
   * ``recapture_graphs("reuse")`` runs after ``wake_up_kv_cache`` and
     rebinds the preserved decode graphs' baked addresses.
 
