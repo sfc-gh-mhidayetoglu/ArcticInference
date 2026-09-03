@@ -99,11 +99,45 @@ mismatch is rejected by name.
 **Cross-node restore needs the same absolute path.** Copy the whole
 `model_dir` to the target node at the identical path.  The compile cache
 is the reason: its `dlopen`'d artifacts are recorded by absolute path and
-must exist at restore.  The other two cross-node requirements are handled
-automatically — `meta.json` carries the capture node's GPU UUIDs so the
-CUDA restore device map can pair them against the local node's, and the
-child pins vLLM's rendezvous and the NCCL/gloo bootstrap sockets to
-loopback so CRIU does not bake a routable IP into the image.
+must exist at restore.  Two of the other cross-node requirements are
+handled automatically — `meta.json` carries the capture node's GPU UUIDs
+so the CUDA restore device map can pair them against the local node's
+(zero overlap between the two UUID sets is the normal case, not an
+error), and the child pins vLLM's rendezvous and the NCCL/gloo bootstrap
+sockets to loopback so CRIU does not bake a routable IP into the image.
+
+**Cross-node restore also needs a byte-identical environment, and this
+one is not checked up front.**  CRIU records every file-backed mapping by
+absolute path *and* size, then re-validates the size when it reopens the
+file at restore.  One mapped file of a different length aborts the entire
+restore:
+
+```
+Error (criu/files-reg.c:2175): File <path> has bad size <local> (expect <image>)
+Error (criu/mem.c:1467): `- Can't open vma
+Error (criu/cr-restore.c:2331): Restoring FAILED.
+```
+
+The venv is where this bites in practice: two nodes that installed the
+same requirements at different times end up with different builds of some
+compiled extension, and CRIU aborts on the first one it hits rather than
+reporting them all.  Unlike the `vllm_config` and `model_dir` checks
+above, there is no early raise — the failure surfaces from inside CRIU.
+Reinstalling from the same requirements is *not* sufficient, because
+identical version specs routinely yield different bytes; copy the tree
+itself (`rsync -a`, or a tarball — never `tar -h`, which dereferences the
+venv's symlinks and changes sizes) to the identical absolute path.
+
+**Check an image against the node before spending a restore attempt.**
+`scripts/imgdiff.py <image_dir>` decodes the image's `files.img` and
+reports every recorded mapping whose local size differs or whose file is
+missing, so a cross-node environment mismatch takes seconds to diagnose
+instead of a failed restore.  It also compares the ELF build-IDs CRIU
+recorded, which catches a same-size-but-different-build library that
+would pass CRIU's size check and then map the wrong text pages.  The one
+entry it always lists and that is never a problem is the `/dev/shm/sem.*`
+ghost file: unlinked at dump time, carried inside the image, recreated by
+CRIU at restore.
 
 **A restored child runs the code frozen in the image.** Editing
 `vllm_child.py` has no effect on an existing image: the child resumes

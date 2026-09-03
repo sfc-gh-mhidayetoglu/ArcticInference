@@ -15,6 +15,11 @@ CRIU is not in the default Ubuntu repos at a recent-enough version.
 Install from the official CRIU PPA:
 
 ```bash
+# 0. Refresh the package lists first.  On a container whose lists are
+#    stale, step 1 fails with 404s on every package because the mirrors
+#    have already rotated out the versions the old lists point at.
+sudo apt-get update
+
 # 1. Add the CRIU PPA
 sudo apt-get install -y software-properties-common
 sudo add-apt-repository -y ppa:criu/ppa
@@ -24,8 +29,10 @@ sudo apt-get update
 sudo apt-get install -y criu
 
 # 3. Verify
-criu --version          # should print 4.x
-which crit              # /usr/sbin/crit  (CRIU image tool)
+criu --version                     # should print 4.x (4.2.1 from the PPA)
+which crit                         # /usr/bin/crit  (CRIU image tool)
+ls /usr/lib/criu/cuda_plugin.so    # shipped by the PPA package
+sudo criu check                    # "Looks good."
 ```
 
 After installing, create the empty plugin directory that the dump
@@ -103,17 +110,19 @@ Verify:
 
 ```bash
 criu --version          # Version: 4.2,  GitID: v4.2
-which crit              # /usr/local/bin/crit  (note: not /usr/sbin/crit)
+which crit              # /usr/local/bin/crit  (note: not /usr/bin/crit)
 ls -d /usr/lib/criu/empty
 ```
 
 Notes:
 
-- `crit` lands in `/usr/local/bin/` on the source build (vs `/usr/sbin/`
+- `crit` lands in `/usr/local/bin/` on the source build (vs `/usr/bin/`
   from the PPA), because it ships as a Python wheel installed by
   `install-crit`.
 - The from-source path also produces `cuda_plugin.so` in the CRIU build
-  tree — the CRIU CUDA infrastructure picks it up at dump time.
+  tree — the CRIU CUDA infrastructure picks it up at dump time.  The PPA
+  package already ships it as `/usr/lib/criu/cuda_plugin.so`, so the CUDA
+  plugin is not on its own a reason to prefer the source build.
 - More detailed build notes (and conditional fix-ups for systems missing
   even more headers) live in `instance_DESIGN.md` under
   *"CRIU Installation (v4.2, from source)"*.

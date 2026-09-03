@@ -125,6 +125,7 @@ semi_persistence/
   *.py           library code (orchestrator, instance, worker, client, dashboard, ...)
   tests/         pytest: CPU-only, hermetic, ~2.5s, no GPU
   scripts/       imperative repros: need real GPUs and real vLLM
+                 (except imgdiff.py, which only needs crit + root)
   skills/        this skill (SKILL.md + reference.md) and every design doc
 ```
 
@@ -138,7 +139,8 @@ python dashboard.py               # needs a running orchestrator on :8157
 ```
 
 `tests/` is the only part runnable in CI. Everything in `scripts/` allocates
-real GPUs and loads real weights.
+real GPUs and loads real weights, except `scripts/imgdiff.py`, which inspects
+a CRIU image on disk and needs neither.
 
 ## Gotchas that bite
 
@@ -146,6 +148,11 @@ real GPUs and loads real weights.
   so after `criu_dump` the model is always `saved` with no live process.
 - **`/usr/lib/criu/empty` must exist** or dump aborts at plugin init. See
   [`INSTALL.md`](INSTALL.md).
+- **An image binds to its node's shared libraries byte-for-byte.** CRIU
+  re-validates the recorded size of every file-backed mapping at restore, so a
+  venv that differs in one compiled extension kills a cross-node restore from
+  inside CRIU, with no up-front check. Run `scripts/imgdiff.py <image_dir>`
+  before restoring an image captured elsewhere.
 - **Reserved env keys** (`CUDA_VISIBLE_DEVICES`,
   `VLLM_ENABLE_V1_MULTIPROCESSING`, `USE_LIBUV`) are silently dropped from
   `vllm_config["_env"]` at apply time, but retained on disk in `meta.json`.
