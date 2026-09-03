@@ -536,8 +536,19 @@ namei -l "$(python -c 'import sys; print(sys.base_prefix)')"
 and fix by granting traversal (`chmod o+x /home/<user>`, which permits
 path traversal without allowing directory listing) or by using an
 interpreter under a world-readable prefix such as `/usr/lib/python3.12`.
-Internal does not hit this because it runs the system python from
-`/usr/local/lib/python3.12`.
+
+The operative variable is *where the interpreter lives*, not how it was
+installed.  A pre-baked pod image that ships vLLM, CRIU and Python
+system-wide satisfies this for free -- `/usr/lib/python3.12` and
+`/usr/local/lib/python3.12/dist-packages` are `drwxr-xr-x`, so dropping
+capabilities changes nothing that process could already read.  That is
+why the mode appears to "just work" on such an image and then fails on a
+development pod where the same code runs from a venv on a private home.
+A venv built on `/usr/bin/python3` is equally fine; a venv built on a
+conda install under `$HOME` is not.
+
+`criu` itself is never implicated: it lives at `/usr/sbin/criu`
+(`-rwxr-xr-x`) and runs in the worker, which keeps its capabilities.
 
 **Only cold start is affected; restoring a pre-existing image is not.**
 This asymmetry is worth internalising, because it makes the bug look
