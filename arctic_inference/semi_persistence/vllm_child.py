@@ -513,6 +513,67 @@ def _semip_destroy_fi_ar_workspace():
         pass
 
 
+def _mark_rst_on_close(fd_int):
+    """Set SO_LINGER(1,0) on an inet TCP socket so its eventual close sends RST
+    (skips TIME_WAIT) -> avoids restore-time EADDRINUSE on the rebind. AF_UNIX
+    and non-stream sockets are left untouched. Operates on a *dup* so we never
+    close the worker's live fd here -- the option lives on the shared socket, so
+    the original fd RSTs when it is finally closed by teardown/CRIU-kill."""
+    import socket, struct
+    try:
+        dup = os.dup(fd_int)
+    except OSError:
+        return None
+    try:
+        s = socket.socket(fileno=dup)   # Linux auto-detects family/type/proto
+    except OSError:
+        os.close(dup)
+        return None
+    try:
+        if (s.family in (socket.AF_INET, socket.AF_INET6)
+                and s.type == socket.SOCK_STREAM):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                         struct.pack("ii", 1, 0))
+            try:
+                return (fd_int, s.family.name, s.getsockname())
+            except OSError:
+                return (fd_int, s.family.name, None)
+    finally:
+        s.close()   # closes the dup only; fd_int stays open for CRIU
+    return None
+
+
+def _mark_inet_sockets_rst(where):
+    """Scan this worker's fds and SO_LINGER(1,0) every inet TCP socket, so the
+    next close (distributed teardown / destructive CRIU dump) sends RST and the
+    tuple skips TIME_WAIT -> restore rebinds the rendezvous port immediately with
+    no cooldown. AF_UNIX / non-stream sockets are left alone. Returns marked
+    (fd, family, addr) tuples."""
+    pid = os.getpid()
+    marked = []
+    try:
+        fd_names = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return []
+    for fd_name in fd_names:
+        try:
+            fd_int = int(fd_name)
+            if fd_int <= 2:
+                continue
+            link = os.readlink(f"/proc/{pid}/fd/{fd_name}")
+        except (OSError, ValueError):
+            continue
+        if not link.startswith("socket:"):
+            continue
+        r = _mark_rst_on_close(fd_int)
+        if r is not None:
+            marked.append(r)
+    if marked:
+        print(f"[rst-on-dump] {where}: SO_LINGER(1,0) on {len(marked)} "
+              f"inet TCP socket(s): {marked}", flush=True)
+    return marked
+
+
 def _destroy_nccl(worker, graph_mode=None):
     """Tear down NCCL process groups before checkpoint.  No-op at TP1."""
     import torch.distributed as dist
@@ -546,6 +607,14 @@ def _destroy_nccl(worker, graph_mode=None):
     from vllm.distributed import parallel_state as ps
     from vllm.distributed.parallel_state import (
         destroy_model_parallel, destroy_distributed_environment)
+
+    # RST-on-close: mark the rendezvous inet TCP sockets now, while they are
+    # still open, so the teardown below closes them with RST (skips TIME_WAIT).
+    # Otherwise the destructive dump leaves the tuple in TIME_WAIT and the
+    # restore rebind fails with EADDRINUSE (sk-inet.c: Address already in use).
+    # Runs per-worker (this is a collective_rpc target), so it hits each rank's
+    # rendezvous socket.
+    _mark_inet_sockets_rst("destroy_nccl")
 
     # Free the FlashInfer AR+RMS multicast workspace before NCCL teardown (full
     # only; reuse preserves graphs and thus the workspace they reference).
