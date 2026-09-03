@@ -159,6 +159,13 @@ a CRIU image on disk and needs neither.
   them. An image dumped without it cannot be restored there at all. The same
   flag costs concurrent restore (one live restore per node), which makes
   `scripts/test_weights.py` incompatible with it. See Complication 11.
+- **`SEMIP_UNPRIVILEGED=1` needs a world-readable interpreter.** The child
+  drops *all* capabilities, so a uid-0 process loses `CAP_DAC_OVERRIDE` and can
+  only read what `other` can. An interpreter behind a private home (`chmod 750`)
+  then breaks cold start with a bogus-looking `ModuleNotFoundError` for a stdlib
+  module right after the `[semip] dropped capabilities` line. A venv inherits
+  its base interpreter's stdlib, so check `sys.base_prefix`, not the venv.
+  Restoring an existing image is unaffected -- it imports nothing.
 - **Reserved env keys** (`CUDA_VISIBLE_DEVICES`,
   `VLLM_ENABLE_V1_MULTIPROCESSING`, `USE_LIBUV`, the loopback trio and the
   compile-cache roots) are silently dropped from `vllm_config["_env"]` at apply

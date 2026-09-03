@@ -496,6 +496,67 @@ Consequently **image portability is decided at dump time**: an image
 dumped without the flag records real caps and cannot be restored on a
 low-cap node without re-dumping.
 
+### Precondition: everything the child reads must be world-accessible
+
+The worker tree runs as root, and root bypasses file permission checks
+via `CAP_DAC_OVERRIDE`.  Zeroing the capabilities takes that away while
+leaving uid 0 in place, so from that instant the child can only read what
+is reachable by *other* -- every directory on the path needs `o+x`, and
+the files need `o+r`.
+
+If the interpreter itself lives behind a private directory, the child
+dies immediately after the drop, and the symptom does not look like a
+permission problem.  `multiprocessing` spawn runs `spawn_main` ->
+`_main` -> unpickle, and unpickling imports the target's module
+(`vllm_child`), which is where the drop fires.  The next stdlib import
+needed to finish that same unpickle then fails:
+
+```
+[semip] dropped capabilities for portable image (capset rc=0)
+Traceback (most recent call last):
+  File ".../multiprocessing/spawn.py", line 132, in _main
+ModuleNotFoundError: No module named 'multiprocessing.popen_spawn_posix'
+```
+
+followed by `init FAILED (child pipe broken, ... state=Z (zombie),
+exited_code=1)`.  A `ModuleNotFoundError` for a stdlib module right after
+the cap-drop line always means this.
+
+Observed with a conda interpreter under a `drwxr-x---` home directory.
+Note a venv does not help by itself: it shares its base interpreter's
+stdlib, so `/data-fast/myenv/bin/python` built on
+`/home/user/miniconda3/envs/dev` still reads its stdlib from under the
+private home -- switching between several such venvs changes nothing.
+Check the base, not the venv:
+
+```bash
+namei -l "$(python -c 'import sys; print(sys.base_prefix)')"
+```
+
+and fix by granting traversal (`chmod o+x /home/<user>`, which permits
+path traversal without allowing directory listing) or by using an
+interpreter under a world-readable prefix such as `/usr/lib/python3.12`.
+Internal does not hit this because it runs the system python from
+`/usr/local/lib/python3.12`.
+
+**Only cold start is affected; restoring a pre-existing image is not.**
+This asymmetry is worth internalising, because it makes the bug look
+intermittent:
+
+- `init` spawns a fresh interpreter, so the child runs Python's import
+  machinery -- which is exactly where the drop fires and exactly what
+  breaks next.
+- `criu_restore` maps an already-initialised process back into memory.
+  The restored child resumes in-memory code and imports nothing, so it
+  never performs a DAC-checked read and zero capabilities cost it
+  nothing.  The file reads the restore *does* need (reopening every
+  file-backed mapping) are done by `criu` in the worker, which keeps its
+  capabilities -- only the child ever drops.
+
+So an image dumped before the precondition was met will keep restoring
+happily, and the failure only reappears the next time something
+cold-starts.
+
 ---
 
 ## Summary Table
