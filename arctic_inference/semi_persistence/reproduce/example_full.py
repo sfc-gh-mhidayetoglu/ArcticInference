@@ -5,7 +5,7 @@ import shutil
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 os.environ.setdefault("VLLM_ALLREDUCE_USE_SYMM_MEM", "0")
@@ -128,6 +128,7 @@ def run_one(label, model_id, tp, util, gpus, extra):
           flush=True)
     print("  times:", {k: round(v, 3) for k, v in times.items()}, flush=True)
     cleanup(inst)
+    return times
 
 
 def main():
@@ -140,16 +141,22 @@ def main():
     specs = [s for s in MODEL_SPECS if not want or s[0] in want]
 
     failed = []
+    recap = []
     for spec in specs:
         t0 = time.time()
         try:
-            run_one(*spec)
+            times = run_one(*spec)
+            recap.append((spec[0], times))
             print(f"[{spec[0]}] OK in {time.time() - t0:.0f}s", flush=True)
         except Exception as e:
             failed.append(spec[0])
             short = str(e).split("\n", 1)[0][:120]
             print(f"[{spec[0]}] FAILED after {time.time() - t0:.0f}s: "
                   f"{type(e).__name__}: {short}", flush=True)
+    print("\n== times ==", flush=True)
+    for label, times in recap:
+        print(f"  {label}: { {k: round(v, 3) for k, v in times.items()} }",
+              flush=True)
     print(f"\ndone: {len(specs) - len(failed)}/{len(specs)} ok", flush=True)
     print("== run finished ==", flush=True)
     sys.exit(1 if failed else 0)
