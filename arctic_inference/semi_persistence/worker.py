@@ -739,7 +739,9 @@ def _worker_criu_load(image_dir, new_pipe_fd):
         "    except OSError:\n"
         "        time.sleep(0.2)\n"
     )
-    cmd = ["sudo", "python3", "-c", helper_script]
+    cmd = ["python3", "-c", helper_script]
+    if not _is_root:
+        cmd.insert(0, "sudo")
 
     holder = None
     # From here on, any failure must tear the namespace down (which also
