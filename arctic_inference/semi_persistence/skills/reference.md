@@ -252,7 +252,7 @@ comes back via `cuda-checkpoint restore`.
 | 4 | stdout/stderr | `dup2 /dev/null`, restore with `--inherit-fd` |
 | 5 | Pipe FD through `sudo` | Pass via `SCM_RIGHTS`, helper `dup2`s then `execvp`s |
 | 6 | CUDA context | Driver API rather than the CLI |
-| 7 | CRIU plugin directory | `/usr/lib/criu/empty` must exist (`--libdir`) |
+| 7 | CRIU plugin directory | `--libdir` needs `/usr/lib/criu/empty`; the dump creates it |
 | 8 | PID collisions at restore | Restore into a private PID namespace; retry loop as backstop |
 | 9 | Ghost remap race (CRIU 4.2) | `--link-remap` handling |
 | 10 | Per-restore PID namespace, and the tty it forced out | Reaper + private `/proc`; child `setsid`, `--shell-job` dropped |

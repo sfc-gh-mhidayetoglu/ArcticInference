@@ -845,7 +845,8 @@ sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-criu PREFIX=/usr
 sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-lib PREFIX=/usr
 sudo PIP_BREAK_SYSTEM_PACKAGES=1 make install-crit PREFIX=/usr
 
-# Empty plugin directory (required by --libdir during dump)
+# Empty plugin directory (used by --libdir during dump; the dump creates
+# it if missing, so this is optional)
 sudo mkdir -p /usr/lib/criu/empty
 ```
 

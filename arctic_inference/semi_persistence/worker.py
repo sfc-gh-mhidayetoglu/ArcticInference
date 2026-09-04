@@ -179,6 +179,10 @@ def _kill_process_tree(pid):
 
 _is_root = os.geteuid() == 0
 
+# Handed to `criu dump --libdir` so CRIU's plugin loader finds nothing there.
+# It must exist: CRIU opens it during plugin init and dies otherwise.
+_CRIU_EMPTY_LIBDIR = "/usr/lib/criu/empty"
+
 
 def _run_cuda_checkpoint(action, pid, ignore_state_err=False, device_map=None):
     """Run sudo cuda-checkpoint --action <action> --pid <pid>."""
@@ -380,6 +384,17 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
             subprocess.run(["sudo", "rm", "-rf", image_dir], check=True)
     os.makedirs(image_dir, exist_ok=True)
 
+    # Neither the CRIU PPA nor the source build creates the --libdir target,
+    # and criu dies at plugin init without it ("Unable to open directory
+    # /usr/lib/criu/empty", criu/plugin.c), so create it here instead of
+    # requiring a manual mkdir per node.  Under /usr/lib, so root-only.
+    if not os.path.isdir(_CRIU_EMPTY_LIBDIR):
+        try:
+            os.makedirs(_CRIU_EMPTY_LIBDIR, exist_ok=True)
+        except OSError:
+            subprocess.run(["sudo", "mkdir", "-p", _CRIU_EMPTY_LIBDIR],
+                           check=True)
+
     # At TP>1 the child spawns worker subprocesses whose Unix-domain IPC
     # sockets (multiproc-executor rpc / shm-broadcast) must be declared
     # --external to CRIU, so scan every descendant PID (deduped by inode), not
@@ -419,7 +434,7 @@ def _worker_criu_save(child_pid, image_dir, pipe_fd, pipe_resource, gpus,
         "--tcp-close",
         "--ext-unix-sk",
         "--link-remap",
-        "--libdir", "/usr/lib/criu/empty",
+        "--libdir", _CRIU_EMPTY_LIBDIR,
         "-v4",
     ]
     # SEMIP_UNPRIVILEGED=1: skip CRIU's network-namespace kerndat probe (which

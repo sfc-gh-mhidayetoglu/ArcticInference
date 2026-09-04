@@ -37,8 +37,8 @@ on AWS p5en.48xlarge (192 vCPU, 2 TiB host memory, 8x H200) with vLLM v0.18.0.*
 
 - Linux with NVIDIA GPUs, and a driver providing `cuda-checkpoint`.
 - vLLM and ArcticInference installed (see the [repository README](../../README.md)).
-- CRIU 4.2 with the CUDA plugin, plus the empty plugin directory
-  `/usr/lib/criu/empty` — without it, dumps abort at plugin init.
+- CRIU 4.2 with the CUDA plugin. The empty plugin directory it needs,
+  `/usr/lib/criu/empty`, is created by the dump if missing.
 - Passwordless `sudo`: checkpoint and restore shell out to `cuda-checkpoint`
   and `criu`, which need root.
 

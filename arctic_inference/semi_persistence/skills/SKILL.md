@@ -153,8 +153,8 @@ a CRIU image on disk and needs neither.
   socket … Address already in use`. Dumps now mark the workers' TCP sockets
   `SO_LINGER(1,0)` so the kill RSTs instead; images from before that change
   need the 60s to drain, not a re-dump. See Complication 12.
-- **`/usr/lib/criu/empty` must exist** or dump aborts at plugin init. See
-  [`INSTALL.md`](INSTALL.md).
+- **`/usr/lib/criu/empty` is created by the dump**, not by any CRIU package;
+  without it criu aborts at plugin init. See Complication 7.
 - **An image binds to its node's shared libraries byte-for-byte.** CRIU
   re-validates the recorded size of every file-backed mapping at restore, so a
   venv that differs in one compiled extension kills a cross-node restore from

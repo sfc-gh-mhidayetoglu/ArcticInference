@@ -49,15 +49,17 @@ checker and does **not** block restore: `clone3(set_tid)` at the recorded PIDs
 is authorized by `CAP_CHECKPOINT_RESTORE`.  See Complication 11 in
 [`CRIU_PLUMBING.md`](CRIU_PLUMBING.md).
 
-After installing, create the empty plugin directory that the dump
-command references via `--libdir`:
+The dump also needs the empty plugin directory it passes to `--libdir`,
+which no CRIU package creates.  `_worker_criu_save` now creates it (via
+`sudo` when the worker is not root), so this is only needed if you want
+it in place ahead of the first dump:
 
 ```bash
 sudo mkdir -p /usr/lib/criu/empty
 ```
 
-Without this directory the dump aborts at plugin initialization
-(see *Complication 7* in [`CRIU_PLUMBING.md`](./CRIU_PLUMBING.md)).
+See *Complication 7* in [`CRIU_PLUMBING.md`](./CRIU_PLUMBING.md) for why
+the directory exists at all.
 
 ### Alternative: build from source (when apt mirrors are unreachable)
 

@@ -295,8 +295,19 @@ CRIU from loading plugins (the CUDA plugin is loaded separately by the
 CRIU CUDA infrastructure).  If the directory does not exist, CRIU
 aborts at plugin initialization and the dump fails.
 
-**Fix:** Ensure `/usr/lib/criu/empty` exists (an empty directory).
-The CRIU PPA package does not create it automatically.
+```
+Error (criu/plugin.c:228): Unable to open directory /usr/lib/criu/empty: No such file or directory
+```
+
+**Fix:** `_worker_criu_save` creates the directory before every dump —
+`os.makedirs`, falling back to `sudo mkdir -p` when the worker is not
+root, since it lives under `/usr/lib`.  Neither the PPA package nor the
+source build creates it, and it is easier to make than to require of
+every node.  The `mkdir` in [`INSTALL.md`](INSTALL.md) is therefore
+optional now.
+
+Dump-only: no restore path passes `--libdir`, and nothing here is
+TP-dependent — the same argv serves TP=1 and TP>1.
 
 ---
 
@@ -660,7 +671,7 @@ leave `TIME_WAIT` behind.
 | stdout/stderr      | File size changes between dump/load | Redirect to /dev/null              | `--inherit-fd fd[1]/fd[2]`           |
 | Pipe FD            | sudo closes FDs >= 3                | —                                  | SCM_RIGHTS via Unix socket           |
 | CUDA context       | GPU state not in CRIU image         | CRIU CUDA plugin at dump           | Driver API or cuda-checkpoint        |
-| Plugin directory   | `--libdir` path missing             | Create `/usr/lib/criu/empty`       | —                                    |
+| Plugin directory   | `--libdir` path missing             | `_worker_criu_save` creates `/usr/lib/criu/empty` before each dump | —                    |
 | stdin / tty        | pts captured as `--shell-job`; can't reattach in a PID ns | fd 0 → `/dev/null` + `setsid()` at child start | drop `--shell-job` |
 | PID collisions     | Zombie from the destructive dump holds the recorded PID | — | Restore each tree in its own PID namespace (reaper + private /proc); retry loop as backstop |
 | Privileged-only CRIU | dump + restore need `CAP_SYS_ADMIN` (netns kerndat probe; restore PID namespace) | `--unprivileged` (`SEMIP_UNPRIVILEGED=1`) skips the netns probe; caps shed in the child before `import torch` | lowcap path: `criu restore -d --unprivileged` in the host PID ns (no `unshare`), tree-kill teardown |
