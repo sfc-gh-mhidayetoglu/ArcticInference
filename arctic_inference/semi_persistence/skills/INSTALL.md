@@ -49,6 +49,47 @@ checker and does **not** block restore: `clone3(set_tid)` at the recorded PIDs
 is authorized by `CAP_CHECKPOINT_RESTORE`.  See Complication 11 in
 [`CRIU_PLUMBING.md`](CRIU_PLUMBING.md).
 
+### Also qualify the interpreter for `SEMIP_UNPRIVILEGED=1`
+
+`criu check` says nothing about the *other* precondition of unprivileged
+mode: the child zeroes its capabilities, losing `CAP_DAC_OVERRIDE`, so
+from then on uid 0 can only read what `other` can.  Every directory on
+the path to the interpreter needs `o+x` and its files `o+r`.  Check the
+**base** prefix, since a venv shares its base interpreter's stdlib:
+
+```bash
+namei -l "$(python -c 'import sys; print(sys.base_prefix)')"
+```
+
+Any component without `o+x` (a `750` home is the usual culprit) fails the
+precondition.  A system-wide Python (`/usr/lib/python3.12`,
+`/usr/local/lib/python3.12/dist-packages`) satisfies it for free, which is
+why pre-baked pod images never hit this.
+
+The functional version of the same check — worth running once per node,
+because it exercises the exact call that breaks — drops capabilities and
+then does what vLLM's `in_the_same_node_as` does during `reinit_nccl`:
+
+```bash
+sudo python3 -c '
+import ctypes
+from multiprocessing import shared_memory, resource_tracker  # pre-import
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+for c in range(64): libc.prctl(24, c, 0, 0, 0)   # PR_CAPBSET_DROP
+libc.prctl(47, 4, 0, 0, 0)                       # PR_CAP_AMBIENT_CLEAR_ALL
+class H(ctypes.Structure): _fields_=[("version",ctypes.c_uint32),("pid",ctypes.c_int)]
+class D(ctypes.Structure): _fields_=[("effective",ctypes.c_uint32),("permitted",ctypes.c_uint32),("inheritable",ctypes.c_uint32)]
+libc.capset(ctypes.byref(H(0x20080522,0)), ctypes.byref((D*2)()))
+s = shared_memory.SharedMemory(create=True, size=128); print("OK", s.name)
+s.close(); s.unlink()'
+```
+
+Run it with the interpreter you will actually serve with.  `OK` means the
+node is fit; a `BrokenPipeError` means the precondition is violated and a
+TP>1 restore will **hang silently** in `reinit_nccl` (Complication 11).
+Fix it before dumping: images are otherwise fine, but you will not find
+out until a later restore.
+
 The dump also needs the empty plugin directory it passes to `--libdir`,
 which no CRIU package creates.  `_worker_criu_save` now creates it (via
 `sudo` when the worker is not root), so this is only needed if you want

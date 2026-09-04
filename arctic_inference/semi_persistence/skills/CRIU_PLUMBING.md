@@ -573,23 +573,49 @@ conda install under `$HOME` is not.
 `criu` itself is never implicated: it lives at `/usr/sbin/criu`
 (`-rwxr-xr-x`) and runs in the worker, which keeps its capabilities.
 
-**Only cold start is affected; restoring a pre-existing image is not.**
-This asymmetry is worth internalising, because it makes the bug look
-intermittent:
+**`criu_restore` itself is safe; what runs after it is not.**  The
+restore maps an already-initialised process back into memory, so the
+child resumes in-memory code, imports nothing, and performs no
+DAC-checked read.  The file reads the restore *does* need (reopening
+every file-backed mapping) are done by `criu` in the worker, which keeps
+its capabilities -- only the child ever drops.
 
-- `init` spawns a fresh interpreter, so the child runs Python's import
-  machinery -- which is exactly where the drop fires and exactly what
-  breaks next.
-- `criu_restore` maps an already-initialised process back into memory.
-  The restored child resumes in-memory code and imports nothing, so it
-  never performs a DAC-checked read and zero capabilities cost it
-  nothing.  The file reads the restore *does* need (reopening every
-  file-backed mapping) are done by `criu` in the worker, which keeps its
-  capabilities -- only the child ever drops.
+That makes `init` the obvious victim: it spawns a fresh interpreter, so
+the child runs Python's import machinery, which is exactly where the drop
+fires.  But **any post-restore primitive that spawns a process or imports
+a not-yet-loaded module hits the same wall**, and at TP>1 `reinit_nccl`
+does:
 
-So an image dumped before the precondition was met will keep restoring
-happily, and the failure only reappears the next time something
-cold-starts.
+```
+_reinit_nccl -> init_worker_distributed_environment
+             -> init_distributed_environment -> _node_count
+             -> in_the_same_node_as        (vllm/distributed/parallel_state.py)
+             -> shared_memory.SharedMemory(create=True)
+             -> multiprocessing.resource_tracker.ensure_running()   # spawns python
+```
+
+The tracker spawn cannot read its own stdlib, dies, and the write to its
+pipe fails with `BrokenPipeError: [Errno 32] Broken pipe`.
+
+**The symptom is a silent hang, not an error.**  vLLM wraps that block in
+`contextlib.suppress(OSError)`, and `BrokenPipeError` *is* an `OSError`,
+so nothing is logged at all -- not even the `Error ignored in
+is_in_the_same_node` line, which only fires for non-`OSError`.  The
+source rank skips its `broadcast_object_list` and proceeds to the
+`barrier()` a few lines below, while every other rank waits forever in
+the matching broadcast.  `py-spy dump` on the workers shows the two ranks
+stopped at *different* lines of `in_the_same_node_as`, which is the
+signature.  All you see in the log is `reinit_nccl` never returning and
+vLLM repeating:
+
+```
+No available shared memory broadcast block found in 60 seconds.
+```
+
+So the precondition is not cold-start-only: an image dumped before it was
+met keeps *restoring* fine and then deadlocks in `reinit_nccl`.  The fix
+is the same (`chmod o+x` the home, or a world-readable interpreter
+prefix) and needs no re-dump, since nothing about the image is wrong.
 
 ---
 

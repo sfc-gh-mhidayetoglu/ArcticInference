@@ -172,7 +172,10 @@ a CRIU image on disk and needs neither.
   then breaks cold start with a bogus-looking `ModuleNotFoundError` for a stdlib
   module right after the `[semip] dropped capabilities` line. A venv inherits
   its base interpreter's stdlib, so check `sys.base_prefix`, not the venv.
-  Restoring an existing image is unaffected -- it imports nothing.
+  `criu_restore` itself is unaffected (it imports nothing), but what runs after
+  it is: at TP>1 `reinit_nccl` spawns a process underneath vLLM's
+  `in_the_same_node_as`, and the failure is a *silent* deadlock because vLLM
+  suppresses the resulting `OSError`. No re-dump needed -- fix the permissions.
 - **Reserved env keys** (`CUDA_VISIBLE_DEVICES`,
   `VLLM_ENABLE_V1_MULTIPROCESSING`, `USE_LIBUV`, the loopback trio and the
   compile-cache roots) are silently dropped from `vllm_config["_env"]` at apply
