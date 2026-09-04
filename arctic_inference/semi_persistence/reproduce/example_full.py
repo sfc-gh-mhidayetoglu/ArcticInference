@@ -9,7 +9,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 os.environ.setdefault("VLLM_ALLREDUCE_USE_SYMM_MEM", "0")
-os.environ.setdefault("FLASHINFER_CACHE_DIR", f"/tmp/flashinfer-uid{os.geteuid()}")
 
 from instance import Instance
 
