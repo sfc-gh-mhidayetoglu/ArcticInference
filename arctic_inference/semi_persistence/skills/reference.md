@@ -51,7 +51,7 @@ placement only and must have exactly that many entries. See
 
 | Primitive | Effect |
 |---|---|
-| `destroy_nccl(graph_mode="reuse")` | Tear down NCCL and CustomAllreduce IPC before a checkpoint |
+| `destroy_nccl(graph_mode="reuse")` | Tear down NCCL and CustomAllreduce IPC before a checkpoint. Also marks the worker's inet TCP sockets `SO_LINGER(1,0)` so their ports skip `TIME_WAIT` when the dump kills the tree (Complication 12) |
 | `reinit_nccl()` | Rebuild NCCL on a fresh port. Must run after `cuda_restore` and before the model runs or a captured graph replays; `attach`/`load_weights` are CPU-only and unconstrained by it |
 | `cleargraph(graph_mode="reuse")` | Drop CUDA-graph exec handles; `reuse` preserves them |
 | `recapture_graphs(graph_mode="reuse")` | Rebind (`reuse`) or recapture (`full`) decode graphs, after `wake_up_kv_cache` |
@@ -235,13 +235,14 @@ run the destructive `criu dump`.
 
 ### Restore sequence
 
-Pass the pipe FD through a Unix socket via `SCM_RIGHTS` into a `sudo`'d helper,
-which `dup2`s it into place, unshares a private PID namespace, and runs `criu
-restore` inside it with `--inherit-fd` for the pipe plus stdout/stderr,
-`--link-remap` and `--tcp-close` (no `--shell-job` — the child holds no tty).
-The CUDA context comes back via `cuda-checkpoint restore`.
+Pass the pipe FD through a Unix socket via `SCM_RIGHTS` into a helper (under
+`sudo` only when the worker is not already root), which `dup2`s it into place,
+unshares a private PID namespace, and runs `criu restore` inside it with
+`--inherit-fd` for the pipe plus stdout/stderr, `--link-remap` and
+`--tcp-close` (no `--shell-job` — the child holds no tty).  The CUDA context
+comes back via `cuda-checkpoint restore`.
 
-### The eleven complications
+### The twelve complications
 
 | # | Complication | Shape of the fix |
 |---|---|---|
@@ -256,6 +257,7 @@ The CUDA context comes back via `cuda-checkpoint restore`.
 | 9 | Ghost remap race (CRIU 4.2) | `--link-remap` handling |
 | 10 | Per-restore PID namespace, and the tty it forced out | Reaper + private `/proc`; child `setsid`, `--shell-job` dropped |
 | 11 | Unprivileged dump + restore | `SEMIP_UNPRIVILEGED=1`: `--unprivileged` on both sides, no-namespace restore, caps shed in the child |
+| 12 | `TIME_WAIT` on the recorded local port | `SO_LINGER(1,0)` on the workers' inet TCP sockets, so the dump's kill RSTs instead of FINs |
 
 `meta.json` alongside the image holds the `vllm_config` (including `_env`) and
 the CRIU metadata, which is what lets the orchestrator rediscover saved models

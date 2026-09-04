@@ -126,6 +126,7 @@ semi_persistence/
   tests/         pytest: CPU-only, hermetic, ~2.5s, no GPU
   scripts/       imperative repros: need real GPUs and real vLLM
                  (except imgdiff.py, which only needs crit + root)
+  reproduce/     example_full.py: the saved -> up sweep across TP1/2/4/8
   skills/        this skill (SKILL.md + reference.md) and every design doc
 ```
 
@@ -146,6 +147,12 @@ a CRIU image on disk and needs neither.
 
 - **CRIU dump is destructive.** The child is killed once the image is written,
   so after `criu_dump` the model is always `saved` with no live process.
+- **A restore right after its own dump can hit `TIME_WAIT`.** CRIU rebinds
+  every local port it recorded, and the destructive dump's own FIN closes park
+  those ports for 60s, so the restore dies inside CRIU with `Can't bind inet
+  socket … Address already in use`. Dumps now mark the workers' TCP sockets
+  `SO_LINGER(1,0)` so the kill RSTs instead; images from before that change
+  need the 60s to drain, not a re-dump. See Complication 12.
 - **`/usr/lib/criu/empty` must exist** or dump aborts at plugin init. See
   [`INSTALL.md`](INSTALL.md).
 - **An image binds to its node's shared libraries byte-for-byte.** CRIU
@@ -185,7 +192,7 @@ a CRIU image on disk and needs neither.
 | [`pipeline_DESIGN.md`](pipeline_DESIGN.md) | Op model, interrupts, cross-model eviction, regression plan |
 | [`slots_DESIGN.md`](slots_DESIGN.md) | Buddy allocator algorithms, invariants, worked example |
 | [`client_DESIGN.md`](client_DESIGN.md) | Job/model two-layer split, calling shapes, session persistence |
-| [`CRIU_PLUMBING.md`](CRIU_PLUMBING.md) | The eleven CRIU complications and the FD keep-list |
+| [`CRIU_PLUMBING.md`](CRIU_PLUMBING.md) | The twelve CRIU complications and the FD keep-list |
 | [`tp_DESIGN.md`](tp_DESIGN.md) | Tensor parallelism: the four TP primitives, NCCL teardown/rebuild, graph reuse |
 | [`semi-p_DESIGN.md`](semi-p_DESIGN.md) | The `model_dir` layout, what a re-dump touches, what binds an image |
 | [`async_generate_DETAILS.md`](async_generate_DETAILS.md) | Async generate, IPC protocol, drain points |

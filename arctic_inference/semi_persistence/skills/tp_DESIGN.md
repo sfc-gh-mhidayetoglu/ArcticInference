@@ -274,6 +274,15 @@ in the child.  All of it degrades to a no-op at TP=1.
   `cleargraph`+`destroy_nccl` itself, but `reinit_nccl` (right after
   `cuda_restore`) and `recapture_graphs("reuse")` (right after
   `wake_up_kv_cache`) are the caller's responsibility.
+- **`destroy_nccl` frees the ports too, not just the comms.** Before
+  tearing the process groups down it marks every inet TCP socket in each
+  worker `SO_LINGER(1,0)`, so the destructive dump's kill RSTs them and
+  their local ports skip `TIME_WAIT`.  Without that, a restore inside 60s
+  of its own dump fails in CRIU with `Address already in use`, because
+  CRIU rebinds each recorded local port.  Every rank contributes a
+  TCPStore connection, which is why the collision is deterministic at
+  TP>1 and only a race at TP=1.  See Complication 12 in
+  [`CRIU_PLUMBING.md`](CRIU_PLUMBING.md).
 - **`reinit_nccl` ordering.** It must run after `cuda_restore`, and before
   anything that runs the model or replays a captured graph — in practice
   before `recapture_graphs` and `generate`.  `attach` and `load_weights`

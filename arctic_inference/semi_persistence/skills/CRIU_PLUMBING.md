@@ -81,7 +81,7 @@ target; everything else is `os.close()`'d:
 | `/dev/nvidia*`          | preserved — CUDA driver fds; restored by CRIU CUDA plugin  |
 | `/dev/shm/*`            | preserved — POSIX shm, including pinned host buffers       |
 | `anon_inode:*`          | preserved — eventfd, epoll, **and io_uring** (rings munmap'd separately) |
-| `socket:[…]`            | preserved — worker tags unix sockets `--external unix[ino]`; TCP gets `--tcp-close` |
+| `socket:[…]`            | preserved — worker tags unix sockets `--external unix[ino]`; TCP gets `--tcp-close` plus `SO_LINGER(1,0)` (Complication 12) |
 | `pipe:[…]`              | preserved                                                  |
 | Everything else         | closed (regular files, Triton `.so` opens, log files, etc.) |
 
@@ -125,6 +125,11 @@ blocked on network I/O.
 Then poll `/proc/<pid>/task/` until the store threads exit (up to 2.5s).
 The TCPStore thread sometimes lingers — the dump proceeds with a
 warning, and CRIU handles the remaining thread via `--tcp-close`.
+
+`--tcp-close` covers the *connections*, not the ports they occupied:
+CRIU rebinds each recorded local port before closing it, so the sockets
+that survive into the image also need `SO_LINGER(1,0)` at dump time.  See
+Complication 12.
 
 ---
 
@@ -208,6 +213,13 @@ Failed because the sudoers policy doesn't permit `-C`.
 2. A background thread accepts and sends the pipe FD via `SCM_RIGHTS`
 3. A Python helper script runs under `sudo`, connects to the socket,
    receives the FD, `dup2`s it into place, then `execvp`s `criu restore`
+
+`sudo` is skipped when the worker is already root (`_is_root`), which
+avoids leaving a long-lived `sudo` between the worker and the reaper —
+it holds the terminal for the life of the namespace and leaves the tty
+in a bad state when teardown SIGKILLs it.  The `SCM_RIGHTS` dance stays
+either way: `subprocess` closes FDs >= 3 in the child regardless of
+`sudo`.
 
 ---
 
@@ -570,11 +582,79 @@ cold-starts.
 
 ---
 
+## Complication 12: `TIME_WAIT` vs the Recorded Local Port
+
+**Problem:** CRIU records every inet socket's exact local port and
+**rebinds it** at restore, *before* `--tcp-close` gets to close it.  The
+dump is destructive, so every socket still open at dump time closes with
+a FIN when the tree is killed and leaves its tuple in `TIME_WAIT` on the
+host.  A restore that follows its own dump immediately then collides
+with those tuples:
+
+```
+Error (criu/sk-inet.c): Can't bind inet socket (id 0x…): Address already in use
+```
+
+The bind cannot step over the tuple because CRIU restores `SO_REUSEADDR`
+from the recorded value rather than forcing it on.  Decode an image to
+see which sockets are exposed:
+
+```bash
+sudo crit decode -i <image_dir>/files.img --pretty \
+  | jq -c '.entries[] | select(.type=="INETSK") | .isk
+           | {state, src_port, reuseaddr: .opts.reuseaddr}'
+```
+
+Listeners — and the sockets accepted from them, which inherit the option
+— carry `reuseaddr: true` and rebind fine.  The client-side connected
+sockets carry `reuseaddr: false`, and those are the ones that fail.
+
+**Deterministic at TP2+, a race at TP1.**  Every rank adds a TCPStore
+connection, so at TP>1 there is always a colliding tuple.  A TP1 image
+still contains such sockets (the store's self-connection, plus whatever
+HTTPS connections the child left open), so TP1 is exposed too — it just
+usually wins the race.
+
+**Fix (dump side): `SO_LINGER(1,0)` before the NCCL teardown.**
+`_mark_inet_sockets_rst` (`vllm_child.py`) walks the worker's
+`/proc/<pid>/fd` and, for every `AF_INET`/`AF_INET6` `SOCK_STREAM`
+socket, sets `SO_LINGER` with `l_onoff=1, l_linger=0` so the eventual
+close sends an **RST** instead of a FIN and the tuple never enters
+`TIME_WAIT`.  It runs at the top of `_destroy_nccl`, before anything is
+closed, and it marks through a `dup()` so the wrapper's `close()`
+releases only the duplicate: the live fd stays open for CRIU, and
+because the option lives on the shared socket the RST fires whenever
+teardown or CRIU's kill finally closes it.  `AF_UNIX` and non-stream
+sockets are left alone.
+
+**Time-bound, not image-bound — no re-dump needed.**  `TIME_WAIT` is
+`TCP_TIMEWAIT_LEN` (60s, hard-coded in the kernel; `tcp_fin_timeout` is
+a different timer), so the window closes a minute after the dump that
+opened it.  Unlike Complications 10 and 11, **images dumped before this
+change do not need re-dumping** — they restore fine once the window has
+drained, which is exactly why the failure looks like it needs a
+cooldown.
+
+What a fresh dump does buy: CRIU stores the option in the image
+(`SkOptsEntry.so_linger`) and replays it at restore, so a tree restored
+from a new image also RSTs on its own teardown.  That keeps back-to-back
+`criu_restore` → teardown → `criu_restore` cycles on one node clean,
+where an old image re-blocks its ports on every teardown.
+
+**Not covered (known, benign today):** the marking sits after the
+`tp_size <= 1` early return in `_destroy_nccl`, so TP1 is never marked;
+and `_destroy_nccl` is a `collective_rpc` target, so only the workers
+are walked — the child's own sockets (e.g. leftover HTTPS connections to
+the model hub, bound to the routable IP rather than loopback) still
+leave `TIME_WAIT` behind.
+
+---
+
 ## Summary Table
 
 | Resource           | Problem at dump time               | Dump-side fix                      | Restore-side fix                     |
 |--------------------|-------------------------------------|------------------------------------|--------------------------------------|
-| NCCL/TCPStore      | Background threads, TCP sockets     | `destroy_process_group()` + poll   | `--tcp-close`                        |
+| NCCL/TCPStore      | Background threads, TCP sockets; the tree-kill's FINs park the recorded local ports in `TIME_WAIT` | `destroy_process_group()` + poll; `SO_LINGER(1,0)` on every inet TCP socket so the kill RSTs instead | `--tcp-close` — but it closes only *after* the rebind, so it is not sufficient alone |
 | io_uring           | Non-serializable kernel state       | Munmap rings (FDs kept via keep-list) | —                                 |
 | POSIX semaphores   | `(deleted)` files → ghost/link remap| Delete sem files; captured as anon | —                                    |
 | stdout/stderr      | File size changes between dump/load | Redirect to /dev/null              | `--inherit-fd fd[1]/fd[2]`           |
